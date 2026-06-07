@@ -1,0 +1,91 @@
+//! mem3 — TriSource-EverOS
+//!
+//! Entry point for the `mem3` CLI binary. Dispatches to subcommand modules.
+//!
+//! ## Architecture
+//! This is the implementation of the spec-kit plan at `specs/001-trisource-everos-mvp/`.
+//! See `AGENTS.md` and `.specify/memory/constitution.md` for the binding principles.
+//!
+//! ## Subcommands
+//! - `add`       — encode a TS-MemCell and persist it
+//! - `query`     — three-way recall with GHW-prioritized ranking
+//! - `goal`      — manage the Goal Poset
+//! - `hyperedge` — manage hypergraph edges
+//! - `dump`      — export the full store as JSONL
+//! - `inspect`   — show one MemCell + its hypergraph neighborhood
+//! - `consolidate` — run the consolidation pipeline
+//! - `forget`    — run the existence-gain-driven forgetting sweep
+//! - `serve`     — start the HTTP daemon
+//! - `bench`     — run performance benchmarks
+//!
+//! ## Constitution compliance
+//! - All output respects `--log-format=jsonl` and silent-by-default for `serve`.
+//! - No hidden allocator; explicit `Allocator` injection.
+//! - No external runtime dependency.
+
+const std = @import("std");
+const builtin = @import("builtin");
+
+const cli = @import("cli.zig");
+const version = @import("version.zig");
+
+const log = std.log.scoped(.mem3_main);
+
+pub fn main(init: std.process.Init.Minimal) !void {
+    var gpa: std.heap.DebugAllocator(.{ .thread_safe = true }) = .init;
+    defer _ = gpa.deinit();
+    const alloc = gpa.allocator();
+
+    var args_iter = std.process.Args.iterate(init.args);
+    _ = args_iter.next(); // skip exe name
+
+    // Parse global flags and subcommand.
+    var parsed = try cli.parse(alloc, &args_iter);
+    defer parsed.deinit(alloc);
+
+    if (parsed.help) {
+        try cli.printHelp();
+        return;
+    }
+    if (parsed.version) {
+        std.debug.print("{s}", .{version.banner()});
+        return;
+    }
+
+    log.debug("dispatching subcommand: {s}", .{@tagName(parsed.cmd)});
+
+    // Dispatch.
+    return switch (parsed.cmd) {
+        .add => @import("cli_commands/add.zig").run(alloc, parsed),
+        .query => @import("cli_commands/query.zig").run(alloc, parsed),
+        .goal => @import("cli_commands/goal.zig").run(alloc, parsed),
+        .hyperedge => @import("cli_commands/hyperedge.zig").run(alloc, parsed),
+        .dump => @import("cli_commands/dump.zig").run(alloc, parsed),
+        .inspect => @import("cli_commands/inspect.zig").run(alloc, parsed),
+        .consolidate => @import("cli_commands/consolidate.zig").run(alloc, parsed),
+        .forget => @import("cli_commands/forget.zig").run(alloc, parsed),
+        .serve => @import("cli_commands/serve.zig").run(alloc, parsed),
+        .bench => @import("cli_commands/bench.zig").run(alloc, parsed),
+        .help => cli.printHelp(),
+        .version => {
+            std.debug.print("{s}", .{version.banner()});
+        },
+    };
+}
+
+// =============================================================================
+// Tests — pulled in via `zig build test`.
+// =============================================================================
+//
+// Top-level test block so a single test binary covers every `test "..."`
+// block transitively referenced. Use `zig build test --test-filter <substr>`
+// to scope.
+//
+// Constitution tests are run separately via `zig build check-constitution`
+// (see `tests/constitution/main.zig`).
+
+test "mem3 placeholder smoke test" {
+    // This exists so the test binary is non-empty before the broader test
+    // suite lands. It is replaced by the real coverage from Phase 3 onward.
+    try std.testing.expectEqualStrings("0.1.0-alpha", version.VERSION);
+}

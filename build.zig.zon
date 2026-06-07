@@ -1,0 +1,19 @@
+.{
+    .name = .mem3,
+    .version = "0.1.0-alpha",
+    .fingerprint = 0xc9978df579642429,
+    .minimum_zig_version = "0.17.0-dev.3000",
+
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "tests",
+        "bench",
+        "examples",
+        "docs",
+        "README.md",
+        "AGENTS.md",
+        "LICENSE",
+    },
+}

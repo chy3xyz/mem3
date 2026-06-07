@@ -1,0 +1,25 @@
+# Zig build artifacts
+/zig-out/
+/.zig-cache/
+/zig-cache/
+
+# Runtime data (per spec §FR-018)
+/data/
+
+# OS noise
+.DS_Store
+Thumbs.db
+
+# Editor
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+
+# Logs (per Constitution VII: silent by default)
+*.log
+logs/
+
+# Benchmark output
+bench-results.json
