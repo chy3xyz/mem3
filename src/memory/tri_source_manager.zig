@@ -69,6 +69,15 @@ pub const TriSourceManager = struct {
     /// `foresight`, and `goal_associations` into its own allocator, so the
     /// caller may free its original slices immediately after this returns.
     pub fn add(self: *TriSourceManager, cell: MemCell) errors!u64 {
+        return try self.addWithId(self.next_id.fetchAdd(1, .monotonic), cell);
+    }
+
+    /// Add with a caller-supplied id. Used by the WAL-first commit path in
+    /// `Store.addRawInternal`, which pre-assigns the id so the WAL record
+    /// can name the cell before it exists in memory. The id is NOT
+    /// validated against `next_id`; the caller is responsible for
+    /// monotonic uniqueness.
+    pub fn addWithId(self: *TriSourceManager, id: u64, cell: MemCell) errors!u64 {
         // Spirit-dimension check.
         if (cell.foresight.len == 0 and cell.goal_associations.len == 0) {
             return errors.SpiritDimMissing;
@@ -134,7 +143,7 @@ pub const TriSourceManager = struct {
         errdefer self.alloc.free(goal_associations);
 
         cell_ptr.* = .{
-            .id = self.next_id.fetchAdd(1, .monotonic),
+            .id = id,
             .source = cell.source,
             .episode = episode,
             .atomic_facts = atomic_facts,

@@ -45,6 +45,14 @@ pub const Lifecycle = struct {
         return self.mgr.add(cell);
     }
 
+    /// Encode with a caller-supplied id. Used by the WAL-first commit path
+    /// in `Store.addRawInternal`: the id is pre-fetchAdd'd so the WAL record
+    /// can name the cell before the manager has it.
+    pub fn encodeWithId(self: *Lifecycle, id: u64, input: RawInput) errors!u64 {
+        const cell = try self.encoder.encode(input);
+        return self.mgr.addWithId(id, cell);
+    }
+
     /// Forgetting: run the existence-gain-driven sweep.
     pub fn forget(self: *Lifecycle, dry_run: bool) !Forgetter.SweepResult {
         return self.forgetter.sweep(self.mgr, dry_run);

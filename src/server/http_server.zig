@@ -120,6 +120,11 @@ const Store = struct {
         self.alloc.destroy(self);
     }
 
+    /// Front-door insert. Pre-assigns an id, journaled to WAL first, then
+    /// committed to in-memory state. If the WAL write fails the in-memory
+    /// store is untouched and the id is returned to the pool. Caller is
+    /// guaranteed: `Ok(id) ⟹ cell is durable on disk AND observable in
+    /// memory`.
     fn addRaw(
         self: *Store,
         source: MemorySource,
@@ -128,30 +133,51 @@ const Store = struct {
         goal_id: u64,
         relevance: f32,
     ) !u64 {
-        return self.addRawInternal(source, episode, facts, goal_id, relevance, true);
+        const id = self.ids.fetchAdd(1, .monotonic);
+        errdefer _ = self.ids.fetchSub(1, .monotonic);
+
+        if (self.wal) |wal| {
+            const payload = try self.encodeWALPayload(id, source, episode, facts, goal_id, relevance);
+            defer self.alloc.free(payload);
+            const ts_s: i64 = @intCast(@divTrunc(nowNs(), std.time.ns_per_s));
+            try wal.append(.{
+                .record_type = .memcell_insert,
+                .payload = payload,
+                .timestamp = ts_s,
+            });
+        }
+        try self.commitToMemory(id, source, episode, facts, goal_id, relevance);
+        return id;
     }
 
-    /// Replay helper: same as addRaw but skips WAL writes (avoid re-recording replayed records).
+    /// Replay-side insert. The id comes from the WAL record (so the cell
+    /// has the same id across boots). No WAL write — we are reading the
+    /// WAL, not writing it. Caller is responsible for ensuring `id` is
+    /// not already taken.
     fn addRawNoWAL(
         self: *Store,
+        id: u64,
         source: MemorySource,
         episode: []const u8,
         facts: []const u8,
         goal_id: u64,
         relevance: f32,
     ) !u64 {
-        return self.addRawInternal(source, episode, facts, goal_id, relevance, false);
+        try self.commitToMemory(id, source, episode, facts, goal_id, relevance);
+        return id;
     }
 
-    fn addRawInternal(
+    /// Parse `facts` (semicolon-separated `s|p|o` triples), encode the
+    /// cell, commit to manager + cell_index + hnsw. No WAL interaction.
+    fn commitToMemory(
         self: *Store,
+        id: u64,
         source: MemorySource,
         episode: []const u8,
         facts: []const u8,
         goal_id: u64,
         relevance: f32,
-        write_wal: bool,
-    ) !u64 {
+    ) !void {
         var fact_list = std.ArrayList(fact).empty;
         defer fact_list.deinit(self.alloc);
         var it = std.mem.splitScalar(u8, facts, ';');
@@ -178,7 +204,7 @@ const Store = struct {
             .priority = 5,
         });
 
-        const id = try self.lc.encode(.{
+        _ = try self.lc.encodeWithId(id, .{
             .source = source,
             .episode = episode,
             .atomic_facts = fact_list.items,
@@ -194,27 +220,16 @@ const Store = struct {
                 log.warn("hnsw insert failed: {}", .{err});
             };
         }
-
-        // Persist to WAL after the in-memory state is consistent.
-        if (write_wal) {
-            if (self.wal) |wal| {
-                const payload = try self.encodeWALPayload(source, episode, facts, goal_id, relevance);
-                defer self.alloc.free(payload);
-                const ts_s: i64 = @intCast(@divTrunc(nowNs(), std.time.ns_per_s));
-                try wal.append(.{
-                    .record_type = .memcell_insert,
-                    .payload = payload,
-                    .timestamp = ts_s,
-                });
-            }
-        }
-        return id;
     }
 
-    /// Encode a memcell_insert WAL payload as a length-prefixed JSON document.
-    /// Fields: { source, episode, facts, goal_id, relevance }.
+    /// Encode a memcell_insert WAL payload as a self-contained JSON document.
+    /// Fields: { id, source, episode, facts, goal_id, relevance }.
+    /// The id MUST be the pre-assigned id (same one used to commit the
+    /// cell in memory); replay uses it to keep the WAL→memory contract
+    /// identical across boots.
     fn encodeWALPayload(
         self: *Store,
+        id: u64,
         source: MemorySource,
         episode: []const u8,
         facts: []const u8,
@@ -228,6 +243,8 @@ const Store = struct {
         var out = std.ArrayList(u8).empty;
         defer out.deinit(self.alloc);
         try out.append(self.alloc, '{');
+        try jsonFieldUintRaw(self.alloc, &out, "id", id);
+        try out.append(self.alloc, ',');
         try jsonFieldStringRaw(self.alloc, &out, "source", source.label());
         try out.append(self.alloc, ',');
         try jsonFieldStringRaw(self.alloc, &out, "episode", episode);
@@ -242,13 +259,17 @@ const Store = struct {
     }
 
     /// Open the WAL at data_dir/mem3.wal and replay any prior records.
-    /// Creates the directory if missing. Silently no-ops if no WAL exists.
+    /// Creates the directory tree if missing. Returns an error on any
+    /// real filesystem failure (EACCES, ENOSPC, etc.) so the caller can
+    /// refuse to start rather than silently run in-memory.
     fn openAndReplayWAL(self: *Store, data_dir: []const u8) !void {
         const dir_path = try self.alloc.dupe(u8, data_dir);
         defer self.alloc.free(dir_path);
 
         // Recursive mkdir (mkdir -p). 0.17 std has no public makeDir API,
         // so we shell out to the C `mkdir` syscall per path component.
+        // A non-zero return is treated as EEXIST *only* if the path already
+        // exists as a directory; otherwise the real error propagates.
         var it = std.mem.splitScalar(u8, dir_path, '/');
         var prefix: std.ArrayList(u8) = .empty;
         defer prefix.deinit(self.alloc);
@@ -263,9 +284,18 @@ const Store = struct {
             }
             try prefix.appendSlice(self.alloc, component);
             var zbuf: [std.fs.max_path_bytes + 1]u8 = undefined;
-            const z = std.fmt.bufPrint(&zbuf, "{s}\x00", .{prefix.items}) catch continue;
-            const rc = std.c.mkdir(z[0 .. z.len - 1 :0].ptr, 0o755);
-            std.debug.print("WAL: mkdir({s}) rc={d}\n", .{ prefix.items, rc });
+            const z = std.fmt.bufPrint(&zbuf, "{s}\x00", .{prefix.items}) catch {
+                return error.DataDirPathTooLong;
+            };
+            const zptr = z[0 .. z.len - 1 :0].ptr;
+            const rc = std.c.mkdir(zptr, 0o755);
+            if (rc == 0) continue;
+            // mkdir returned -1. EEXIST (most common case in dev) is fine
+            // if the path is already a directory. Anything else propagates.
+            var st: std.c.Stat = undefined;
+            if (std.c.stat(zptr, &st) != 0) return error.DataDirStatFailed;
+            const mode_u32: u32 = @intCast(st.mode);
+            if ((mode_u32 & 0xF000) != 0x4000) return error.DataDirNotADirectory;
         }
 
         const wal_path = std.fs.path.join(self.alloc, &.{ data_dir, "mem3.wal" }) catch |err| {
@@ -328,32 +358,43 @@ const Store = struct {
 
         // Replay records.
         var replay_count: u64 = 0;
+        var max_replayed_id: u64 = 0;
         const Ctx = struct {
             store: *Store,
             count: *u64,
+            max_id: *u64,
         };
-        var ctx = Ctx{ .store = self, .count = &replay_count };
+        var ctx = Ctx{ .store = self, .count = &replay_count, .max_id = &max_replayed_id };
         wal_ptr.replay(existing.items, &ctx, struct {
             fn cb(ctx_ptr: *Ctx, rec: WALRecord) anyerror!void {
                 if (rec.record_type != .memcell_insert) return;
-                const parsed = parseInsertPayload(rec.payload) orelse return;
-                var local_parsed = parsed;
-                defer local_parsed.deinit(ctx_ptr.store.alloc);
-                _ = ctx_ptr.store.addRawNoWAL(
-                    parsed.source,
-                    parsed.episode,
-                    parsed.facts,
-                    parsed.goal_id,
-                    parsed.relevance,
-                ) catch |err| {
-                    std.log.warn("replay insert failed: {}", .{err});
-                    return;
-                };
-                ctx_ptr.count.* += 1;
+                const maybe_parsed = try parseInsertPayload(ctx_ptr.store.alloc, rec.payload);
+                if (maybe_parsed) |parsed| {
+                    defer parsed.deinit(ctx_ptr.store.alloc);
+                    if (parsed.id > ctx_ptr.max_id.*) ctx_ptr.max_id.* = parsed.id;
+                    _ = ctx_ptr.store.addRawNoWAL(
+                        parsed.id,
+                        parsed.source,
+                        parsed.episode,
+                        parsed.facts,
+                        parsed.goal_id,
+                        parsed.relevance,
+                    ) catch |err| {
+                        std.log.warn("replay insert failed: {}", .{err});
+                        return;
+                    };
+                    ctx_ptr.count.* += 1;
+                }
             }
         }.cb) catch |err| {
             log.warn("WAL replay stopped at record {d}: {}", .{ replay_count, err });
         };
+        // Bump the id counter past the highest replayed id so future
+        // fresh inserts can't collide with a replayed one. fetchMax is
+        // atomic and idempotent: if `ids` is already past, no change.
+        if (max_replayed_id > 0) {
+            _ = self.ids.fetchMax(max_replayed_id + 1, .monotonic);
+        }
         std.debug.print("WAL: replayed {d} memcell_insert records from {s}\n", .{ replay_count, wal_path });
     }
 
@@ -584,10 +625,14 @@ pub const Server = struct {
         const body_start = std.mem.findPos(u8, full_request, 0, "\r\n\r\n") orelse 0;
         const body = full_request[body_start + 4 ..];
 
-        const source_str = extractJsonString(body, "source") orelse "matter";
+        const source_str = try extractJsonStringOrOwned(self.alloc, body, "source", "matter");
+        defer self.alloc.free(source_str);
         const source = core.MemorySource.fromString(source_str) catch return try self.jsonResponse(400, "Bad Request", "{\"error\":\"invalid source\"}");
-        const episode = extractJsonString(body, "episode") orelse return try self.jsonResponse(400, "Bad Request", "{\"error\":\"episode required\"}");
-        const facts = extractJsonString(body, "facts") orelse "";
+        const episode = try extractJsonStringOrOwned(self.alloc, body, "episode", "");
+        defer self.alloc.free(episode);
+        if (episode.len == 0) return try self.jsonResponse(400, "Bad Request", "{\"error\":\"episode required\"}");
+        const facts = try extractJsonStringOrOwned(self.alloc, body, "facts", "");
+        defer self.alloc.free(facts);
         const goal_id = @as(u64, @intCast(extractJsonInt(body, "goalId") orelse 1));
         const relevance = extractJsonFloat(body, "relevance") orelse 0.5;
 
@@ -614,7 +659,9 @@ pub const Server = struct {
         const body_start = std.mem.findPos(u8, full_request, 0, "\r\n\r\n") orelse 0;
         const body = full_request[body_start + 4 ..];
 
-        const text = extractJsonString(body, "text") orelse return try self.jsonResponse(400, "Bad Request", "{\"error\":\"text required\"}");
+        const text = try extractJsonStringOrOwned(self.alloc, body, "text", "");
+        defer self.alloc.free(text);
+        if (text.len == 0) return try self.jsonResponse(400, "Bad Request", "{\"error\":\"text required\"}");
         const topk = @as(usize, @intCast(extractJsonInt(body, "topk") orelse 10));
         _ = extractJsonInt(body, "maxHops") orelse 3;
 
@@ -734,7 +781,91 @@ pub const Server = struct {
 // Tiny JSON utilities (avoid pulling in std.json for the hot API path).
 // =============================================================================
 
-fn extractJsonString(body: []const u8, key: []const u8) ?[]const u8 {
+/// JSON-string unescape. Walks `input` (which is between two unescaped
+/// `"` characters) and produces the raw string value. Handles:
+/// `\"` `\\` `\/` `\n` `\r` `\t` `\b` `\f` and `\uXXXX` (UTF-8 encoded).
+/// Returns an owned slice; caller frees.
+fn unescapeJsonString(alloc: Allocator, input: []const u8) Allocator.Error![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc);
+    var i: usize = 0;
+    while (i < input.len) {
+        const ch = input[i];
+        if (ch != '\\') {
+            try out.append(alloc, ch);
+            i += 1;
+            continue;
+        }
+        if (i + 1 >= input.len) break;
+        const esc = input[i + 1];
+        switch (esc) {
+            '"' => try out.append(alloc, '"'),
+            '\\' => try out.append(alloc, '\\'),
+            '/' => try out.append(alloc, '/'),
+            'n' => try out.append(alloc, '\n'),
+            'r' => try out.append(alloc, '\r'),
+            't' => try out.append(alloc, '\t'),
+            'b' => try out.append(alloc, 0x08),
+            'f' => try out.append(alloc, 0x0C),
+            'u' => {
+                if (i + 6 > input.len) {
+                    // Truncated \u — emit the raw 2 chars and stop.
+                    try out.appendSlice(alloc, input[i..]);
+                    i = input.len;
+                    break;
+                }
+                const hex = input[i + 2 .. i + 6];
+                const cp = std.fmt.parseInt(u21, hex, 16) catch {
+                    // Malformed escape: pass through raw.
+                    try out.appendSlice(alloc, input[i..][0..2]);
+                    i += 2;
+                    continue;
+                };
+                var buf: [4]u8 = undefined;
+                const n = utf8Encode(cp, &buf);
+                try out.appendSlice(alloc, buf[0..n]);
+                i += 6;
+                continue;
+            },
+            else => try out.append(alloc, esc),
+        }
+        i += 2;
+    }
+    return out.toOwnedSlice(alloc);
+}
+
+/// UTF-8 encode a Unicode scalar value (up to 0x10FFFF) into `dest`.
+/// Returns the number of bytes written (1..4).
+fn utf8Encode(cp: u21, dest: *[4]u8) usize {
+    if (cp < 0x80) {
+        dest[0] = @intCast(cp);
+        return 1;
+    } else if (cp < 0x800) {
+        dest[0] = @intCast(0xC0 | (cp >> 6));
+        dest[1] = @intCast(0x80 | (cp & 0x3F));
+        return 2;
+    } else if (cp < 0x10000) {
+        dest[0] = @intCast(0xE0 | (cp >> 12));
+        dest[1] = @intCast(0x80 | ((cp >> 6) & 0x3F));
+        dest[2] = @intCast(0x80 | (cp & 0x3F));
+        return 3;
+    } else {
+        dest[0] = @intCast(0xF0 | (cp >> 18));
+        dest[1] = @intCast(0x80 | ((cp >> 12) & 0x3F));
+        dest[2] = @intCast(0x80 | ((cp >> 6) & 0x3F));
+        dest[3] = @intCast(0x80 | (cp & 0x3F));
+        return 4;
+    }
+}
+
+/// Like `extractJsonString` but always returns an owned, heap-allocated
+/// slice. Missing field → `default` is duped. Caller frees.
+fn extractJsonStringOrOwned(alloc: Allocator, body: []const u8, key: []const u8, default: []const u8) ![]u8 {
+    if (try extractJsonString(alloc, body, key)) |s| return s;
+    return try alloc.dupe(u8, default);
+}
+
+fn extractJsonString(alloc: Allocator, body: []const u8, key: []const u8) !?[]u8 {
     const needle = std.fmt.allocPrint(std.heap.page_allocator, "\"{s}\":", .{key}) catch return null;
     defer std.heap.page_allocator.free(needle);
     const idx = std.mem.findPos(u8, body, 0, needle) orelse return null;
@@ -743,16 +874,22 @@ fn extractJsonString(body: []const u8, key: []const u8) ?[]const u8 {
     if (pos >= body.len or body[pos] != '"') return null;
     pos += 1;
     const start = pos;
-    // Walk to terminating unescaped quote.
-    while (pos < body.len) : (pos += 1) {
+    // Walk to terminating unescaped quote. Manual pos management: a
+    // backslash escapes the *next* byte (any byte, even another `\`).
+    while (pos < body.len) {
         if (body[pos] == '\\') {
-            pos += 1; // skip escaped char (any byte)
+            // Skip the backslash AND the next byte. If the next byte
+            // would land past the end, bail.
+            if (pos + 1 >= body.len) return null;
+            pos += 2;
             continue;
         }
         if (body[pos] == '"') break;
+        pos += 1;
     }
     if (pos >= body.len) return null;
-    return body[start..pos];
+    // Allocate + unescape. Caller owns the returned slice.
+    return try unescapeJsonString(alloc, body[start..pos]);
 }
 
 fn extractJsonInt(body: []const u8, key: []const u8) ?i64 {
@@ -777,9 +914,16 @@ fn jsonFieldString(alloc: Allocator, out: *std.ArrayList(u8), key: []const u8, v
     try out.appendSlice(alloc, "\":\"");
     for (value) |vc| {
         switch (vc) {
-            '"' => try out.append(alloc, '\\'),
-            '\\' => try out.append(alloc, '\\'),
+            '"' => try out.appendSlice(alloc, "\\\""), // \" (2 bytes)
+            '\\' => try out.appendSlice(alloc, "\\\\"), // \\ (2 bytes)
             '\n' => try out.appendSlice(alloc, "\\n"),
+            '\r' => try out.appendSlice(alloc, "\\r"),
+            '\t' => try out.appendSlice(alloc, "\\t"),
+            0...7, 11, 14...31 => {
+                var buf: [8]u8 = undefined;
+                const s = std.fmt.bufPrint(&buf, "\\u{x:0>4}", .{vc}) catch unreachable;
+                try out.appendSlice(alloc, s);
+            },
             else => try out.append(alloc, vc),
         }
     }
@@ -888,27 +1032,39 @@ fn jsonFieldFloatRaw(alloc: Allocator, out: *std.ArrayList(u8), key: []const u8,
 }
 
 const ParsedInsert = struct {
+    id: u64,
     source: MemorySource,
-    /// Borrowed slices from the parent payload buffer; no need to free.
-    episode: []const u8,
-    facts: []const u8,
+    /// Owned (heap-allocated, unescaped) string fields. Free via deinit.
+    episode: []u8,
+    facts: []u8,
     goal_id: u64,
     relevance: f32,
 
-    pub fn deinit(_: *ParsedInsert, _: Allocator) void {}
+    pub fn deinit(self: *const ParsedInsert, alloc: Allocator) void {
+        alloc.free(self.episode);
+        alloc.free(self.facts);
+    }
 };
 
-/// Parse a JSON payload of shape { source, episode, facts, goal_id, relevance }.
-fn parseInsertPayload(payload: []const u8) ?ParsedInsert {
-    const source_str = extractJsonString(payload, "source") orelse "matter";
+/// Parse a JSON payload of shape { id, source, episode, facts, goal_id, relevance }.
+fn parseInsertPayload(alloc: Allocator, payload: []const u8) !?ParsedInsert {
+    const id_i: i64 = extractJsonInt(payload, "id") orelse return null;
+    if (id_i < 0) return null;
+    const id: u64 = @intCast(id_i);
+    const source_str = try extractJsonStringOrOwned(alloc, payload, "source", "matter");
+    errdefer alloc.free(source_str);
     const source = core.MemorySource.fromString(source_str) catch return null;
-    const episode = extractJsonString(payload, "episode") orelse return null;
-    const facts = extractJsonString(payload, "facts") orelse "";
+    const episode = try extractJsonStringOrOwned(alloc, payload, "episode", "");
+    errdefer alloc.free(episode);
+    if (episode.len == 0) return null;
+    const facts = try extractJsonStringOrOwned(alloc, payload, "facts", "");
+    errdefer alloc.free(facts);
     const goal_id_i: i64 = extractJsonInt(payload, "goal_id") orelse extractJsonInt(payload, "goalId") orelse 1;
     if (goal_id_i < 0) return null;
     const goal_id: u64 = @intCast(goal_id_i);
     const relevance_f: f32 = extractJsonFloat(payload, "relevance") orelse 0.5;
     return .{
+        .id = id,
         .source = source,
         .episode = episode,
         .facts = facts,
