@@ -11,11 +11,12 @@ pub const CivilDate = struct {
 
 /// Get current Unix time in milliseconds.
 ///
-/// Per Zig 0.17-compat memory: `std.time.milliTimestamp` does not exist.
-/// Use `std.time.timestamp` (seconds) and multiply.
+/// Per Zig 0.17-compat memory: `std.time.timestamp` / `milliTimestamp` do
+/// not exist. We use the C `clock_gettime` via `std.c` for portability.
 pub fn nowMs() i64 {
-    const s = std.time.timestamp();
-    return s * 1000;
+    var ts: std.c.timespec = .{ .sec = 0, .nsec = 0 };
+    _ = std.c.clock_gettime(std.c.CLOCK.REALTIME, &ts);
+    return @as(i64, ts.sec) * 1000 + @divTrunc(@as(i64, ts.nsec), 1_000_000);
 }
 
 /// High-resolution monotonic time in nanoseconds. For benchmarking only.

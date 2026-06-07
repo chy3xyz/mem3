@@ -45,23 +45,26 @@ pub const MemCell = struct {
     /// for record-offset arithmetic.
     pub const serialized_size: usize = serializer.calculateSize(MemCell);
 
-    /// Free all owned slices. Use this when the cell was heap-allocated and
-    /// its string / slice fields were `dupe`d.
+    /// Free all heap-allocated slices owned by this MemCell.
+    /// This is a "full deinit" — releases episode, atomic_facts[i].*,
+    /// foresight[i].description, the container slices, and the
+    /// `metadata.location` string. Used by tests and by managers that
+    /// dup the cell on insertion.
     pub fn deinit(self: *const MemCell, alloc: std.mem.Allocator) void {
-        alloc.free(self.episode);
+        alloc.free(@constCast(self.episode));
         for (self.atomic_facts) |f| {
-            alloc.free(f.subject);
-            alloc.free(f.predicate);
-            alloc.free(f.object);
-            alloc.free(f.source);
+            alloc.free(@constCast(f.subject));
+            alloc.free(@constCast(f.predicate));
+            alloc.free(@constCast(f.object));
+            alloc.free(@constCast(f.source));
         }
-        alloc.free(self.atomic_facts);
+        alloc.free(@constCast(self.atomic_facts));
         for (self.foresight) |f| {
-            alloc.free(f.description);
+            alloc.free(@constCast(f.description));
         }
-        alloc.free(self.foresight);
-        alloc.free(self.goal_associations);
-        if (self.metadata.location) |loc| alloc.free(loc);
+        alloc.free(@constCast(self.foresight));
+        alloc.free(@constCast(self.goal_associations));
+        if (self.metadata.location) |loc| alloc.free(@constCast(loc));
     }
 
     /// Touch the cell (bump updated_at, recency, frequency). Used on read access.

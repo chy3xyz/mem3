@@ -107,6 +107,15 @@ pub fn parse(alloc: Allocator, iter: *ArgIterator) !Parsed {
             p.cmd = try subcommandFromName(arg);
             continue;
         }
+        // Track if the previous arg was a flag expecting a value.
+        if (p.args.items.len > 0) {
+            const last = &p.args.items[p.args.items.len - 1];
+            if (last.value == null and !std.mem.startsWith(u8, last.key, "--no-")) {
+                // Heuristic: this token is the value for the previous flag.
+                last.value = arg;
+                continue;
+            }
+        }
         try p.args.append(alloc, parseArg(alloc, arg));
     }
     return p;

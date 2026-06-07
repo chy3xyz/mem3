@@ -13,6 +13,12 @@ const std = @import("std");
 
 pub const core = @import("core/mod.zig");
 pub const utils = @import("utils/mod.zig");
+pub const ghw = @import("ghw/mod.zig");
+pub const memory = @import("memory/mod.zig");
+pub const hypermem = @import("hypermem/mod.zig");
+pub const retrieval = @import("retrieval/mod.zig");
+pub const storage = @import("storage/mod.zig");
+pub const server = @import("server/mod.zig");
 
 // Re-export the most common types at the top level so consumers can
 // `const mem3 = @import("mem3"); mem3.MemCell` etc.
@@ -27,6 +33,42 @@ pub const MemCell = core.MemCell;
 pub const IdSources = core.IdSources;
 pub const Config = core.Config;
 pub const Error = core.Error;
+
+// GHW re-exports
+pub const GoalPoset = ghw.GoalPoset;
+pub const GoalNode = ghw.GoalNode;
+pub const Harness = ghw.Harness;
+pub const HarnessRegistry = ghw.HarnessRegistry;
+pub const WorldEntity = ghw.WorldEntity;
+pub const WorldModel = ghw.WorldModel;
+
+// Memory re-exports
+pub const TriSourceManager = memory.TriSourceManager;
+pub const Encoder = memory.Encoder;
+pub const RawInput = memory.RawInput;
+pub const Forgetter = memory.Forgetter;
+pub const FuzzyStore = memory.FuzzyStore;
+pub const Lifecycle = memory.Lifecycle;
+
+// HyMem re-exports
+pub const HyperEdge = hypermem.HyperEdge;
+pub const HyMem = hypermem.HyMem;
+
+// Retrieval re-exports
+pub const HNSW = retrieval.HNSW;
+pub const StubEmbedder = retrieval.StubEmbedder;
+pub const HybridRetriever = retrieval.HybridRetriever;
+pub const Candidate = retrieval.Candidate;
+pub const RerankContext = retrieval.RerankContext;
+pub const ScoredCell = retrieval.ScoredCell;
+
+// Storage re-exports
+pub const WAL = storage.WAL;
+pub const WALRecord = storage.WALRecord;
+pub const WALRecordType = storage.WALRecordType;
+
+// Server re-exports
+pub const Server = server.Server;
 
 /// Library version. Keep in sync with `build.zig.zon`.
 pub const VERSION = "0.1.0-alpha";

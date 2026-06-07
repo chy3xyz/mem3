@@ -8,7 +8,7 @@ const std = @import("std");
 
 /// xxHash3 64-bit non-secret hash. Self-contained, no external dep.
 pub fn xxh3_64bits(input: []const u8) u64 {
-    return std.hash.XxHash3.hash(input);
+    return std.hash.XxHash3.hash(0, input);
 }
 
 /// Stable per-string hash (for HNSW stub embedder, where we want the same
