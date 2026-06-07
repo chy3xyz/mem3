@@ -1,0 +1,349 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>mem3 — TriSource-EverOS</title>
+  <!-- HAT stack: htmx + Alpine.js + Tailwind CSS — zero build step, all from CDN -->
+  <script src="https://unpkg.com/htmx.org@1.9.12" defer></script>
+  <script src="https://unpkg.com/[email protected]/dist/cdn.min.js" defer></script>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    [x-cloak] { display: none !important; }
+    /* 三源 配色 — 物=琥珀, 象=青, 性=紫 */
+    .src-matter  { background: #fef3c7; color: #78350f; }
+    .src-form    { background: #cffafe; color: #155e75; }
+    .src-spirit  { background: #ede9fe; color: #4c1d95; }
+    .src-matter-dark  { background: #78350f; }
+    .src-form-dark    { background: #155e75; }
+    .src-spirit-dark  { background: #4c1d95; }
+  </style>
+</head>
+<body class="bg-slate-50 min-h-screen text-slate-900 font-sans" x-data="mem3App()" x-init="init()" x-cloak>
+  <!-- Top bar -->
+  <header class="bg-white border-b border-slate-200 shadow-sm">
+    <div class="max-w-7xl mx-auto px-6 py-4 flex items-center justify-between">
+      <div>
+        <h1 class="text-2xl font-bold tracking-tight">
+          <span class="text-slate-900">mem</span><span class="text-indigo-600">3</span>
+          <span class="text-slate-400 text-sm font-normal ml-2">// TriSource-EverOS</span>
+        </h1>
+        <p class="text-xs text-slate-500 mt-1">
+          <span class="font-mono" x-text="version"></span> ·
+          <span class="font-mono" x-text="`${cellCount} cells`"></span> ·
+          <span class="font-mono" x-text="`${goalCount} goals`"></span> ·
+          <span x-text="`uptime ${uptime}s`"></span>
+        </p>
+      </div>
+      <div class="flex items-center gap-2">
+        <span class="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium"
+              :class="healthy ? 'bg-green-100 text-green-800' : 'bg-red-100 text-red-800'">
+          <span class="w-1.5 h-1.5 rounded-full mr-1.5"
+                :class="healthy ? 'bg-green-500' : 'bg-red-500'"></span>
+          <span x-text="healthy ? 'healthy' : 'down'"></span>
+        </span>
+        <button @click="refreshAll()"
+                class="text-xs px-3 py-1 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded transition">
+          ↻ Refresh
+        </button>
+      </div>
+    </div>
+  </header>
+
+  <main class="max-w-7xl mx-auto px-6 py-8 grid grid-cols-1 lg:grid-cols-3 gap-6">
+
+    <!-- LEFT: Add cell (Alpine form state) -->
+    <section class="bg-white rounded-lg shadow-sm border border-slate-200 p-5">
+      <h2 class="text-sm font-semibold text-slate-700 mb-4 uppercase tracking-wide">Encode Memory</h2>
+
+      <form @submit.prevent="addCell()" class="space-y-3">
+        <div>
+          <label class="block text-xs font-medium text-slate-600 mb-1">Source (物 / 象 / 性)</label>
+          <div class="grid grid-cols-3 gap-1">
+            <template x-for="src in ['matter','form','spirit']" :key="src">
+              <button type="button"
+                      @click="form.source = src"
+                      :class="form.source === src
+                        ? (src === 'matter' ? 'src-matter-dark text-white' : src === 'form' ? 'src-form-dark text-white' : 'src-spirit-dark text-white') + ' px-2 py-1.5 rounded text-xs font-semibold ring-2 ring-offset-1 ring-indigo-400'
+                        : (src === 'matter' ? 'src-matter' : src === 'form' ? 'src-form' : 'src-spirit') + ' px-2 py-1.5 rounded text-xs font-semibold opacity-60 hover:opacity-100'">
+                <span x-text="src"></span>
+              </button>
+            </template>
+          </div>
+        </div>
+
+        <div>
+          <label class="block text-xs font-medium text-slate-600 mb-1">Episode (raw interaction)</label>
+          <textarea x-model="form.episode" rows="3" required
+                    placeholder="user said 'how do I use Zig 0.17 std.Io?'"
+                    class="w-full text-sm border border-slate-300 rounded px-2 py-1.5 focus:ring-1 focus:ring-indigo-500 focus:border-indigo-500"></textarea>
+        </div>
+
+        <div>
+          <label class="block text-xs font-medium text-slate-600 mb-1">
+            Atomic Facts
+            <span class="text-slate-400 font-normal">(s|p|o; s|p|o)</span>
+          </label>
+          <input x-model="form.facts" type="text"
+                 placeholder="user|asked|Zig std.Io"
+                 class="w-full text-sm border border-slate-300 rounded px-2 py-1.5 font-mono" />
+        </div>
+
+        <div class="grid grid-cols-2 gap-2">
+          <div>
+            <label class="block text-xs font-medium text-slate-600 mb-1">Goal ID</label>
+            <input x-model.number="form.goalId" type="number" min="1" value="1"
+                   class="w-full text-sm border border-slate-300 rounded px-2 py-1.5" />
+          </div>
+          <div>
+            <label class="block text-xs font-medium text-slate-600 mb-1">Relevance</label>
+            <input x-model.number="form.relevance" type="number" step="0.05" min="0" max="1" value="0.8"
+                   class="w-full text-sm border border-slate-300 rounded px-2 py-1.5" />
+          </div>
+        </div>
+
+        <button type="submit" :disabled="sending"
+                class="w-full bg-indigo-600 hover:bg-indigo-700 disabled:bg-slate-300 text-white text-sm font-semibold py-2 rounded transition">
+          <span x-show="!sending">+ Encode MemCell</span>
+          <span x-show="sending" x-cloak>⏳ encoding…</span>
+        </button>
+
+        <div x-show="lastAddError" x-cloak
+             class="text-xs text-red-600 bg-red-50 border border-red-200 rounded px-2 py-1.5"
+             x-text="lastAddError"></div>
+        <div x-show="lastAddId" x-cloak
+             class="text-xs text-green-700 bg-green-50 border border-green-200 rounded px-2 py-1.5">
+          ✓ added memory id=<span x-text="lastAddId"></span>
+        </div>
+      </form>
+    </section>
+
+    <!-- MIDDLE: Cell list (htmx-driven, auto-refresh) -->
+    <section class="bg-white rounded-lg shadow-sm border border-slate-200 p-5">
+      <h2 class="text-sm font-semibold text-slate-700 mb-4 uppercase tracking-wide flex items-center justify-between">
+        <span>MemCells <span class="text-slate-400 font-normal" x-text="`(${cellCount})`"></span></span>
+        <div class="flex gap-1 text-xs">
+          <template x-for="src in ['all','matter','form','spirit']" :key="src">
+            <button @click="sourceFilter = src; refreshList()"
+                    :class="sourceFilter === src ? 'bg-slate-900 text-white' : 'bg-slate-100 text-slate-700 hover:bg-slate-200'"
+                    class="px-2 py-0.5 rounded">
+              <span x-text="src"></span>
+            </button>
+          </template>
+        </div>
+      </h2>
+
+      <div id="cell-list"
+           hx-get="/api/memcells"
+           hx-trigger="load, every 3s"
+           hx-swap="innerHTML"
+           class="space-y-2 max-h-[60vh] overflow-y-auto">
+        <div class="text-sm text-slate-400 text-center py-8">loading…</div>
+      </div>
+    </section>
+
+    <!-- RIGHT: Search (htmx form, results inline) -->
+    <section class="bg-white rounded-lg shadow-sm border border-slate-200 p-5">
+      <h2 class="text-sm font-semibold text-slate-700 mb-4 uppercase tracking-wide">Three-Way Recall</h2>
+
+      <form @submit.prevent="search()">
+        <div class="flex gap-2 mb-3">
+          <input x-model="query.text" type="text" required
+                 placeholder="Zig 0.17 std.Io…"
+                 class="flex-1 text-sm border border-slate-300 rounded px-2 py-1.5 focus:ring-1 focus:ring-indigo-500" />
+          <button type="submit" :disabled="querying"
+                  class="bg-slate-900 hover:bg-slate-800 disabled:bg-slate-300 text-white text-sm font-semibold px-3 rounded">
+            <span x-show="!querying">search</span>
+            <span x-show="querying" x-cloak>…</span>
+          </button>
+        </div>
+        <div class="flex items-center gap-3 text-xs text-slate-500 mb-3">
+          <label>topk
+            <input x-model.number="query.topk" type="number" min="1" max="50" value="10"
+                   class="w-12 ml-1 text-sm border border-slate-300 rounded px-1 py-0.5" />
+          </label>
+          <label>max-hops
+            <input x-model.number="query.maxHops" type="number" min="0" max="5" value="3"
+                   class="w-12 ml-1 text-sm border border-slate-300 rounded px-1 py-0.5" />
+          </label>
+        </div>
+      </form>
+
+      <div x-show="querying" x-cloak class="text-xs text-slate-400">⏳ running recall…</div>
+
+      <div id="query-results" class="space-y-2 max-h-[55vh] overflow-y-auto">
+        <template x-for="(r, i) in results" :key="r.id + '-' + i">
+          <div class="border border-slate-200 rounded p-2 hover:border-indigo-300 transition cursor-pointer"
+               @click="inspectCell(r.id)">
+            <div class="flex items-center justify-between mb-1">
+              <div class="flex items-center gap-1.5">
+                <span class="text-xs font-mono text-slate-400">#<span x-text="r.id"></span></span>
+                <span class="text-xs px-1.5 py-0.5 rounded font-semibold"
+                      :class="r.source === 'matter' ? 'src-matter' : r.source === 'form' ? 'src-form' : 'src-spirit'"
+                      x-text="r.source"></span>
+              </div>
+              <span class="text-xs font-mono font-semibold"
+                    :class="r.score > 0.7 ? 'text-green-600' : r.score > 0.4 ? 'text-amber-600' : 'text-slate-500'"
+                    x-text="r.score.toFixed(3)"></span>
+            </div>
+            <div class="text-xs text-slate-700 line-clamp-2" x-text="r.episode"></div>
+            <div class="flex gap-1 mt-1 flex-wrap" x-show="r.goals && r.goals.length > 0">
+              <template x-for="g in r.goals" :key="g.id">
+                <span class="text-[10px] font-mono px-1 py-0.5 bg-slate-100 text-slate-600 rounded">
+                  g<span x-text="g.id"></span>:<span x-text="g.relevance.toFixed(2)"></span>
+                </span>
+              </template>
+            </div>
+          </div>
+        </template>
+        <div x-show="!querying && results.length === 0" class="text-sm text-slate-400 text-center py-6">
+          run a search to see results
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <!-- Footer: constitution banner -->
+  <footer class="max-w-7xl mx-auto px-6 py-6 text-xs text-slate-500">
+    <div class="border-t border-slate-200 pt-4 flex flex-wrap items-center justify-between gap-2">
+      <span>
+        <span class="font-mono">三源合恰</span> ·
+        <span class="font-mono">物</span>/<span class="font-mono">象</span>/<span class="font-mono">性</span> ·
+        <span class="font-mono">GHW</span>
+        <span class="font-mono">Goal/Harness/World</span> ·
+        single binary 2.4 MB · zero deps
+      </span>
+      <span>
+        <a href="https://github.com/yourname/mem3" class="hover:text-indigo-600">source</a> ·
+        <a href="/healthz" class="hover:text-indigo-600">health</a> ·
+        <a href="/metrics" class="hover:text-indigo-600">metrics</a>
+      </span>
+    </div>
+  </footer>
+
+  <!-- ============================================================== -->
+  <!-- Alpine app -->
+  <!-- ============================================================== -->
+  <script>
+    function mem3App() {
+      return {
+        // ---- state ----
+        version: '0.1.0-alpha',
+        healthy: false,
+        cellCount: 0,
+        goalCount: 0,
+        uptime: 0,
+        sourceFilter: 'all',
+        sending: false,
+        querying: false,
+        lastAddId: null,
+        lastAddError: null,
+        form: { source: 'matter', episode: '', facts: '', goalId: 1, relevance: 0.8 },
+        query: { text: '', topk: 10, maxHops: 3 },
+        results: [],
+
+        // ---- init ----
+        async init() {
+          this.start = Date.now();
+          setInterval(() => { this.uptime = Math.floor((Date.now() - this.start) / 1000); }, 1000);
+          await this.refreshAll();
+          // Re-render the cell list with current filter.
+          this.refreshList();
+        },
+
+        // ---- API calls ----
+        async refreshAll() {
+          try {
+            const h = await fetch('/healthz').then(r => r.json());
+            this.healthy = !!h.status;
+            this.version = h.version || this.version;
+          } catch (_) { this.healthy = false; }
+
+          try {
+            const goals = await fetch('/api/goals').then(r => r.json());
+            this.goalCount = Array.isArray(goals) ? goals.length : 0;
+          } catch (_) { this.goalCount = 0; }
+
+          try {
+            const list = await fetch('/api/memcells').then(r => r.json());
+            this.cellCount = Array.isArray(list) ? list.length : 0;
+          } catch (_) { this.cellCount = 0; }
+        },
+
+        async refreshList() {
+          // Re-trigger htmx load by toggling the hx-trigger.
+          const el = document.getElementById('cell-list');
+          if (el) {
+            el.setAttribute('hx-vals', JSON.stringify({ source: this.sourceFilter }));
+            if (window.htmx) window.htmx.trigger(el, 'load');
+          }
+        },
+
+        async addCell() {
+          this.sending = true;
+          this.lastAddError = null;
+          this.lastAddId = null;
+          try {
+            const res = await fetch('/api/memcells', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                source: this.form.source,
+                episode: this.form.episode,
+                facts: this.form.facts,
+                goalId: this.form.goalId,
+                relevance: this.form.relevance,
+              }),
+            });
+            if (!res.ok) {
+              const err = await res.text();
+              throw new Error(err);
+            }
+            const data = await res.json();
+            this.lastAddId = data.id;
+            this.form.episode = '';
+            this.form.facts = '';
+            await this.refreshAll();
+            this.refreshList();
+          } catch (e) {
+            this.lastAddError = String(e.message || e);
+          } finally {
+            this.sending = false;
+          }
+        },
+
+        async search() {
+          if (!this.query.text.trim()) return;
+          this.querying = true;
+          this.results = [];
+          try {
+            const res = await fetch('/api/query', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                text: this.query.text,
+                topk: this.query.topk,
+                maxHops: this.query.maxHops,
+              }),
+            });
+            const data = await res.json();
+            this.results = data.results || [];
+          } catch (e) {
+            console.error(e);
+            this.results = [];
+          } finally {
+            this.querying = false;
+          }
+        },
+
+        async inspectCell(id) {
+          try {
+            const cell = await fetch('/api/memcells/' + id).then(r => r.json());
+            alert(JSON.stringify(cell, null, 2));
+          } catch (e) { console.error(e); }
+        },
+      };
+    }
+  </script>
+</body>
+</html>
