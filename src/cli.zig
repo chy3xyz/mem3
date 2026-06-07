@@ -102,6 +102,18 @@ pub fn parse(alloc: Allocator, iter: *ArgIterator) !Parsed {
             p.port = std.fmt.parseInt(u16, arg["--port=".len..], 10) catch 7777;
             continue;
         }
+        if (std.mem.eql(u8, arg, "--port")) {
+            try p.args.append(alloc, .{ .key = "--port", .value = null });
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--bind")) {
+            try p.args.append(alloc, .{ .key = "--bind", .value = null });
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--data-dir")) {
+            try p.args.append(alloc, .{ .key = "--data-dir", .value = null });
+            continue;
+        }
         if (next_subcommand) {
             next_subcommand = false;
             p.cmd = try subcommandFromName(arg);
@@ -117,6 +129,18 @@ pub fn parse(alloc: Allocator, iter: *ArgIterator) !Parsed {
             }
         }
         try p.args.append(alloc, parseArg(alloc, arg));
+    }
+    // Post-process: lift space-form flag values into their fields.
+    for (p.args.items) |a| {
+        if (a.value) |v| {
+            if (std.mem.eql(u8, a.key, "--port")) {
+                p.port = std.fmt.parseInt(u16, v, 10) catch p.port;
+            } else if (std.mem.eql(u8, a.key, "--bind")) {
+                p.bind = v;
+            } else if (std.mem.eql(u8, a.key, "--data-dir")) {
+                p.data_dir = v;
+            }
+        }
     }
     return p;
 }

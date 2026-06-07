@@ -6,12 +6,14 @@ const cli = @import("../cli.zig");
 const server = @import("../server/http_server.zig");
 
 pub fn run(alloc: std.mem.Allocator, p: cli.Parsed) !void {
-    const srv = try server.Server.init(alloc, p.bind, p.port);
+    const srv = try server.Server.init(alloc, p.bind, p.port, p.data_dir);
     defer srv.deinit();
     try srv.listen();
     std.debug.print("mem3 v0.1.0-alpha listening on http://{s}:{d}\n", .{ p.bind, p.port });
+    std.debug.print("  data dir:  {s}\n", .{p.data_dir});
     std.debug.print("  web UI:    http://{s}:{d}/\n", .{ p.bind, p.port });
     std.debug.print("  health:    http://{s}:{d}/healthz\n", .{ p.bind, p.port });
     std.debug.print("  metrics:   http://{s}:{d}/metrics\n", .{ p.bind, p.port });
+    std.debug.print("  sync:      POST http://{s}:{d}/api/sync\n", .{ p.bind, p.port });
     try srv.serve();
 }

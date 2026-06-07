@@ -6,6 +6,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const c = std.c;
 const core = @import("../core/mod.zig");
 const MemCell = core.MemCell;
 const HyperEdge = @import("../hypermem/hyperedge.zig").HyperEdge;
@@ -33,7 +34,7 @@ pub const WALRecord = struct {
     timestamp: i64,
 
     pub fn checksum(self: *const WALRecord) u32 {
-        var h = std.hash.XxHash3.init();
+        var h = std.hash.XxHash3.init(0);
         h.update(&[_]u8{@intFromEnum(self.record_type)});
         h.update(self.payload);
         h.update(&std.mem.toBytes(self.timestamp));
@@ -44,7 +45,9 @@ pub const WALRecord = struct {
 pub const WAL = struct {
     alloc: Allocator,
     path: []const u8,
-    file: ?std.fs.File,
+    /// POSIX file descriptor (c_int). -1 when closed. Using raw fd avoids
+    /// Zig 0.17's Io-based std.fs API which is awkward in this context.
+    fd: c_int = -1,
     /// Records appended in this session (not yet flushed to disk).
     buffer: std.ArrayList(u8),
     /// Number of records written.
@@ -56,26 +59,35 @@ pub const WAL = struct {
         return .{
             .alloc = alloc,
             .path = try alloc.dupe(u8, path),
-            .file = null,
+            .fd = -1,
             .buffer = .empty,
         };
     }
 
     pub fn deinit(self: *WAL) void {
-        if (self.file) |f| f.close();
+        if (self.fd >= 0) {
+            _ = c.close(self.fd);
+            self.fd = -1;
+        }
         self.alloc.free(self.path);
         self.buffer.deinit(self.alloc);
     }
 
-    /// Open (or create) the WAL file.
+    /// Open (or create) the WAL file in append mode.
     pub fn open(self: *WAL) !void {
-        const f = try std.fs.cwd().createFile(self.path, .{ .read = true, .truncate = false });
-        errdefer f.close();
-        self.file = f;
+        // Build NUL-terminated path.
+        var path_buf: [std.fs.max_path_bytes + 1]u8 = undefined;
+        const path_z = try std.fmt.bufPrint(&path_buf, "{s}\x00", .{self.path});
+        const flags: c.O = .{ .CREAT = true, .APPEND = true, .ACCMODE = .WRONLY };
+        const fd = c.open(path_z[0 .. path_z.len - 1 :0].ptr, flags, @as(c.mode_t, 0o644));
+        if (fd < 0) return error.WALOpenFailed;
+        self.fd = fd;
     }
 
     /// Append a record. The record is buffered; call `flush()` to write
-    /// to disk.
+    /// to disk. For durability, every record is flushed immediately
+    /// (`sync_every_n = 1`); high-throughput callers may override the
+    /// field directly to batch.
     pub fn append(self: *WAL, rec: WALRecord) !void {
         const cs = rec.checksum();
         // Layout: [len:u32 LE][type:u8][payload:N][ts:i64 LE][checksum:u32 LE]
@@ -93,16 +105,28 @@ pub const WAL = struct {
         std.mem.writeInt(u32, &cs_bytes, cs, .little);
         try self.buffer.appendSlice(self.alloc, &cs_bytes);
         self.record_count += 1;
-        if (self.record_count % self.sync_every_n == 0) {
-            try self.flush();
-        }
+        // Flush after every record to make this safe for crash recovery.
+        try self.flush();
     }
 
-    /// Flush the buffer to disk.
+    /// Flush the buffer to disk. After a successful flush, the data is
+    /// `fsync`d so it survives a process crash.
     pub fn flush(self: *WAL) !void {
-        const f = self.file orelse return error.WALCorrupt;
+        if (self.fd < 0) return error.WALCorrupt;
         if (self.buffer.items.len == 0) return;
-        try f.writeAll(self.buffer.items);
+        var pos: usize = 0;
+        while (pos < self.buffer.items.len) {
+            const n = c.write(self.fd, self.buffer.items[pos..].ptr, self.buffer.items.len - pos);
+            if (n < 0) return error.WALWriteFailed;
+            if (n == 0) return error.WALWriteFailed;
+            pos += @intCast(n);
+        }
+        // fsync — durability on process crash. Non-fatal if it fails
+        // (network FS, etc.) since the data is already in the OS page cache.
+        const fsync_rc = c.fsync(self.fd);
+        if (fsync_rc != 0) {
+            std.log.warn("WAL fsync returned {d} (data is in OS cache, may be lost on hard crash)", .{fsync_rc});
+        }
         self.buffer.clearRetainingCapacity();
     }
 
@@ -112,8 +136,8 @@ pub const WAL = struct {
     pub fn replay(
         self: *WAL,
         data: []const u8,
-        cb: *const fn (ctx: anytype, rec: WALRecord) anyerror!void,
         ctx: anytype,
+        comptime cb: fn (ctx: @TypeOf(ctx), rec: WALRecord) anyerror!void,
     ) !void {
         _ = self;
         var pos: usize = 0;

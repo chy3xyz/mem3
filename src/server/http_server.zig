@@ -1,16 +1,18 @@
 //! HTTP server — minimal HTTP/1.1 over POSIX sockets with in-process store.
 //!
-//! **v0.1.0-alpha limitation**: store is process-local; data does not
-//! persist across restarts. WASM/LibSQL persistence lands in v0.2.0.
+//! **Persistence (v0.1.0+)**: writes are journaled to a Write-Ahead Log at
+//! `data_dir/mem3.wal`. On startup the WAL is replayed to reconstruct the
+//! in-process store. Use `data_dir` to switch storage locations.
 //!
 //! **Constitution FR-017** endpoints:
 //!   - GET  /                            — web UI (htmx + Alpine.js + Tailwind)
 //!   - GET  /api/memcells                — list
 //!   - GET  /api/memcells/{id}           — single
-//!   - POST /api/memcells                — create
+//!   - POST /api/memcells                — create (WAL-durable)
 //!   - GET  /api/goals                   — list
 //!   - POST /api/query                   — three-way recall
 //!   - GET  /healthz, /metrics           — observability
+//!   - POST /api/sync                    — flush WAL to disk
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -26,6 +28,8 @@ const ghw = @import("../ghw/mod.zig");
 const memory = @import("../memory/mod.zig");
 const retrieval = @import("../retrieval/mod.zig");
 const HNSW = retrieval.HNSW;
+const WAL = @import("../storage/wal.zig").WAL;
+const WALRecord = @import("../storage/wal.zig").WALRecord;
 
 const log = std.log.scoped(.mem3_server);
 
@@ -52,8 +56,10 @@ const Store = struct {
     hnsw: *HNSW,
     emb: retrieval.StubEmbedder,
     cell_index: std.AutoHashMap(u64, *MemCell),
+    /// WAL for crash-safe persistence. Optional so tests / dry-runs can opt out.
+    wal: ?*WAL,
 
-    fn init(alloc: Allocator) !*Store {
+    fn init(alloc: Allocator, data_dir: []const u8) !*Store {
         const self = try alloc.create(Store);
         self.* = .{
             .alloc = alloc,
@@ -64,6 +70,7 @@ const Store = struct {
             .hnsw = undefined,
             .emb = undefined,
             .cell_index = std.AutoHashMap(u64, *MemCell).init(alloc),
+            .wal = null,
         };
         // Goals
         var goals = try alloc.create(ghw.GoalPoset);
@@ -86,10 +93,18 @@ const Store = struct {
         hnsw.* = HNSW.init(alloc, .{}, 384);
         self.hnsw = hnsw;
         self.emb = retrieval.StubEmbedder.init(384);
+        // Open WAL (best-effort) and replay if data_dir exists.
+        try self.openAndReplayWAL(data_dir);
         return self;
     }
 
     fn deinit(self: *Store) void {
+        if (self.wal) |w| {
+            w.flush() catch {};
+            w.deinit();
+            self.alloc.destroy(w);
+            self.wal = null;
+        }
         var it = self.cell_index.iterator();
         while (it.next()) |_| {}
         self.cell_index.deinit();
@@ -112,6 +127,30 @@ const Store = struct {
         facts: []const u8,
         goal_id: u64,
         relevance: f32,
+    ) !u64 {
+        return self.addRawInternal(source, episode, facts, goal_id, relevance, true);
+    }
+
+    /// Replay helper: same as addRaw but skips WAL writes (avoid re-recording replayed records).
+    fn addRawNoWAL(
+        self: *Store,
+        source: MemorySource,
+        episode: []const u8,
+        facts: []const u8,
+        goal_id: u64,
+        relevance: f32,
+    ) !u64 {
+        return self.addRawInternal(source, episode, facts, goal_id, relevance, false);
+    }
+
+    fn addRawInternal(
+        self: *Store,
+        source: MemorySource,
+        episode: []const u8,
+        facts: []const u8,
+        goal_id: u64,
+        relevance: f32,
+        write_wal: bool,
     ) !u64 {
         var fact_list = std.ArrayList(fact).empty;
         defer fact_list.deinit(self.alloc);
@@ -155,7 +194,167 @@ const Store = struct {
                 log.warn("hnsw insert failed: {}", .{err});
             };
         }
+
+        // Persist to WAL after the in-memory state is consistent.
+        if (write_wal) {
+            if (self.wal) |wal| {
+                const payload = try self.encodeWALPayload(source, episode, facts, goal_id, relevance);
+                defer self.alloc.free(payload);
+                const ts_s: i64 = @intCast(@divTrunc(nowNs(), std.time.ns_per_s));
+                try wal.append(.{
+                    .record_type = .memcell_insert,
+                    .payload = payload,
+                    .timestamp = ts_s,
+                });
+            }
+        }
         return id;
+    }
+
+    /// Encode a memcell_insert WAL payload as a length-prefixed JSON document.
+    /// Fields: { source, episode, facts, goal_id, relevance }.
+    fn encodeWALPayload(
+        self: *Store,
+        source: MemorySource,
+        episode: []const u8,
+        facts: []const u8,
+        goal_id: u64,
+        relevance: f32,
+    ) ![]u8 {
+        // Use std.fmt.allocPrint to produce a self-contained JSON object.
+        // Strings are JSON-escaped inline. Episodes come from the API and
+        // may contain quotes, backslashes, and control characters; we
+        // escape them as we copy.
+        var out = std.ArrayList(u8).empty;
+        defer out.deinit(self.alloc);
+        try out.append(self.alloc, '{');
+        try jsonFieldStringRaw(self.alloc, &out, "source", source.label());
+        try out.append(self.alloc, ',');
+        try jsonFieldStringRaw(self.alloc, &out, "episode", episode);
+        try out.append(self.alloc, ',');
+        try jsonFieldStringRaw(self.alloc, &out, "facts", facts);
+        try out.append(self.alloc, ',');
+        try jsonFieldUintRaw(self.alloc, &out, "goal_id", goal_id);
+        try out.append(self.alloc, ',');
+        try jsonFieldFloatRaw(self.alloc, &out, "relevance", relevance);
+        try out.append(self.alloc, '}');
+        return out.toOwnedSlice(self.alloc);
+    }
+
+    /// Open the WAL at data_dir/mem3.wal and replay any prior records.
+    /// Creates the directory if missing. Silently no-ops if no WAL exists.
+    fn openAndReplayWAL(self: *Store, data_dir: []const u8) !void {
+        const dir_path = try self.alloc.dupe(u8, data_dir);
+        defer self.alloc.free(dir_path);
+
+        // Recursive mkdir (mkdir -p). 0.17 std has no public makeDir API,
+        // so we shell out to the C `mkdir` syscall per path component.
+        var it = std.mem.splitScalar(u8, dir_path, '/');
+        var prefix: std.ArrayList(u8) = .empty;
+        defer prefix.deinit(self.alloc);
+        // Absolute path starting with / : add a leading slash.
+        if (dir_path.len > 0 and dir_path[0] == '/') {
+            try prefix.append(self.alloc, '/');
+        }
+        while (it.next()) |component| {
+            if (component.len == 0) continue;
+            if (prefix.items.len > 0 and prefix.items[prefix.items.len - 1] != '/') {
+                try prefix.append(self.alloc, '/');
+            }
+            try prefix.appendSlice(self.alloc, component);
+            var zbuf: [std.fs.max_path_bytes + 1]u8 = undefined;
+            const z = std.fmt.bufPrint(&zbuf, "{s}\x00", .{prefix.items}) catch continue;
+            const rc = std.c.mkdir(z[0 .. z.len - 1 :0].ptr, 0o755);
+            std.debug.print("WAL: mkdir({s}) rc={d}\n", .{ prefix.items, rc });
+        }
+
+        const wal_path = std.fs.path.join(self.alloc, &.{ data_dir, "mem3.wal" }) catch |err| {
+            log.warn("path.join failed: {}; persistence disabled", .{err});
+            return;
+        };
+        defer self.alloc.free(wal_path);
+
+        // Build a NUL-terminated copy for C open() calls.
+        var wal_z_buf: [std.fs.max_path_bytes + 1]u8 = undefined;
+        const wal_z = std.fmt.bufPrint(&wal_z_buf, "{s}\x00", .{wal_path}) catch {
+            log.warn("path too long", .{});
+            return;
+        };
+        const wal_z_slice = wal_z[0 .. wal_z.len - 1 :0];
+
+        // Try to read existing WAL via POSIX open (0.17 has no fs.openFileAbsolute).
+        var existing: std.ArrayList(u8) = .empty;
+        defer existing.deinit(self.alloc);
+
+        const fd = std.c.open(wal_z_slice.ptr, std.c.O{}, @as(c.mode_t, 0));
+        if (fd >= 0) {
+            defer _ = std.c.close(fd);
+            var stat_buf: std.c.Stat = undefined;
+            if (std.c.fstat(fd, &stat_buf) == 0) {
+                const size: usize = @intCast(@max(0, stat_buf.size));
+                if (size > 0) {
+                    const buf = try self.alloc.alloc(u8, size);
+                    defer self.alloc.free(buf);
+                    var got: usize = 0;
+                    while (got < size) {
+                        const n = std.c.read(fd, buf[got..].ptr, size - got);
+                        if (n <= 0) break;
+                        got += @intCast(n);
+                    }
+                    try existing.appendSlice(self.alloc, buf[0..got]);
+                }
+            }
+        }
+        // Now allocate the WAL (it will createFile on open()).
+        const wal_ptr = self.alloc.create(WAL) catch |err| {
+            std.debug.print("WAL: alloc failed: {s}\n", .{@errorName(err)});
+            return;
+        };
+        const init_wal = WAL.init(self.alloc, wal_path) catch |err| {
+            std.debug.print("WAL: init failed: {s}\n", .{@errorName(err)});
+            self.alloc.destroy(wal_ptr);
+            return;
+        };
+        wal_ptr.* = init_wal;
+        wal_ptr.open() catch |err| {
+            std.debug.print("WAL: open({s}) failed: {s}\n", .{ wal_path, @errorName(err) });
+            wal_ptr.deinit();
+            self.alloc.destroy(wal_ptr);
+            return;
+        };
+        std.debug.print("WAL: opened {s} (replay={d} bytes)\n", .{ wal_path, existing.items.len });
+        self.wal = wal_ptr;
+        if (existing.items.len == 0) return;
+
+        // Replay records.
+        var replay_count: u64 = 0;
+        const Ctx = struct {
+            store: *Store,
+            count: *u64,
+        };
+        var ctx = Ctx{ .store = self, .count = &replay_count };
+        wal_ptr.replay(existing.items, &ctx, struct {
+            fn cb(ctx_ptr: *Ctx, rec: WALRecord) anyerror!void {
+                if (rec.record_type != .memcell_insert) return;
+                const parsed = parseInsertPayload(rec.payload) orelse return;
+                var local_parsed = parsed;
+                defer local_parsed.deinit(ctx_ptr.store.alloc);
+                _ = ctx_ptr.store.addRawNoWAL(
+                    parsed.source,
+                    parsed.episode,
+                    parsed.facts,
+                    parsed.goal_id,
+                    parsed.relevance,
+                ) catch |err| {
+                    std.log.warn("replay insert failed: {}", .{err});
+                    return;
+                };
+                ctx_ptr.count.* += 1;
+            }
+        }.cb) catch |err| {
+            log.warn("WAL replay stopped at record {d}: {}", .{ replay_count, err });
+        };
+        std.debug.print("WAL: replayed {d} memcell_insert records from {s}\n", .{ replay_count, wal_path });
     }
 
     fn allCells(self: *Store, alloc: Allocator) ![]*MemCell {
@@ -207,9 +406,9 @@ pub const Server = struct {
     boot_time_ns: u128,
     metrics: Metrics,
 
-    pub fn init(alloc: Allocator, bind: []const u8, port: u16) !*Server {
+    pub fn init(alloc: Allocator, bind: []const u8, port: u16, data_dir: []const u8) !*Server {
         const self = try alloc.create(Server);
-        const store = try Store.init(alloc);
+        const store = try Store.init(alloc, data_dir);
         self.* = .{
             .alloc = alloc,
             .bind = try alloc.dupe(u8, bind),
@@ -338,7 +537,22 @@ pub const Server = struct {
         if (std.mem.eql(u8, path, "/api/query") and std.mem.eql(u8, method, "POST")) {
             return try self.handleQuery(full_request);
         }
+        if (std.mem.eql(u8, path, "/api/sync") and std.mem.eql(u8, method, "POST")) {
+            return try self.handleSync();
+        }
         return try self.textResponse(404, "Not Found", "404 not found\n");
+    }
+
+    fn handleSync(self: *Server) !Response {
+        if (self.store.wal) |wal| {
+            wal.flush() catch |err| {
+                return try self.jsonResponse(500, "Internal Server Error",
+                    try std.fmt.allocPrint(self.alloc, "{{\"error\":\"flush failed: {s}\"}}", .{@errorName(err)}));
+            };
+        }
+        return try self.jsonResponse(200, "OK",
+            \\{"status":"synced"}
+        );
     }
 
     fn handleListMemcells(self: *Server) !Response {
@@ -529,7 +743,14 @@ fn extractJsonString(body: []const u8, key: []const u8) ?[]const u8 {
     if (pos >= body.len or body[pos] != '"') return null;
     pos += 1;
     const start = pos;
-    while (pos < body.len and body[pos] != '"') : (pos += 1) {}
+    // Walk to terminating unescaped quote.
+    while (pos < body.len) : (pos += 1) {
+        if (body[pos] == '\\') {
+            pos += 1; // skip escaped char (any byte)
+            continue;
+        }
+        if (body[pos] == '"') break;
+    }
     if (pos >= body.len) return null;
     return body[start..pos];
 }
@@ -610,7 +831,7 @@ fn jsonAppendCell(alloc: Allocator, out: *std.ArrayList(u8), cell: *const MemCel
 
 test "Server: healthz route" {
     const alloc = std.testing.allocator;
-    var srv = try Server.init(alloc, "127.0.0.1", 0);
+    var srv = try Server.init(alloc, "127.0.0.1", 0, "data/test_server");
     defer srv.deinit();
     const resp = try srv.route("GET", "/healthz", "");
     try std.testing.expectEqual(@as(u16, 200), resp.status);
@@ -619,10 +840,79 @@ test "Server: healthz route" {
 
 test "Server: GET /api/goals" {
     const alloc = std.testing.allocator;
-    var srv = try Server.init(alloc, "127.0.0.1", 0);
+    var srv = try Server.init(alloc, "127.0.0.1", 0, "data/test_server");
     defer srv.deinit();
     const resp = try srv.route("GET", "/api/goals", "");
     defer alloc.free(resp.body);
     try std.testing.expectEqual(@as(u16, 200), resp.status);
     try std.testing.expect(std.mem.indexOf(u8, resp.body, "general") != null);
+}
+
+// =============================================================================
+// WAL payload helpers
+// =============================================================================
+
+/// JSON-escaped string field: "key":"escaped value".
+fn jsonFieldStringRaw(alloc: Allocator, out: *std.ArrayList(u8), key: []const u8, value: []const u8) !void {
+    try out.append(alloc, '"');
+    for (key) |kc| try out.append(alloc, kc);
+    try out.appendSlice(alloc, "\":\"");
+    for (value) |vc| {
+        switch (vc) {
+            '"' => try out.appendSlice(alloc, "\\\""),
+            '\\' => try out.appendSlice(alloc, "\\\\"),
+            '\n' => try out.appendSlice(alloc, "\\n"),
+            '\r' => try out.appendSlice(alloc, "\\r"),
+            '\t' => try out.appendSlice(alloc, "\\t"),
+            0...7, 11, 14...31 => {
+                var buf: [8]u8 = undefined;
+                const s = std.fmt.bufPrint(&buf, "\\u{x:0>4}", .{vc}) catch continue;
+                try out.appendSlice(alloc, s);
+            },
+            else => try out.append(alloc, vc),
+        }
+    }
+    try out.append(alloc, '"');
+}
+
+fn jsonFieldUintRaw(alloc: Allocator, out: *std.ArrayList(u8), key: []const u8, value: u64) !void {
+    var buf: [32]u8 = undefined;
+    const s = std.fmt.bufPrint(&buf, "\"{s}\":{d}", .{ key, value }) catch unreachable;
+    try out.appendSlice(alloc, s);
+}
+
+fn jsonFieldFloatRaw(alloc: Allocator, out: *std.ArrayList(u8), key: []const u8, value: f32) !void {
+    var buf: [48]u8 = undefined;
+    const s = std.fmt.bufPrint(&buf, "\"{s}\":{d:.6}", .{ key, value }) catch unreachable;
+    try out.appendSlice(alloc, s);
+}
+
+const ParsedInsert = struct {
+    source: MemorySource,
+    /// Borrowed slices from the parent payload buffer; no need to free.
+    episode: []const u8,
+    facts: []const u8,
+    goal_id: u64,
+    relevance: f32,
+
+    pub fn deinit(_: *ParsedInsert, _: Allocator) void {}
+};
+
+/// Parse a JSON payload of shape { source, episode, facts, goal_id, relevance }.
+fn parseInsertPayload(payload: []const u8) ?ParsedInsert {
+    const source_str = extractJsonString(payload, "source") orelse "matter";
+    const source = core.MemorySource.fromString(source_str) catch return null;
+    const episode = extractJsonString(payload, "episode") orelse return null;
+    const facts = extractJsonString(payload, "facts") orelse "";
+    const goal_id_i: i64 = extractJsonInt(payload, "goal_id") orelse extractJsonInt(payload, "goalId") orelse 1;
+    if (goal_id_i < 0) return null;
+    const goal_id: u64 = @intCast(goal_id_i);
+    const relevance_f: f32 = extractJsonFloat(payload, "relevance") orelse 0.5;
+    return .{
+        .source = source,
+        .episode = episode,
+        .facts = facts,
+        .goal_id = goal_id,
+        .relevance = relevance_f,
+    };
 }
