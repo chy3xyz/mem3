@@ -229,15 +229,17 @@ pub const HNSW = struct {
     fn connect(self: *HNSW, a: u64, b: u64, level: u8) !void {
         const a_node = self.nodes.getPtr(a) orelse return;
         const b_node = self.nodes.getPtr(b) orelse return;
-        if (level < a_node.neighbors.len) try a_node.neighbors[level].append(self.alloc, b);
-        if (level < b_node.neighbors.len) try b_node.neighbors[level].append(self.alloc, a);
+        if (level < a_node.*.neighbors.len) try a_node.*.neighbors[level].append(self.alloc, b);
+        if (level < b_node.*.neighbors.len) try b_node.*.neighbors[level].append(self.alloc, a);
     }
 
     fn randomLevel(self: *HNSW) u8 {
         // Exponential distribution with `1/M` probability.
+        var prng = std.Random.DefaultPrng.init(@intCast(@intFromPtr(&self) ^ 0xDEADBEEF));
+        const rand = prng.random();
         var lvl: u8 = 0;
         while (lvl < 16) : (lvl += 1) {
-            const r = std.crypto.random.float(f32);
+            const r = rand.float(f32);
             if (r > 1.0 / @as(f32, @floatFromInt(self.cfg.hnsw_m))) break;
         }
         return lvl;

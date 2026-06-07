@@ -80,12 +80,14 @@ pub const Forgetter = struct {
         return cell.metadata.importance_score * decay;
     }
 
+    pub const SweepResult = struct { fuzzied: usize, kept: usize, archived: usize };
+
     /// Run the forgetting sweep. Returns counts of (fuzzied, kept).
     pub fn sweep(
         self: *Forgetter,
         mgr: *TriSourceManager,
         dry_run: bool,
-    ) !struct { fuzzied: usize, kept: usize, archived: usize } {
+    ) !SweepResult {
         const now = time.nowMs();
         var fuzzied: usize = 0;
         var kept: usize = 0;

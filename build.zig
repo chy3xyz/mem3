@@ -101,6 +101,26 @@ pub fn build(b: *std.Build) void {
     const run_notebook = b.addRunArtifact(notebook_exe);
     const notebook_step = b.step("example-notebook", "Run the researcher's notebook example");
     notebook_step.dependOn(&run_notebook.step);
+
+    // =========================================================================
+    // Example: `zig build example-loadtest`
+    // =========================================================================
+    const loadtest_module = b.createModule(.{
+        .root_source_file = b.path("examples/loadtest.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+        .imports = &.{
+            .{ .name = "mem3", .module = libmem3_module },
+        },
+    });
+    const loadtest_exe = b.addExecutable(.{
+        .name = "loadtest",
+        .root_module = loadtest_module,
+    });
+    b.installArtifact(loadtest_exe);
+    const run_loadtest = b.addRunArtifact(loadtest_exe);
+    const loadtest_step = b.step("example-loadtest", "Run the production load test (1000 cells + 200 queries)");
+    loadtest_step.dependOn(&run_loadtest.step);
 }
 
 fn addAllTests(
