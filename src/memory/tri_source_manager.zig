@@ -76,8 +76,11 @@ pub const TriSourceManager = struct {
     /// `Store.addRawInternal`, which pre-assigns the id so the WAL record
     /// can name the cell before it exists in memory. The id is NOT
     /// validated against `next_id`; the caller is responsible for
-    /// monotonic uniqueness.
+    /// monotonic uniqueness. Rejects duplicate ids with
+    /// `errors.DuplicateId` so the manager's own bookkeeping (cell_ptr
+    /// storage + map insertion) can't be silently overwritten.
     pub fn addWithId(self: *TriSourceManager, id: u64, cell: MemCell) errors!u64 {
+        if (self.get(id) != null) return errors.DuplicateId;
         // Spirit-dimension check.
         if (cell.foresight.len == 0 and cell.goal_associations.len == 0) {
             return errors.SpiritDimMissing;

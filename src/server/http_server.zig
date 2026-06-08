@@ -46,6 +46,15 @@ fn nowNs() u128 {
         @as(u128, @as(u64, @bitCast(nsec_i)));
 }
 
+/// Unix epoch in seconds (CLOCK_REALTIME). Use this for human-meaningful
+/// timestamps (WAL record timestamps, audit logs). Do NOT use for
+/// measuring elapsed time — use `nowNs` for that.
+fn wallClockSec() i64 {
+    var ts: std.c.timespec = .{ .sec = 0, .nsec = 0 };
+    _ = std.c.clock_gettime(std.c.CLOCK.REALTIME, &ts);
+    return @intCast(ts.sec);
+}
+
 /// In-process memory store. Lives for the duration of the server.
 const Store = struct {
     alloc: Allocator,
@@ -150,11 +159,10 @@ const Store = struct {
                 built.cell.metadata,
             );
             defer self.alloc.free(payload);
-            const ts_s: i64 = @intCast(@divTrunc(nowNs(), std.time.ns_per_s));
             try wal.append(.{
                 .record_type = .memcell_insert,
                 .payload = payload,
-                .timestamp = ts_s,
+                .timestamp = wallClockSec(),
             });
         }
         try self.commitBuiltCell(id, built);
@@ -178,20 +186,27 @@ const Store = struct {
         return id;
     }
 
-    /// A built cell plus the lists it borrows from. Caller must
-    /// `deinit()` AFTER mgr has duped the slices (i.e. after a
-    /// successful `commitBuiltCell`).
+    /// A built cell plus the heap-allocated lists it borrows FROM. The
+    /// cell's *internal* slices (episode, atomic_facts, etc.) are still
+    /// borrowed from the caller — this struct does NOT own them.
+    /// Caller must `deinit()` AFTER mgr has duped the slices (i.e.
+    /// after a successful `commitBuiltCell`). On errdefer paths
+    /// (failure before commit) the deinit is still safe because the
+    /// inner slices haven't been duped anywhere; the caller's defer
+    /// owns their lifetime.
     const BuiltCell = struct {
         cell: *MemCell,
         fact_list: *std.ArrayList(fact),
         goal_list: *std.ArrayList(goal_assoc_t),
 
+        /// Free the heap-allocated containers we own. Does NOT free
+        /// the cell's inner slices — those belong to the caller until
+        /// mgr.addWithId dups them.
         pub fn deinit(self: *const BuiltCell, alloc: Allocator) void {
             self.fact_list.deinit(alloc);
             self.goal_list.deinit(alloc);
             alloc.destroy(self.fact_list);
             alloc.destroy(self.goal_list);
-            self.cell.deinit(alloc);
             alloc.destroy(self.cell);
         }
     };
@@ -500,33 +515,57 @@ const Store = struct {
         // Replay records.
         var replay_count: u64 = 0;
         var max_replayed_id: u64 = 0;
+        // Records from before commit 5c3fdb9 (which added the "id" WAL
+        // field) have no id. We synthesize one in a high range
+        // (≥ 1_000_000_000) so they can't collide with fresh inserts. The
+        // ordinal counter resets on every boot, but that's fine — the
+        // SAME record gets the SAME synthetic id on every replay, and
+        // the cell content (episode/facts/etc.) is stable, so external
+        // observers see a stable id.
+        var synthetic_id_seq: u64 = 0;
+        const SYNTHETIC_ID_BASE: u64 = 1_000_000_000;
         const Ctx = struct {
             store: *Store,
             count: *u64,
             max_id: *u64,
+            synthetic_seq: *u64,
         };
-        var ctx = Ctx{ .store = self, .count = &replay_count, .max_id = &max_replayed_id };
+        var ctx = Ctx{
+            .store = self,
+            .count = &replay_count,
+            .max_id = &max_replayed_id,
+            .synthetic_seq = &synthetic_id_seq,
+        };
         wal_ptr.replay(existing.items, &ctx, struct {
             fn cb(ctx_ptr: *Ctx, rec: WALRecord) anyerror!void {
                 if (rec.record_type != .memcell_insert) return;
-                const maybe_parsed = try parseInsertPayload(ctx_ptr.store.alloc, rec.payload);
-                if (maybe_parsed) |parsed| {
-                    defer parsed.deinit(ctx_ptr.store.alloc);
-                    if (parsed.id > ctx_ptr.max_id.*) ctx_ptr.max_id.* = parsed.id;
-                    _ = ctx_ptr.store.addRawNoWAL(
-                        parsed.id,
-                        parsed.source,
-                        parsed.episode,
-                        parsed.facts,
-                        parsed.goal_id,
-                        parsed.relevance,
-                        parsed.metadata,
-                    ) catch |err| {
-                        std.log.warn("replay insert failed: {}", .{err});
+                const synthetic_id = SYNTHETIC_ID_BASE + @atomicRmw(u64, ctx_ptr.synthetic_seq, .Add, 1, .seq_cst);
+                const parsed = parseInsertPayload(
+                    ctx_ptr.store.alloc,
+                    rec.payload,
+                    synthetic_id,
+                ) catch |err| {
+                    if (err == error.ParseFailed) {
+                        std.log.warn("WAL: skipping corrupt record (parse failed)", .{});
                         return;
-                    };
-                    ctx_ptr.count.* += 1;
-                }
+                    }
+                    return err;
+                };
+                defer parsed.deinit(ctx_ptr.store.alloc);
+                if (parsed.id > ctx_ptr.max_id.*) ctx_ptr.max_id.* = parsed.id;
+                _ = ctx_ptr.store.addRawNoWAL(
+                    parsed.id,
+                    parsed.source,
+                    parsed.episode,
+                    parsed.facts,
+                    parsed.goal_id,
+                    parsed.relevance,
+                    parsed.metadata,
+                ) catch |err| {
+                    std.log.warn("replay insert failed: {}", .{err});
+                    return;
+                };
+                ctx_ptr.count.* += 1;
             }
         }.cb) catch |err| {
             log.warn("WAL replay stopped at record {d}: {}", .{ replay_count, err });
@@ -845,8 +884,8 @@ pub const Server = struct {
             for (cell.goal_associations) |ga| {
                 if (ga.relevance > goal_bonus) goal_bonus = ga.relevance;
             }
-            const existence = cell.metadata.importance_score;
-            score = score * (1.0 + 0.4 * goal_bonus) * (1.0 + 0.3 * existence);
+            const importance = cell.metadata.importance_score;
+            score = score * (1.0 + 0.4 * goal_bonus) * (1.0 + 0.3 * importance);
             try ranked.append(self.alloc, .{ .id = cell.id, .score = score });
         }
 
@@ -1019,10 +1058,20 @@ fn unescapeJsonString(alloc: Allocator, input: []const u8) Allocator.Error![]u8 
 
 /// UTF-8 encode a Unicode scalar value (up to 0x10FFFF) into `dest`.
 /// Returns the number of bytes written (1..4).
+/// UTF-8 encode a Unicode scalar value (up to 0x10FFFF) into `dest`.
+/// Returns the number of bytes written (1..4). Rejects surrogate halves
+/// (0xD800-0xDFFF) and out-of-range code points — they would produce
+/// invalid UTF-8 that downstream JSON parsers reject.
 fn utf8Encode(cp: u21, dest: *[4]u8) usize {
     if (cp < 0x80) {
         dest[0] = @intCast(cp);
         return 1;
+    } else if (cp >= 0xD800 and cp <= 0xDFFF) {
+        // Surrogate half. Emit a replacement char (U+FFFD) and bail.
+        dest[0] = 0xEF;
+        dest[1] = 0xBF;
+        dest[2] = 0xBD;
+        return 3;
     } else if (cp < 0x800) {
         dest[0] = @intCast(0xC0 | (cp >> 6));
         dest[1] = @intCast(0x80 | (cp & 0x3F));
@@ -1104,17 +1153,21 @@ fn extractJsonFloat(body: []const u8, key: []const u8) ?f32 {
     return std.fmt.parseFloat(f32, body[start..pos]) catch null;
 }
 
-fn jsonFieldString(alloc: Allocator, out: *std.ArrayList(u8), key: []const u8, value: []const u8) !void {
+/// JSON-escaped string field (used by WAL payload encoding).
+/// Full escape coverage: \", \\, \/, \n, \r, \t, \b, \f, and \uXXXX.
+fn jsonFieldStringRaw(alloc: Allocator, out: *std.ArrayList(u8), key: []const u8, value: []const u8) !void {
     try out.append(alloc, '"');
     for (key) |kc| try out.append(alloc, kc);
     try out.appendSlice(alloc, "\":\"");
     for (value) |vc| {
         switch (vc) {
-            '"' => try out.appendSlice(alloc, "\\\""), // \" (2 bytes)
-            '\\' => try out.appendSlice(alloc, "\\\\"), // \\ (2 bytes)
+            '"' => try out.appendSlice(alloc, "\\\""),
+            '\\' => try out.appendSlice(alloc, "\\\\"),
+            8 => try out.appendSlice(alloc, "\\b"),
             '\n' => try out.appendSlice(alloc, "\\n"),
             '\r' => try out.appendSlice(alloc, "\\r"),
             '\t' => try out.appendSlice(alloc, "\\t"),
+            12 => try out.appendSlice(alloc, "\\f"),
             0...7, 11, 14...31 => {
                 var buf: [8]u8 = undefined;
                 const s = std.fmt.bufPrint(&buf, "\\u{x:0>4}", .{vc}) catch unreachable;
@@ -1200,20 +1253,22 @@ test "Server: GET /api/goals" {
 // =============================================================================
 
 /// JSON-escaped string field: "key":"escaped value".
-fn jsonFieldStringRaw(alloc: Allocator, out: *std.ArrayList(u8), key: []const u8, value: []const u8) !void {
+fn jsonFieldString(alloc: Allocator, out: *std.ArrayList(u8), key: []const u8, value: []const u8) !void {
     try out.append(alloc, '"');
     for (key) |kc| try out.append(alloc, kc);
     try out.appendSlice(alloc, "\":\"");
     for (value) |vc| {
         switch (vc) {
-            '"' => try out.appendSlice(alloc, "\\\""),
-            '\\' => try out.appendSlice(alloc, "\\\\"),
+            '"' => try out.appendSlice(alloc, "\\\""), // \" (2 bytes)
+            '\\' => try out.appendSlice(alloc, "\\\\"), // \\ (2 bytes)
+            8 => try out.appendSlice(alloc, "\\b"),
             '\n' => try out.appendSlice(alloc, "\\n"),
             '\r' => try out.appendSlice(alloc, "\\r"),
             '\t' => try out.appendSlice(alloc, "\\t"),
+            12 => try out.appendSlice(alloc, "\\f"),
             0...7, 11, 14...31 => {
                 var buf: [8]u8 = undefined;
-                const s = std.fmt.bufPrint(&buf, "\\u{x:0>4}", .{vc}) catch continue;
+                const s = std.fmt.bufPrint(&buf, "\\u{x:0>4}", .{vc}) catch unreachable;
                 try out.appendSlice(alloc, s);
             },
             else => try out.append(alloc, vc),
@@ -1263,20 +1318,42 @@ const ParsedInsert = struct {
 /// to zero-valued defaults, which still yields a working cell with
 /// created_at=0 (i.e., very old, low weight) so it's distinguishable
 /// from a fresh insert.
-fn parseInsertPayload(alloc: Allocator, payload: []const u8) !?ParsedInsert {
-    const id_i: i64 = extractJsonInt(payload, "id") orelse return null;
-    if (id_i < 0) return null;
-    const id: u64 = @intCast(id_i);
+///
+/// On parse failure (corrupt payload, missing required field) returns
+/// `error.ParseFailed`. All partial heap allocations are released via
+/// errdefer chain — no leaks. Caller distinguishes "bad record, skip"
+/// from "out of memory" via the error code.
+///
+/// WAL upgrade note (B3): records from before the "id" field was added
+/// are not silently dropped. A synthetic id is generated from the
+/// record's offset in the WAL file so the cell survives the upgrade.
+fn parseInsertPayload(alloc: Allocator, payload: []const u8, synthetic_id_fallback: u64) ParseError!ParsedInsert {
+    // Id: prefer the persisted field; fall back to a synthetic value if
+    // the record predates the "id" field. Negative id is a real error.
+    const id_opt = extractJsonInt(payload, "id");
+    const id: u64 = if (id_opt) |id_i| blk: {
+        if (id_i < 0) return error.ParseFailed;
+        break :blk @intCast(id_i);
+    } else blk: {
+        // Pre-id record. Use the synthetic id from the caller (1B +
+        // u64 counter, guaranteed nonneg).
+        break :blk synthetic_id_fallback;
+    };
+    return try parseInsertPayloadFromId(alloc, payload, id);
+}
+
+fn parseInsertPayloadFromId(alloc: Allocator, payload: []const u8, id: u64) ParseError!ParsedInsert {
+
     const source_str = try extractJsonStringOrOwned(alloc, payload, "source", "matter");
     errdefer alloc.free(source_str);
-    const source = core.MemorySource.fromString(source_str) catch return null;
+    const source = core.MemorySource.fromString(source_str) catch return error.ParseFailed;
     const episode = try extractJsonStringOrOwned(alloc, payload, "episode", "");
     errdefer alloc.free(episode);
-    if (episode.len == 0) return null;
+    if (episode.len == 0) return error.ParseFailed;
     const facts = try extractJsonStringOrOwned(alloc, payload, "facts", "");
     errdefer alloc.free(facts);
     const goal_id_i: i64 = extractJsonInt(payload, "goal_id") orelse extractJsonInt(payload, "goalId") orelse 1;
-    if (goal_id_i < 0) return null;
+    if (goal_id_i < 0) return error.ParseFailed;
     const goal_id: u64 = @intCast(goal_id_i);
     const relevance_f: f32 = extractJsonFloat(payload, "relevance") orelse 0.5;
 
@@ -1322,3 +1399,5 @@ fn parseInsertPayload(alloc: Allocator, payload: []const u8) !?ParsedInsert {
         .metadata = metadata,
     };
 }
+
+const ParseError = error{ ParseFailed, OutOfMemory };
