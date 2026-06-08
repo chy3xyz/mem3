@@ -11,6 +11,8 @@ const RawInput = enc.RawInput;
 const Encoder = enc.Encoder;
 const Forgetter = @import("forgetter.zig").Forgetter;
 const FuzzyStore = @import("forgetter.zig").FuzzyStore;
+const Consolidator = @import("consolidator.zig").Consolidator;
+const CoherenceCalculator = @import("coherence.zig").CoherenceCalculator;
 const config = @import("../core/config.zig").Config;
 const errors = core.Error;
 
@@ -21,6 +23,8 @@ pub const Lifecycle = struct {
     encoder: Encoder,
     forgetter: Forgetter,
     fuzzy: FuzzyStore,
+    consolidator: Consolidator,
+    coherence: CoherenceCalculator,
 
     pub fn init(alloc: Allocator, cfg: config, mgr: *TriSourceManager) Lifecycle {
         const fuzzy = FuzzyStore.init(alloc);
@@ -31,12 +35,19 @@ pub const Lifecycle = struct {
             .encoder = Encoder.init(alloc, cfg),
             .forgetter = Forgetter.init(alloc, cfg, undefined), // patched below
             .fuzzy = fuzzy,
+            .consolidator = Consolidator.init(alloc, cfg, undefined, undefined), // patched below
+            .coherence = CoherenceCalculator.init(alloc),
         };
     }
 
-    /// Wire the forgetter to the fuzzy store. Required after init().
+    /// Wire the forgetter to the fuzzy store and the consolidator to
+    /// both. Required after init() because struct fields are
+    /// initialized in order and the dependencies (fuzzy, mgr) aren't
+    /// available at init() time.
     pub fn wire(self: *Lifecycle) void {
         self.forgetter.fuzzy = &self.fuzzy;
+        self.consolidator.fuzzy = &self.fuzzy;
+        self.consolidator.mgr = self.mgr;
     }
 
     /// Encoding: turn a raw input into a MemCell and add to the manager.
@@ -67,10 +78,11 @@ pub const Lifecycle = struct {
         return self.forgetter.sweep(self.mgr, dry_run);
     }
 
-    /// Consolidation: in v0.1.0 this is a no-op stub; v0.2.0 will run HAC.
+    /// Consolidation: run HAC clustering + abstract generation. Returns
+    /// the number of abstract cells created (1 per cluster ≥ 2 cells).
     pub fn consolidate(self: *Lifecycle) !usize {
-        _ = self;
-        return 0;
+        const result = try self.consolidator.consolidate();
+        return result.abstracts_created;
     }
 };
 

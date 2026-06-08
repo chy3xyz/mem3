@@ -30,6 +30,9 @@ const retrieval = @import("../retrieval/mod.zig");
 const HNSW = retrieval.HNSW;
 const WAL = @import("../storage/wal.zig").WAL;
 const WALRecord = @import("../storage/wal.zig").WALRecord;
+const Snapshot = @import("../storage/snapshot.zig");
+const SnapshotData = Snapshot.SnapshotData;
+const SnapshotWriter = Snapshot.SnapshotWriter;
 
 const log = std.log.scoped(.mem3_server);
 
@@ -67,6 +70,9 @@ const Store = struct {
     cell_index: std.AutoHashMap(u64, *MemCell),
     /// WAL for crash-safe persistence. Optional so tests / dry-runs can opt out.
     wal: ?*WAL,
+    /// Snapshot path (data_dir/snapshot.bin). On boot, if the
+    /// snapshot exists, we read it before replaying the WAL.
+    snapshot_path: []u8,
 
     fn init(alloc: Allocator, data_dir: []const u8) !*Store {
         const self = try alloc.create(Store);
@@ -80,6 +86,7 @@ const Store = struct {
             .emb = undefined,
             .cell_index = std.AutoHashMap(u64, *MemCell).init(alloc),
             .wal = null,
+            .snapshot_path = undefined,
         };
         // Goals
         var goals = try alloc.create(ghw.GoalPoset);
@@ -102,6 +109,11 @@ const Store = struct {
         hnsw.* = HNSW.init(alloc, .{}, 384);
         self.hnsw = hnsw;
         self.emb = retrieval.StubEmbedder.init(384);
+        // Compute snapshot path: <data_dir>/snapshot.bin
+        self.snapshot_path = std.fs.path.join(self.alloc, &.{ data_dir, "snapshot.bin" }) catch {
+            log.err("snapshot path too long; persistence disabled", .{});
+            return error.SnapshotPathTooLong;
+        };
         // Open WAL (best-effort) and replay if data_dir exists.
         try self.openAndReplayWAL(data_dir);
         return self;
@@ -114,6 +126,7 @@ const Store = struct {
             self.alloc.destroy(w);
             self.wal = null;
         }
+        self.alloc.free(self.snapshot_path);
         var it = self.cell_index.iterator();
         while (it.next()) |_| {}
         self.cell_index.deinit();
@@ -210,6 +223,141 @@ const Store = struct {
             alloc.destroy(self.cell);
         }
     };
+
+    /// Read snapshot (if present) and restore mgr + fuzzy + id counter.
+    /// Called by openAndReplayWAL before the WAL replay pass.
+    fn loadSnapshot(self: *Store) !void {
+        var data = Snapshot.read(self.alloc, self.snapshot_path) catch |err| switch (err) {
+            error.SnapshotOpenFailed,
+            error.SnapshotEmpty,
+            error.SnapshotTruncated,
+            error.SnapshotBadMagic,
+            error.SnapshotBadVersion,
+            => {
+                std.debug.print("WAL: no valid snapshot at {s}, starting fresh\n", .{self.snapshot_path});
+                return;
+            },
+            else => return err,
+        };
+        defer data.deinit();
+        std.debug.print("WAL: snapshot has {d} cells, {d} fuzzy, counter={d}\n", .{
+            data.cells.len,
+            data.fuzzy_cells.len,
+            data.counter,
+        });
+
+        // Restore the id counter so fresh inserts pick up after the snapshot.
+        if (data.counter > 0) {
+            _ = self.ids.fetchMax(data.counter, .monotonic);
+        }
+
+        // Re-insert cells into the manager. Use mgr.addWithId so the
+        // counter is honored (snapshot ids are stable across boots).
+        for (data.cells) |cs| {
+            const cell = try self.alloc.create(MemCell);
+            errdefer self.alloc.destroy(cell);
+            cell.* = .{
+                .id = cs.id,
+                .source = cs.source,
+                .episode = cs.episode, // borrowed; mgr will dup
+                .atomic_facts = cs.facts,
+                .foresight = cs.foresight,
+                .goal_associations = cs.goal_associations,
+                .metadata = cs.metadata,
+            };
+            _ = self.lc.addCell(cs.id, cell.*) catch |err| {
+                std.log.warn("snapshot: addCell failed for id={d}: {}", .{ cs.id, err });
+                return;
+            };
+            if (self.mgr.get(cs.id)) |stored| try self.cell_index.put(cs.id, stored);
+        }
+        for (data.fuzzy_cells) |cs| {
+            // Allocate a fresh MemCell for fuzzy (we want to own the slices).
+            const cell = try self.alloc.create(MemCell);
+            errdefer self.alloc.destroy(cell);
+            cell.* = .{
+                .id = cs.id,
+                .source = cs.source,
+                .episode = try self.alloc.dupe(u8, cs.episode),
+                .atomic_facts = try self.cloneFacts(cs.facts),
+                .foresight = try self.cloneForesights(cs.foresight),
+                .goal_associations = try self.alloc.dupe(core.GoalAssociation, cs.goal_associations),
+                .metadata = cs.metadata,
+            };
+            try self.lc.fuzzy.transfer(cell);
+        }
+    }
+
+    /// Take a snapshot of (counter, mgr, fuzzy) to disk, then truncate
+    /// the WAL. Atomic: snapshot is written to a temp file, fsync'd,
+    /// then renamed over the previous snapshot. After a successful
+    /// snapshot the WAL is truncated because the snapshot now contains
+    /// the full state — no replay needed for any record ≤ snapshot.
+    fn takeSnapshot(self: *Store) !void {
+        var w = SnapshotWriter.init(self.alloc, self.snapshot_path);
+        const bytes = w.write(
+            self.ids.load(.monotonic),
+            self.goals,
+            self.mgr,
+            &self.lc.fuzzy,
+        ) catch |err| {
+            std.log.warn("snapshot: write failed: {}", .{err});
+            return;
+        };
+        std.debug.print("snapshot: wrote {d} bytes to {s}\n", .{ bytes, self.snapshot_path });
+        // Truncate the WAL. Close, delete, reopen as fresh.
+        if (self.wal) |wal| {
+            wal.flush() catch {};
+            wal.deinit();
+            self.alloc.destroy(wal);
+            self.wal = null;
+            // Delete the old WAL file so the new one starts empty.
+            const wal_path = std.fs.path.join(self.alloc, &.{
+                self.snapshot_path[0 .. self.snapshot_path.len - "snapshot.bin".len],
+                "mem3.wal",
+            }) catch return;
+            defer self.alloc.free(wal_path);
+            var zbuf: [std.fs.max_path_bytes + 1]u8 = undefined;
+            const z = std.fmt.bufPrint(&zbuf, "{s}\x00", .{wal_path}) catch return;
+            _ = std.c.unlink(z[0 .. z.len - 1 :0].ptr);
+            // Reopen a fresh WAL.
+            const wal_ptr = self.alloc.create(WAL) catch return;
+            wal_ptr.* = try WAL.init(self.alloc, wal_path);
+            wal_ptr.open() catch {
+                wal_ptr.deinit();
+                self.alloc.destroy(wal_ptr);
+                return;
+            };
+            self.wal = wal_ptr;
+        }
+    }
+
+    fn cloneFacts(self: *Store, src: []const core.Fact) ![]core.Fact {
+        const out = try self.alloc.alloc(core.Fact, src.len);
+        for (src, 0..) |f, i| {
+            out[i] = .{
+                .subject = try self.alloc.dupe(u8, f.subject),
+                .predicate = try self.alloc.dupe(u8, f.predicate),
+                .object = try self.alloc.dupe(u8, f.object),
+                .confidence = f.confidence,
+                .source = try self.alloc.dupe(u8, f.source),
+            };
+        }
+        return out;
+    }
+
+    fn cloneForesights(self: *Store, src: []const core.Foresight) ![]core.Foresight {
+        const out = try self.alloc.alloc(core.Foresight, src.len);
+        for (src, 0..) |f, i| {
+            out[i] = .{
+                .description = try self.alloc.dupe(u8, f.description),
+                .valid_from = f.valid_from,
+                .valid_until = f.valid_until,
+                .confidence = f.confidence,
+            };
+        }
+        return out;
+    }
 
     /// Build a fresh MemCell from user input (new insert). Uses the
     /// encoder to set fresh metadata (created_at = now, etc.). Returns
@@ -510,6 +658,10 @@ const Store = struct {
         };
         std.debug.print("WAL: opened {s} (replay={d} bytes)\n", .{ wal_path, existing.items.len });
         self.wal = wal_ptr;
+        // Read snapshot FIRST (if present), then replay WAL on top.
+        // Snapshot is the "base" state; WAL records are deltas since
+        // the snapshot.
+        try self.loadSnapshot();
         if (existing.items.len == 0) return;
 
         // Replay records.
@@ -776,8 +928,15 @@ pub const Server = struct {
                 return try self.jsonResponse(500, "Internal Server Error",
                     try std.fmt.allocPrint(self.alloc, "{{\"error\":\"flush failed: {s}\"}}", .{@errorName(err)}));
             };
+            // After WAL is durable, take a snapshot + truncate WAL so
+            // next boot replays from snapshot (fast) instead of replaying
+            // every WAL record (slow for long-lived daemons).
+            self.store.takeSnapshot() catch |err| {
+                return try self.jsonResponse(500, "Internal Server Error",
+                    try std.fmt.allocPrint(self.alloc, "{{\"error\":\"snapshot failed: {s}\"}}", .{@errorName(err)}));
+            };
             return try self.jsonResponse(200, "OK",
-                \\{"status":"synced","wal":true}
+                \\{"status":"synced","wal":true,"snapshot":true}
             );
         }
         // No WAL → persistence was never enabled for this server. The
