@@ -53,6 +53,15 @@ pub const Lifecycle = struct {
         return self.mgr.addWithId(id, cell);
     }
 
+    /// Replay-side insert: take a fully-formed cell (already parsed from
+    /// WAL with restored metadata) and add it under the given id. Bypasses
+    /// the encoder so created_at / importance_score / decay_rate survive
+    /// the round-trip — Principle III ranking requires these to be stable
+    /// across boots, not reset to "now".
+    pub fn addCell(self: *Lifecycle, id: u64, cell: MemCell) errors!u64 {
+        return self.mgr.addWithId(id, cell);
+    }
+
     /// Forgetting: run the existence-gain-driven sweep.
     pub fn forget(self: *Lifecycle, dry_run: bool) !Forgetter.SweepResult {
         return self.forgetter.sweep(self.mgr, dry_run);

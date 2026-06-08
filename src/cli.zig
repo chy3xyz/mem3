@@ -47,6 +47,8 @@ pub const Parsed = struct {
     args: std.ArrayList(Arg) = .empty,
 
     pub fn deinit(self: *Parsed, alloc: Allocator) void {
+        // args holds borrowed slices from the cmdline iterator (which
+        // has program lifetime) — no per-element frees needed.
         self.args.deinit(alloc);
     }
 };
@@ -145,12 +147,11 @@ pub fn parse(alloc: Allocator, iter: *ArgIterator) !Parsed {
     return p;
 }
 
-fn parseArg(alloc: Allocator, raw: []const u8) Arg {
+fn parseArg(_: Allocator, raw: []const u8) Arg {
     if (std.mem.startsWith(u8, raw, "--")) {
         if (std.mem.findScalar(u8, raw, '=')) |eq| {
-            const key = alloc.dupe(u8, raw[0..eq]) catch raw[0..eq];
-            const value = alloc.dupe(u8, raw[eq + 1 ..]) catch raw[eq + 1 ..];
-            return .{ .key = key, .value = value };
+            // Borrowed slices: cmdline has program-lifetime strings.
+            return .{ .key = raw[0..eq], .value = raw[eq + 1 ..] };
         }
         return .{ .key = raw, .value = null };
     }

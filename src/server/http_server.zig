@@ -136,8 +136,19 @@ const Store = struct {
         const id = self.ids.fetchAdd(1, .monotonic);
         errdefer _ = self.ids.fetchSub(1, .monotonic);
 
+        const built = try self.buildCellFromInput(id, source, episode, facts, goal_id, relevance);
+        errdefer built.deinit(self.alloc);
+
         if (self.wal) |wal| {
-            const payload = try self.encodeWALPayload(id, source, episode, facts, goal_id, relevance);
+            const payload = try self.encodeWALPayload(
+                id,
+                source,
+                episode,
+                facts,
+                goal_id,
+                relevance,
+                built.cell.metadata,
+            );
             defer self.alloc.free(payload);
             const ts_s: i64 = @intCast(@divTrunc(nowNs(), std.time.ns_per_s));
             try wal.append(.{
@@ -146,14 +157,11 @@ const Store = struct {
                 .timestamp = ts_s,
             });
         }
-        try self.commitToMemory(id, source, episode, facts, goal_id, relevance);
+        try self.commitBuiltCell(id, built);
         return id;
     }
 
-    /// Replay-side insert. The id comes from the WAL record (so the cell
-    /// has the same id across boots). No WAL write — we are reading the
-    /// WAL, not writing it. Caller is responsible for ensuring `id` is
-    /// not already taken.
+    /// Replay-side insert. The id + metadata come from the WAL record.
     fn addRawNoWAL(
         self: *Store,
         id: u64,
@@ -162,14 +170,37 @@ const Store = struct {
         facts: []const u8,
         goal_id: u64,
         relevance: f32,
+        meta: core.Metadata,
     ) !u64 {
-        try self.commitToMemory(id, source, episode, facts, goal_id, relevance);
+        const built = try self.buildCellFromParsed(id, source, episode, facts, goal_id, relevance, meta);
+        errdefer built.deinit(self.alloc);
+        try self.commitBuiltCell(id, built);
         return id;
     }
 
-    /// Parse `facts` (semicolon-separated `s|p|o` triples), encode the
-    /// cell, commit to manager + cell_index + hnsw. No WAL interaction.
-    fn commitToMemory(
+    /// A built cell plus the lists it borrows from. Caller must
+    /// `deinit()` AFTER mgr has duped the slices (i.e. after a
+    /// successful `commitBuiltCell`).
+    const BuiltCell = struct {
+        cell: *MemCell,
+        fact_list: *std.ArrayList(fact),
+        goal_list: *std.ArrayList(goal_assoc_t),
+
+        pub fn deinit(self: *const BuiltCell, alloc: Allocator) void {
+            self.fact_list.deinit(alloc);
+            self.goal_list.deinit(alloc);
+            alloc.destroy(self.fact_list);
+            alloc.destroy(self.goal_list);
+            self.cell.deinit(alloc);
+            alloc.destroy(self.cell);
+        }
+    };
+
+    /// Build a fresh MemCell from user input (new insert). Uses the
+    /// encoder to set fresh metadata (created_at = now, etc.). Returns
+    /// a BuiltCell whose lists must outlive the mgr commit; use
+    /// `commitBuiltCell` to commit and then deinit the BuiltCell.
+    fn buildCellFromInput(
         self: *Store,
         id: u64,
         source: MemorySource,
@@ -177,9 +208,18 @@ const Store = struct {
         facts: []const u8,
         goal_id: u64,
         relevance: f32,
-    ) !void {
-        var fact_list = std.ArrayList(fact).empty;
-        defer fact_list.deinit(self.alloc);
+    ) !BuiltCell {
+        const fact_list = try self.alloc.create(std.ArrayList(fact));
+        errdefer self.alloc.destroy(fact_list);
+        fact_list.* = .empty;
+
+        const goal_list = try self.alloc.create(std.ArrayList(goal_assoc_t));
+        errdefer self.alloc.destroy(goal_list);
+        goal_list.* = .empty;
+
+        errdefer fact_list.deinit(self.alloc);
+        errdefer goal_list.deinit(self.alloc);
+
         var it = std.mem.splitScalar(u8, facts, ';');
         while (it.next()) |part| {
             if (part.len == 0) continue;
@@ -196,25 +236,108 @@ const Store = struct {
             });
         }
 
-        var goal_list = std.ArrayList(goal_assoc_t).empty;
-        defer goal_list.deinit(self.alloc);
         try goal_list.append(self.alloc, .{
             .goal_id = goal_id,
             .relevance = relevance,
             .priority = 5,
         });
 
-        _ = try self.lc.encodeWithId(id, .{
+        const cell_ptr = try self.alloc.create(MemCell);
+        errdefer self.alloc.destroy(cell_ptr);
+        cell_ptr.* = try self.lc.encoder.encode(.{
             .source = source,
             .episode = episode,
             .atomic_facts = fact_list.items,
             .foresight = &[_]foresight_t{},
             .goal_associations = goal_list.items,
         });
+        cell_ptr.id = id;
+        return .{
+            .cell = cell_ptr,
+            .fact_list = fact_list,
+            .goal_list = goal_list,
+        };
+    }
 
-        if (self.mgr.get(id)) |cell| {
-            try self.cell_index.put(id, cell);
-            const v = try self.emb.embed(self.alloc, episode);
+    /// Build a MemCell from a WAL record (replay). Uses the metadata
+    /// that was persisted, NOT fresh timestamps. This is the key to
+    /// Principle III fidelity across boots.
+    fn buildCellFromParsed(
+        self: *Store,
+        id: u64,
+        source: MemorySource,
+        episode: []const u8,
+        facts: []const u8,
+        goal_id: u64,
+        relevance: f32,
+        meta: core.Metadata,
+    ) !BuiltCell {
+        const fact_list = try self.alloc.create(std.ArrayList(fact));
+        errdefer self.alloc.destroy(fact_list);
+        fact_list.* = .empty;
+
+        const goal_list = try self.alloc.create(std.ArrayList(goal_assoc_t));
+        errdefer self.alloc.destroy(goal_list);
+        goal_list.* = .empty;
+
+        errdefer fact_list.deinit(self.alloc);
+        errdefer goal_list.deinit(self.alloc);
+
+        var it = std.mem.splitScalar(u8, facts, ';');
+        while (it.next()) |part| {
+            if (part.len == 0) continue;
+            var pit = std.mem.splitScalar(u8, part, '|');
+            const s = pit.next() orelse "";
+            const p = pit.next() orelse "";
+            const o = pit.next() orelse "";
+            try fact_list.append(self.alloc, .{
+                .subject = s,
+                .predicate = p,
+                .object = o,
+                .confidence = 1.0,
+                .source = "api",
+            });
+        }
+
+        try goal_list.append(self.alloc, .{
+            .goal_id = goal_id,
+            .relevance = relevance,
+            .priority = 5,
+        });
+
+        const cell_ptr = try self.alloc.create(MemCell);
+        errdefer self.alloc.destroy(cell_ptr);
+        cell_ptr.* = .{
+            .id = id,
+            .source = source,
+            .episode = episode, // borrowed; mgr.addWithId will dup
+            .atomic_facts = fact_list.items, // borrowed
+            .foresight = &[_]foresight_t{},
+            .goal_associations = goal_list.items, // borrowed
+            .metadata = meta,
+        };
+        return .{
+            .cell = cell_ptr,
+            .fact_list = fact_list,
+            .goal_list = goal_list,
+        };
+    }
+
+    /// Commit a built cell to mgr + cell_index + hnsw. The lists
+    /// (fact_list, goal_list) are deinited in-place because the mgr
+    /// already duped their contents into its own store.
+    fn commitBuiltCell(self: *Store, id: u64, built: BuiltCell) !void {
+        _ = try self.lc.addCell(id, built.cell.*);
+        // The mgr has now duped all borrowed slices. Free the lists.
+        built.fact_list.deinit(self.alloc);
+        built.goal_list.deinit(self.alloc);
+        self.alloc.destroy(built.fact_list);
+        self.alloc.destroy(built.goal_list);
+        self.alloc.destroy(built.cell);
+
+        if (self.mgr.get(id)) |stored| {
+            try self.cell_index.put(id, stored);
+            const v = try self.emb.embed(self.alloc, stored.episode);
             defer self.alloc.free(v);
             self.hnsw.insert(id, v) catch |err| {
                 log.warn("hnsw insert failed: {}", .{err});
@@ -223,10 +346,12 @@ const Store = struct {
     }
 
     /// Encode a memcell_insert WAL payload as a self-contained JSON document.
-    /// Fields: { id, source, episode, facts, goal_id, relevance }.
+    /// Fields: { id, source, episode, facts, goal_id, relevance, ...meta }.
     /// The id MUST be the pre-assigned id (same one used to commit the
     /// cell in memory); replay uses it to keep the WAL→memory contract
-    /// identical across boots.
+    /// identical across boots. Metadata fields are persisted so Principle
+    /// III (existence-gain-driven) rankings are stable across boots
+    /// instead of being reset to "now".
     fn encodeWALPayload(
         self: *Store,
         id: u64,
@@ -235,11 +360,8 @@ const Store = struct {
         facts: []const u8,
         goal_id: u64,
         relevance: f32,
+        meta: core.Metadata,
     ) ![]u8 {
-        // Use std.fmt.allocPrint to produce a self-contained JSON object.
-        // Strings are JSON-escaped inline. Episodes come from the API and
-        // may contain quotes, backslashes, and control characters; we
-        // escape them as we copy.
         var out = std.ArrayList(u8).empty;
         defer out.deinit(self.alloc);
         try out.append(self.alloc, '{');
@@ -254,6 +376,25 @@ const Store = struct {
         try jsonFieldUintRaw(self.alloc, &out, "goal_id", goal_id);
         try out.append(self.alloc, ',');
         try jsonFieldFloatRaw(self.alloc, &out, "relevance", relevance);
+        try out.append(self.alloc, ',');
+        // Metadata round-trip (Principle III fidelity).
+        try jsonFieldIntRaw(self.alloc, &out, "created_at", meta.created_at);
+        try out.append(self.alloc, ',');
+        try jsonFieldIntRaw(self.alloc, &out, "updated_at", meta.updated_at);
+        try out.append(self.alloc, ',');
+        try jsonFieldIntRaw(self.alloc, &out, "last_accessed_at", meta.last_accessed_at);
+        try out.append(self.alloc, ',');
+        try jsonFieldFloatRaw(self.alloc, &out, "importance_score", meta.importance_score);
+        try out.append(self.alloc, ',');
+        try jsonFieldFloatRaw(self.alloc, &out, "coherence_score", meta.coherence_score);
+        try out.append(self.alloc, ',');
+        try jsonFieldFloatRaw(self.alloc, &out, "decay_rate", meta.decay_rate);
+        try out.append(self.alloc, ',');
+        try jsonFieldFloatRaw(self.alloc, &out, "source_confidence", meta.source_confidence);
+        try out.append(self.alloc, ',');
+        try jsonFieldFloatRaw(self.alloc, &out, "emotional_valence", meta.emotional_valence);
+        try out.append(self.alloc, ',');
+        try jsonFieldUintRaw(self.alloc, &out, "access_count", meta.access_count);
         try out.append(self.alloc, '}');
         return out.toOwnedSlice(self.alloc);
     }
@@ -379,6 +520,7 @@ const Store = struct {
                         parsed.facts,
                         parsed.goal_id,
                         parsed.relevance,
+                        parsed.metadata,
                     ) catch |err| {
                         std.log.warn("replay insert failed: {}", .{err});
                         return;
@@ -474,10 +616,15 @@ pub const Server = struct {
         var addr: std.posix.sockaddr.in = undefined;
         addr.family = c.AF.INET;
         addr.port = std.mem.nativeToBig(u16, self.port);
-        addr.addr = std.mem.nativeToBig(u32, 0x7F000001);
-        if (!std.mem.eql(u8, self.bind, "127.0.0.1") and !std.mem.eql(u8, self.bind, "localhost")) {
-            addr.addr = 0;
-        }
+        // Resolve bind: IPv4 dotted-quad → u32 BE. Special names:
+        //   "127.0.0.1" / "localhost" → loopback
+        //   "0.0.0.0" / "all"        → INADDR_ANY (all interfaces)
+        //   anything else that's a valid IPv4 → use it
+        //   invalid                  → warn + fall back to loopback
+        addr.addr = parseBindAddr(self.bind) catch |err| blk: {
+            std.debug.print("WARN: invalid bind '{s}': {s}; falling back to 127.0.0.1\n", .{ self.bind, @errorName(err) });
+            break :blk std.mem.nativeToBig(u32, 0x7F000001);
+        };
 
         const fd = std.c.socket(c.AF.INET, @bitCast(@as(u32, c.SOCK.STREAM)), 0);
         if (fd < 0) return error.SocketFailed;
@@ -590,9 +737,14 @@ pub const Server = struct {
                 return try self.jsonResponse(500, "Internal Server Error",
                     try std.fmt.allocPrint(self.alloc, "{{\"error\":\"flush failed: {s}\"}}", .{@errorName(err)}));
             };
+            return try self.jsonResponse(200, "OK",
+                \\{"status":"synced","wal":true}
+            );
         }
-        return try self.jsonResponse(200, "OK",
-            \\{"status":"synced"}
+        // No WAL → persistence was never enabled for this server. The
+        // contract is honest: don't claim a sync that didn't happen.
+        return try self.jsonResponse(503, "Service Unavailable",
+            \\{"error":"persistence not enabled (no WAL)","wal":false}
         );
     }
 
@@ -777,6 +929,37 @@ pub const Server = struct {
     }
 };
 
+/// Resolve a bind address: "127.0.0.1" / "localhost" → loopback,
+/// "0.0.0.0" / "all" → INADDR_ANY, anything else parsed as IPv4 dotted-quad.
+/// Returns a u32 in network byte order (big-endian).
+fn parseBindAddr(text: []const u8) !u32 {
+    if (std.mem.eql(u8, text, "localhost")) return std.mem.nativeToBig(u32, 0x7F000001);
+    if (std.mem.eql(u8, text, "all") or std.mem.eql(u8, text, "0.0.0.0")) return 0;
+
+    var octets: [4]u8 = undefined;
+    var octet_idx: u8 = 0;
+    var accum: u32 = 0;
+    var saw_digit = false;
+    for (text) |ch| {
+        if (ch == '.') {
+            if (!saw_digit) return error.InvalidIpv4;
+            if (octet_idx >= 3) return error.InvalidIpv4; // too many dots
+            octets[octet_idx] = @intCast(accum);
+            octet_idx += 1;
+            accum = 0;
+            saw_digit = false;
+            continue;
+        }
+        if (ch < '0' or ch > '9') return error.InvalidIpv4;
+        accum = accum * 10 + (ch - '0');
+        if (accum > 255) return error.InvalidIpv4;
+        saw_digit = true;
+    }
+    if (!saw_digit or octet_idx != 3) return error.InvalidIpv4;
+    octets[octet_idx] = @intCast(accum);
+    return std.mem.nativeToBig(u32, (@as(u32, octets[0]) << 24) | (@as(u32, octets[1]) << 16) | (@as(u32, octets[2]) << 8) | octets[3]);
+}
+
 // =============================================================================
 // Tiny JSON utilities (avoid pulling in std.json for the hot API path).
 // =============================================================================
@@ -904,8 +1087,21 @@ fn extractJsonInt(body: []const u8, key: []const u8) ?i64 {
     return std.fmt.parseInt(i64, body[start..pos], 10) catch null;
 }
 
+/// Parse a JSON number (int or float) into f32. Walks the number body
+/// from extractJsonInt's find, then parses with std.fmt.parseFloat which
+/// handles decimals, signs, and exponents.
 fn extractJsonFloat(body: []const u8, key: []const u8) ?f32 {
-    return @as(f32, @floatFromInt(extractJsonInt(body, key) orelse return null));
+    const needle = std.fmt.allocPrint(std.heap.page_allocator, "\"{s}\":", .{key}) catch return null;
+    defer std.heap.page_allocator.free(needle);
+    const idx = std.mem.findPos(u8, body, 0, needle) orelse return null;
+    var pos = idx + needle.len;
+    while (pos < body.len and (body[pos] == ' ' or body[pos] == '\t')) : (pos += 1) {}
+    const start = pos;
+    while (pos < body.len and (body[pos] >= '0' and body[pos] <= '9' or
+        body[pos] == '-' or body[pos] == '+' or body[pos] == '.' or
+        body[pos] == 'e' or body[pos] == 'E')) : (pos += 1) {}
+    if (start == pos) return null;
+    return std.fmt.parseFloat(f32, body[start..pos]) catch null;
 }
 
 fn jsonFieldString(alloc: Allocator, out: *std.ArrayList(u8), key: []const u8, value: []const u8) !void {
@@ -976,7 +1172,11 @@ fn jsonAppendCell(alloc: Allocator, out: *std.ArrayList(u8), cell: *const MemCel
 test "Server: healthz route" {
     const alloc = std.testing.allocator;
     var srv = try Server.init(alloc, "127.0.0.1", 0, "data/test_server");
-    defer srv.deinit();
+    defer {
+        srv.deinit();
+        // Test cleanup: remove the data dir the test created.
+        std.fs.cwd().deleteTree("data/test_server") catch {};
+    }
     const resp = try srv.route("GET", "/healthz", "");
     try std.testing.expectEqual(@as(u16, 200), resp.status);
     try std.testing.expect(std.mem.indexOf(u8, resp.body, "ok") != null);
@@ -985,7 +1185,10 @@ test "Server: healthz route" {
 test "Server: GET /api/goals" {
     const alloc = std.testing.allocator;
     var srv = try Server.init(alloc, "127.0.0.1", 0, "data/test_server");
-    defer srv.deinit();
+    defer {
+        srv.deinit();
+        std.fs.cwd().deleteTree("data/test_server") catch {};
+    }
     const resp = try srv.route("GET", "/api/goals", "");
     defer alloc.free(resp.body);
     try std.testing.expectEqual(@as(u16, 200), resp.status);
@@ -1031,6 +1234,12 @@ fn jsonFieldFloatRaw(alloc: Allocator, out: *std.ArrayList(u8), key: []const u8,
     try out.appendSlice(alloc, s);
 }
 
+fn jsonFieldIntRaw(alloc: Allocator, out: *std.ArrayList(u8), key: []const u8, value: i64) !void {
+    var buf: [32]u8 = undefined;
+    const s = std.fmt.bufPrint(&buf, "\"{s}\":{d}", .{ key, value }) catch unreachable;
+    try out.appendSlice(alloc, s);
+}
+
 const ParsedInsert = struct {
     id: u64,
     source: MemorySource,
@@ -1039,6 +1248,9 @@ const ParsedInsert = struct {
     facts: []u8,
     goal_id: u64,
     relevance: f32,
+    /// Persisted metadata. Restored verbatim on replay so Principle III
+    /// ranking (decay × importance × coherence) is stable across boots.
+    metadata: core.Metadata,
 
     pub fn deinit(self: *const ParsedInsert, alloc: Allocator) void {
         alloc.free(self.episode);
@@ -1046,7 +1258,11 @@ const ParsedInsert = struct {
     }
 };
 
-/// Parse a JSON payload of shape { id, source, episode, facts, goal_id, relevance }.
+/// Parse a JSON payload of shape { id, source, episode, facts, goal_id, relevance, ...meta }.
+/// Metadata fields are optional — older WAL records (pre-metadata) parse
+/// to zero-valued defaults, which still yields a working cell with
+/// created_at=0 (i.e., very old, low weight) so it's distinguishable
+/// from a fresh insert.
 fn parseInsertPayload(alloc: Allocator, payload: []const u8) !?ParsedInsert {
     const id_i: i64 = extractJsonInt(payload, "id") orelse return null;
     if (id_i < 0) return null;
@@ -1063,6 +1279,39 @@ fn parseInsertPayload(alloc: Allocator, payload: []const u8) !?ParsedInsert {
     if (goal_id_i < 0) return null;
     const goal_id: u64 = @intCast(goal_id_i);
     const relevance_f: f32 = extractJsonFloat(payload, "relevance") orelse 0.5;
+
+    // Metadata fields. Missing fields → 0 (for ints) / 0.0 (for floats) /
+    // defaults for derived values. A future enhancement could persist
+    // the encoder's source_confidence default (1.0) here, but 0.0 is
+    // safe because the manager rejects cells with source_confidence
+    // below 0.5 at *encode* time — at *replay* time the cell is already
+    // proven valid, so we accept the lower bound.
+    const created_at = extractJsonInt(payload, "created_at") orelse 0;
+    const updated_at = extractJsonInt(payload, "updated_at") orelse created_at;
+    const last_accessed_at = extractJsonInt(payload, "last_accessed_at") orelse created_at;
+    const importance_score = extractJsonFloat(payload, "importance_score") orelse 0.5;
+    const coherence_score = extractJsonFloat(payload, "coherence_score") orelse 0.0;
+    const decay_rate = extractJsonFloat(payload, "decay_rate") orelse 0.01;
+    const source_confidence = extractJsonFloat(payload, "source_confidence") orelse 1.0;
+    const emotional_valence = extractJsonFloat(payload, "emotional_valence") orelse 0.0;
+    const access_count_i = extractJsonInt(payload, "access_count") orelse 0;
+    const access_count: u64 = if (access_count_i < 0) 0 else @intCast(access_count_i);
+
+    const metadata = core.Metadata{
+        .created_at = created_at,
+        .updated_at = updated_at,
+        .source_confidence = source_confidence,
+        .emotional_valence = emotional_valence,
+        .location = null,
+        .access_count = access_count,
+        .last_accessed_at = last_accessed_at,
+        .coherence_score = coherence_score,
+        .importance_score = importance_score,
+        .decay_rate = decay_rate,
+        .is_fuzzy = false,
+        .superseded_at = null,
+    };
+
     return .{
         .id = id,
         .source = source,
@@ -1070,5 +1319,6 @@ fn parseInsertPayload(alloc: Allocator, payload: []const u8) !?ParsedInsert {
         .facts = facts,
         .goal_id = goal_id,
         .relevance = relevance_f,
+        .metadata = metadata,
     };
 }
