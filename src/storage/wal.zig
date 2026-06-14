@@ -176,29 +176,40 @@ test "WAL: append + replay" {
     var wal = try WAL.init(std.testing.allocator, "data/test.wal");
     defer wal.deinit();
     try wal.open();
-    defer {
-        std.fs.cwd().deleteFile("data/test.wal") catch {};
-    }
+    defer _ = std.c.unlink("data/test.wal");
 
     try wal.append(.{ .record_type = .memcell_insert, .payload = "hello", .timestamp = 1000 });
     try wal.append(.{ .record_type = .memcell_insert, .payload = "world", .timestamp = 2000 });
     try wal.flush();
 
-    // Replay from disk.
-    const f = try std.fs.cwd().openFile("data/test.wal", .{});
-    defer f.close();
-    const stat = try f.stat();
-    const buf = try std.testing.allocator.alloc(u8, stat.size);
+    // Replay from disk. Use POSIX open via std.c — Zig 0.17 removed
+    // std.fs.cwd(), and std.posix.openat wants a directory fd.
+    var zpath: [std.fs.max_path_bytes + 1]u8 = undefined;
+    const z = try std.fmt.bufPrint(&zpath, "{s}\x00", .{"data/test.wal"});
+    const zslice = z[0 .. z.len - 1 :0];
+    const fd = std.c.open(zslice.ptr, std.c.O{}, @as(std.c.mode_t, 0));
+    try std.testing.expect(fd >= 0);
+    defer _ = std.c.close(fd);
+    var stat_buf: std.c.Stat = undefined;
+    try std.testing.expect(std.c.fstat(fd, &stat_buf) == 0);
+    const stat_size: usize = @intCast(@max(0, stat_buf.size));
+    const buf = try std.testing.allocator.alloc(u8, stat_size);
     defer std.testing.allocator.free(buf);
-    _ = try f.readAll(buf);
+    var got: usize = 0;
+    while (got < stat_size) {
+        const n = std.c.read(fd, buf[got..].ptr, stat_size - got);
+        if (n <= 0) break;
+        got += @intCast(n);
+    }
 
     var records: usize = 0;
-    try wal.replay(buf, struct {
+    const Cb = struct {
         fn cb(ctx: *usize, rec: WALRecord) !void {
             _ = rec;
             ctx.* += 1;
         }
-    }.cb, &records);
+    };
+    try wal.replay(buf, &records, Cb.cb);
     try std.testing.expectEqual(@as(usize, 2), records);
 }
 
@@ -206,23 +217,38 @@ test "WAL: checksum corruption is detected" {
     var wal = try WAL.init(std.testing.allocator, "data/test_corrupt.wal");
     defer wal.deinit();
     try wal.open();
-    defer {
-        std.fs.cwd().deleteFile("data/test_corrupt.wal") catch {};
-    }
+    defer _ = std.c.unlink("data/test_corrupt.wal");
     try wal.append(.{ .record_type = .memcell_insert, .payload = "x", .timestamp = 100 });
     try wal.flush();
 
-    // Corrupt the file: flip a byte in the middle.
-    const f = try std.fs.cwd().openFile("data/test_corrupt.wal", .{ .mode = .read_write });
-    defer f.close();
+    // Corrupt the file: flip a byte in the middle. Use POSIX open()
+    // since std.fs.cwd() is gone in Zig 0.17.
+    var zpath: [std.fs.max_path_bytes + 1]u8 = undefined;
+    const z = try std.fmt.bufPrint(&zpath, "{s}\x00", .{"data/test_corrupt.wal"});
+    const zslice = z[0 .. z.len - 1 :0];
+    const flags: std.c.O = .{ .ACCMODE = .RDWR };
+    const fd = std.c.open(zslice.ptr, flags, @as(std.c.mode_t, 0));
+    try std.testing.expect(fd >= 0);
+    defer _ = std.c.close(fd);
     var buf: [64]u8 = undefined;
-    _ = try f.readAll(&buf);
+    var got: usize = 0;
+    while (got < buf.len) {
+        const n = std.c.read(fd, buf[got..].ptr, buf.len - got);
+        if (n <= 0) break;
+        got += @intCast(n);
+    }
     buf[10] ^= 0xFF;
-    _ = try f.seekTo(0);
-    try f.writeAll(&buf);
+    _ = std.c.lseek(fd, 0, std.c.SEEK.SET);
+    var written: usize = 0;
+    while (written < got) {
+        const n = std.c.write(fd, buf[written..got].ptr, got - written);
+        if (n <= 0) break;
+        written += @intCast(n);
+    }
 
     // Replay: should error.
-    try std.testing.expectError(error.WALCorrupt, wal.replay(&buf, struct {
+    const CbNoop = struct {
         fn cb(_: *u8, _: WALRecord) !void {}
-    }.cb, @as(*u8, undefined)));
+    };
+    try std.testing.expectError(error.WALCorrupt, wal.replay(buf[0..got], @as(*u8, undefined), CbNoop.cb));
 }

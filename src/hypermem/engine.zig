@@ -51,7 +51,7 @@ pub const HyMem = struct {
 
         var e_it = self.edge_to_nodes.iterator();
         while (e_it.next()) |entry| entry.value_ptr.*.deinit(self.alloc);
-        self.edge_to_edges.deinit();
+        self.edge_to_nodes.deinit();
     }
 
     /// Register a node (MemCell). Idempotent.
@@ -102,12 +102,14 @@ pub const HyMem = struct {
 
     /// Get the edges incident to a node.
     pub fn edgesOf(self: *HyMem, node_id: u64) []const u64 {
-        return self.node_to_edges.get(node_id) orelse &.{};
+        const list = self.node_to_edges.getPtr(node_id) orelse return &.{};
+        return list.items;
     }
 
     /// Get the nodes in a given edge.
     pub fn nodesIn(self: *HyMem, edge_id: u64) []const u64 {
-        return self.edge_to_nodes.get(edge_id) orelse &.{};
+        const list = self.edge_to_nodes.getPtr(edge_id) orelse return &.{};
+        return list.items;
     }
 
     /// Remove an edge (e.g., during a fuzzy-store transition).
@@ -180,10 +182,12 @@ pub const HyMem = struct {
                     }
                 }
             }
-            // Swap frontiers.
+            // Swap frontiers. Zig doesn't allow pointer-arithmetic on local
+            // ArrayLists, so we move-construct via assignment: each
+            // ArrayList becomes the other's contents.
             const tmp = frontier;
-            @as(*void, @ptrCast(&frontier)).* = @as(*void, @ptrCast(&next_frontier)).*;
-            @as(*void, @ptrCast(&next_frontier)).* = @as(*void, @ptrCast(&tmp)).*;
+            frontier = next_frontier;
+            next_frontier = tmp;
             hops += 1;
         }
         return results.toOwnedSlice(alloc);

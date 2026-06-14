@@ -34,7 +34,7 @@ const config = @import("../core/config.zig").Config;
 /// denominator up, producing a *slightly* higher similarity than
 /// the true value — the bias is conservative for "should this cell
 /// be considered coherent?" decisions).
-const MAX_TRACKED_TOKENS: usize = 512;
+pub const MAX_TRACKED_TOKENS: usize = 512;
 
 /// Per-cell coherence calculator. Holds reusable buffers so repeated
 /// calls don't re-allocate. One instance per Lifecycle (or per
@@ -157,7 +157,7 @@ fn tokenizeInto(bits: *[MAX_TRACKED_TOKENS]u8, text: []const u8) void {
         }
         if (bl == 0) continue;
         const normalized = buf[0..bl];
-        const h = std.hash.XxHash3.hash(normalized);
+        const h = std.hash.XxHash3.hash(0, normalized);
         const idx: usize = @intCast(h % MAX_TRACKED_TOKENS);
         bits[idx] = 1;
     }

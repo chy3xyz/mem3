@@ -129,15 +129,40 @@ fn addAllTests(
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
 ) void {
-    const tests = b.addTest(.{
+    // Two test binaries:
+    //   1. `src/main.zig`-rooted — collects tests transitively via the
+    //      comptime import block there (catches Store/CLI regressions).
+    //   2. `tests/main.zig`-rooted — collects the dedicated unit/
+    //      integration/property tests in tests/ (catches correctness
+    //      regressions in algorithms the Store itself doesn't run).
+    const libmem3_module = b.createModule(.{
+        .root_source_file = b.path("src/lib.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const main_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/main.zig"),
             .target = target,
             .optimize = optimize,
         }),
     });
-    const run_tests = b.addRunArtifact(tests);
-    parent_step.dependOn(&run_tests.step);
+    const run_main_tests = b.addRunArtifact(main_tests);
+    parent_step.dependOn(&run_main_tests.step);
+
+    const e2e_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "mem3", .module = libmem3_module },
+            },
+        }),
+    });
+    const run_e2e_tests = b.addRunArtifact(e2e_tests);
+    parent_step.dependOn(&run_e2e_tests.step);
 }
 
 fn addBench(

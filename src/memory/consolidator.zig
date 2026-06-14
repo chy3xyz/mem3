@@ -29,6 +29,7 @@ const MemCell = core.MemCell;
 const TriSourceManager = @import("tri_source_manager.zig").TriSourceManager;
 const FuzzyStore = @import("forgetter.zig").FuzzyStore;
 const CoherenceCalculator = @import("coherence.zig").CoherenceCalculator;
+const coherence_mod = @import("coherence.zig");
 const config = @import("../core/config.zig").Config;
 const time = @import("../utils/time.zig");
 
@@ -74,7 +75,10 @@ pub const Consolidator = struct {
 
         const n = cells.items.len;
         // Step 2: single-linkage clustering via union-find.
-        var parent: [n]usize = undefined;
+        // Heap-allocate the parent array: Zig's stack-allocated arrays
+        // require a comptime size, but `n` is a runtime count.
+        const parent = try self.alloc.alloc(usize, n);
+        defer self.alloc.free(parent);
         for (0..n) |i| parent[i] = i;
 
         const find = struct {
@@ -102,16 +106,20 @@ pub const Consolidator = struct {
             while (j < n) : (j += 1) {
                 const c_mf_ij = pairwiseMatterForm(self, cells.items[i], cells.items[j]);
                 if (c_mf_ij >= threshold) {
-                    union_set(&parent, &i, i, j);
+                    union_set(parent, &i, i, j);
                 }
             }
         }
 
         // Step 3: collect clusters (group cells by root).
         var cluster_map = std.AutoHashMap(usize, std.ArrayList(usize)).init(self.alloc);
-        defer cluster_map.deinit();
+        defer {
+            var cit = cluster_map.iterator();
+            while (cit.next()) |entry| entry.value_ptr.deinit(self.alloc);
+            cluster_map.deinit();
+        }
         for (0..n) |k| {
-            const root = find(&parent, &i, k);
+            const root = find(parent, &i, k);
             const gop = try cluster_map.getOrPut(root);
             if (!gop.found_existing) gop.value_ptr.* = .empty;
             try gop.value_ptr.append(self.alloc, k);
@@ -148,12 +156,12 @@ pub const Consolidator = struct {
         tokenizeCell(&calc.scratch_b, b);
         var inter: usize = 0;
         var union_size: usize = 0;
-        for (0..CoherenceCalculator.MAX_TRACKED_TOKENS) |i| {
-            const av = calc.scratch_a[i] != 0;
-            const bv = calc.scratch_b[i] != 0;
-            if (av and bv) inter += 1;
-            if (av or bv) union_size += 1;
-        }
+for (0..coherence_mod.MAX_TRACKED_TOKENS) |i| {
+        const av = calc.scratch_a[i] != 0;
+        const bv = calc.scratch_b[i] != 0;
+        if (av and bv) inter += 1;
+        if (av or bv) union_size += 1;
+    }
         if (union_size == 0) return 0.0;
         return @as(f32, @floatFromInt(inter)) / @as(f32, @floatFromInt(union_size));
     }
@@ -170,7 +178,7 @@ pub const Consolidator = struct {
         for (indices) |idx| {
             @memset(&self.coherence.scratch_b, 0);
             tokenizeCell(&self.coherence.scratch_b, cells[idx]);
-            for (0..CoherenceCalculator.MAX_TRACKED_TOKENS) |i| {
+            for (0..coherence_mod.MAX_TRACKED_TOKENS) |i| {
                 if (self.coherence.scratch_b[i] != 0) {
                     self.coherence.scratch_a[i] = 1;
                 }
@@ -188,7 +196,8 @@ pub const Consolidator = struct {
         // emit only those tokens whose hash-bucket is in the AND set.
         // For human-readability, take the representative's episode and
         // filter to common tokens (approximate: substring contains).
-        for (std.mem.splitScalar(u8, rep.episode, ' ')) |tok| {
+        var split_it = std.mem.splitScalar(u8, rep.episode, ' ');
+        while (split_it.next()) |tok| {
             if (tok.len == 0) continue;
             var buf: [64]u8 = undefined;
             var bl: usize = 0;
@@ -202,8 +211,8 @@ pub const Consolidator = struct {
                 }
             }
             if (bl == 0) continue;
-            const h = std.hash.XxHash3.hash(buf[0..bl]);
-            const idx: usize = @intCast(h % CoherenceCalculator.MAX_TRACKED_TOKENS);
+            const h = std.hash.XxHash3.hash(0, buf[0..bl]);
+            const idx: usize = @intCast(h % coherence_mod.MAX_TRACKED_TOKENS);
             if (self.coherence.scratch_a[idx] != 0) {
                 if (abstract_text.items.len > 0) try abstract_text.append(alloc, ' ');
                 try abstract_text.appendSlice(alloc, buf[0..bl]);
@@ -246,13 +255,29 @@ pub const Consolidator = struct {
                 .superseded_at = null,
             },
         };
+        // Snapshot the slices we own so we can free them AFTER mgr has
+        // duped them. mgr.addWithId takes the cell by value (it dups
+        // every owned slice inside); the local cell_ptr's heap slices
+        // are still ours and must be freed explicitly.
+        const own_episode = cell_ptr.episode;
+        const own_foresight = cell_ptr.foresight;
+        const own_goals = cell_ptr.goal_associations;
+        defer {
+            alloc.free(own_episode);
+            for (own_foresight) |f| alloc.free(@constCast(f.description));
+            alloc.free(own_foresight);
+            alloc.free(own_goals);
+        }
         _ = self.mgr.addWithId(cell_ptr.id, cell_ptr.*) catch |err| {
             // On duplicate id (extremely unlikely), drop the abstract
-            // silently. We've leaked the cell_ptr; report the error
-            // so the caller knows consolidation partially failed.
+            // silently. The errdefer at line 231 frees cell_ptr; the
+            // defer above frees the slices.
             std.log.warn("consolidator: addWithId failed: {}", .{err});
             return;
         };
+        // mgr.addWithId dups all owned slices (episode, atomic_facts,
+        // etc.); the local cell_ptr is no longer needed.
+        alloc.destroy(cell_ptr);
     }
 };
 
@@ -278,10 +303,10 @@ fn cloneGoals(alloc: Allocator, src: []const core.GoalAssociation) ![]core.GoalA
 /// Tokenize a cell's matter + form fields into a bitset. Mirrors the
 /// intra-cell tokenizeInto in CoherenceCalculator, but aggregates
 /// episode + atomic_facts in one pass.
-fn tokenizeCell(bits: *[CoherenceCalculator.MAX_TRACKED_TOKENS]u8, cell: *const MemCell) void {
+fn tokenizeCell(bits: *[coherence_mod.MAX_TRACKED_TOKENS]u8, cell: *const MemCell) void {
     // Inline the per-field tokenize pass.
     const visit = struct {
-        fn visit(b: *[CoherenceCalculator.MAX_TRACKED_TOKENS]u8, text: []const u8) void {
+        fn visit(b: *[coherence_mod.MAX_TRACKED_TOKENS]u8, text: []const u8) void {
             var it = std.mem.splitScalar(u8, text, ' ');
             while (it.next()) |tok| {
                 if (tok.len == 0) continue;
@@ -297,8 +322,8 @@ fn tokenizeCell(bits: *[CoherenceCalculator.MAX_TRACKED_TOKENS]u8, cell: *const 
                     }
                 }
                 if (bl == 0) continue;
-                const h = std.hash.XxHash3.hash(buf[0..bl]);
-                const idx: usize = @intCast(h % CoherenceCalculator.MAX_TRACKED_TOKENS);
+                const h = std.hash.XxHash3.hash(0, buf[0..bl]);
+                const idx: usize = @intCast(h % coherence_mod.MAX_TRACKED_TOKENS);
                 b[idx] = 1;
             }
         }

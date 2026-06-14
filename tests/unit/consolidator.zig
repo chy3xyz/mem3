@@ -1,0 +1,120 @@
+//! Unit tests for `Consolidator` (Hierarchical Agglomerative
+//! Clustering). Exercises:
+//! - HAC clustering on a small corpus of similar cells
+//! - Abstract generation (1 per cluster of size ≥ 2)
+//! - No abstract when cells are too dissimilar
+//! - PCR rule: originals are preserved (consolidation never deletes)
+
+const std = @import("std");
+const testing = std.testing;
+const mem3 = @import("mem3");
+const Config = mem3.core.Config;
+const TriSourceManager = mem3.memory.TriSourceManager;
+const FuzzyStore = mem3.memory.FuzzyStore;
+const Consolidator = mem3.consolidator_mod.Consolidator;
+
+fn buildStore(alloc: std.mem.Allocator) !struct {
+    mgr: *TriSourceManager,
+    cons: Consolidator,
+    alloc: std.mem.Allocator,
+
+    fn deinit(self: *@This()) void {
+        // CoherenceCalculator has no heap state, so no deinit.
+        self.cons.fuzzy.deinit();
+        self.cons.mgr.deinit();
+        self.alloc.destroy(self.cons.fuzzy);
+        self.alloc.destroy(self.cons.mgr);
+    }
+} {
+    var ids: std.atomic.Value(u64) = .init(1);
+    _ = &ids; // pointer escapes into TriSourceManager
+
+    const mgr_ptr = try alloc.create(TriSourceManager);
+    mgr_ptr.* = TriSourceManager.init(alloc, &ids);
+
+    const fuzzy_ptr = try alloc.create(FuzzyStore);
+    fuzzy_ptr.* = FuzzyStore.init(alloc);
+
+    const cons = Consolidator.init(
+        alloc,
+        Config{ .consolidation_threshold = 0.3 },
+        fuzzy_ptr,
+        mgr_ptr,
+    );
+    return .{ .mgr = mgr_ptr, .cons = cons, .alloc = alloc };
+}
+
+fn addCell(mgr: *TriSourceManager, episode: []const u8, source: mem3.MemorySource, goal_id: u64) !void {
+    const cell: mem3.MemCell = .{
+        .id = 0,
+        .source = source,
+        .episode = episode,
+        .atomic_facts = &.{},
+        .foresight = &.{},
+        .goal_associations = &.{
+            .{ .goal_id = goal_id, .relevance = 0.5, .priority = 5 },
+        },
+        .metadata = .{ .source_confidence = 1.0, .importance_score = 0.5, .decay_rate = 0.01 },
+    };
+    _ = try mgr.add(cell);
+}
+
+test "Consolidator: two similar cells produce one abstract" {
+    const alloc = testing.allocator;
+    var s = try buildStore(alloc);
+    defer s.deinit();
+
+    try addCell(s.mgr, "machine learning optimizes models", .form, 1);
+    try addCell(s.mgr, "machine learning trains models", .form, 1);
+    try addCell(s.mgr, "machine learning improves accuracy", .form, 1);
+
+    try testing.expectEqual(@as(usize, 3), s.mgr.count());
+
+    const result = try s.cons.consolidate();
+    try testing.expectEqual(@as(usize, 1), result.abstracts_created);
+    // 3 originals + 1 abstract.
+    try testing.expectEqual(@as(usize, 4), s.mgr.count());
+}
+
+test "Consolidator: dissimilar cells produce no abstract" {
+    const alloc = testing.allocator;
+    var s = try buildStore(alloc);
+    defer s.deinit();
+
+    try addCell(s.mgr, "machine learning optimizes models", .form, 1);
+    try addCell(s.mgr, "potato recipe for dinner", .form, 1);
+    try addCell(s.mgr, "quantum gravity theory revisited", .form, 1);
+
+    const result = try s.cons.consolidate();
+    try testing.expectEqual(@as(usize, 0), result.abstracts_created);
+    // Originals preserved.
+    try testing.expectEqual(@as(usize, 3), s.mgr.count());
+}
+
+test "Consolidator: PCR — originals are never deleted" {
+    // Even after consolidation, the original cells must remain in the
+    // manager. This is the Projective Cognitive Reduction invariant.
+    const alloc = testing.allocator;
+    var s = try buildStore(alloc);
+    defer s.deinit();
+
+    try addCell(s.mgr, "deep learning vision models", .form, 1);
+    try addCell(s.mgr, "deep learning speech models", .form, 1);
+
+    const before = s.mgr.count();
+    _ = try s.cons.consolidate();
+    const after = s.mgr.count();
+
+    // After consolidation: at least `before` cells (originals) plus 1
+    // abstract. No deletions.
+    try testing.expect(after >= before + 1);
+}
+
+test "Consolidator: empty corpus produces zero abstracts" {
+    const alloc = testing.allocator;
+    var s = try buildStore(alloc);
+    defer s.deinit();
+
+    const result = try s.cons.consolidate();
+    try testing.expectEqual(@as(usize, 0), result.abstracts_created);
+}

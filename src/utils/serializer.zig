@@ -1,207 +1,101 @@
-//! Comptime zero-overhead binary serializer.
+//! Comptime zero-overhead binary serializer (Zig 0.17 dev-friendly).
 //!
 //! **Constitution Principle V**: serialization MUST be `comptime`-generated.
 //! No runtime reflection. Each serializable type has a `serialized_size`
 //! computed at compile time, used by the WAL and SSTable for offset
-//! arithmetic.
+//! bookkeeping. Runtime serialize / deserialize are the simplest possible:
+//! little-endian fixed-width for primitive scalars, length-prefixed for
+//! slices, in-order fields for structs.
 //!
-//! ## Wire format
+//! Supported scalar kinds: `int`, `float`, `bool`, `enum` (tag), `?T`
+//! (1-byte present flag + T), `[]const u8` (u32 len + bytes), `[N]T`
+//! arrays of fixed size, and `struct` of the above.
 //!
-//! - Integers: little-endian, fixed-width matching the type.
-//! - Floats: little-endian bit-cast to integer, fixed-width.
-//! - Enums: stored as their `u8` tag (must be `enum(u8)`).
-//! - Bools: 1 byte (0 or 1).
-//! - `[]const u8`: 4-byte little-endian length prefix, then UTF-8 bytes.
-//! - `[]const T` (any other T): 4-byte count prefix, then each element serialized.
-//! - Struct: fields emitted in declaration order.
-//! - Optional: 1-byte present flag (0/1), then value if present.
-//!
-//! ## Comptime size calculation
-//!
-//! `calculateSize(T)` walks the type's fields at compile time and sums the
-//! fixed-width contributions. Variable-length types (slices) are reported
-//! as their *prefix* size; the actual length depends on runtime data.
+//! Anything else (pointers to non-`[]const u8` slices, optionals of
+//! pointer types, unions, error sets) must be wrapped in a custom
+//! serializer — this module does not pretend to handle Zig's full type
+//! system.
 
 const std = @import("std");
 const builtin = @import("builtin");
-const Allocator = std.mem.Allocator;
-const Io = std.Io;
+const mem = std.mem;
+const Allocator = mem.Allocator;
 
 const log = std.log.scoped(.mem3_serializer);
 
-/// Comptime-computed serialized size of `T` (prefix only, not data).
+/// Comptime-computed serialized size of `T` (prefix only, not slice data).
 pub fn calculateSize(comptime T: type) usize {
     return switch (@typeInfo(T)) {
-        .Int => |i| divCeilInt(i.bits, 8),
-        .Float => |f| f.bits / 8,
-        .Bool => 1,
-        .Enum => @sizeOf(std.meta.Tag(T)),
-        .Pointer => |p| p_size(p),
-        .Array => |a| a.len * calculateSize(a.child),
-        .Struct => |s| s_size: {
+        .int => |i| comptimeIntSize(i.bits),
+        .float => |f| comptimeIntSize(f.bits),
+        .bool => 1,
+        .@"enum" => @sizeOf(std.meta.Tag(T)),
+        .pointer => |p| switch (p.size) {
+            .slice => @sizeOf(u32), // length prefix only; payload is runtime
+            .one => calculateSize(p.child), // array literal decays to *const [N]T
+            else => @compileError("calculateSize: unsupported pointer " ++ @typeName(T)),
+        },
+        .array => |a| a.len * calculateSize(a.child),
+        .@"struct" => |s| s_size: {
             var total: usize = 0;
-            for (s.fields) |f| {
-                total += calculateSize(f.type);
+            inline for (s.field_types) |t| {
+                total += calculateSize(t);
             }
             break :s_size total;
         },
-        .Optional => |o| 1 + calculateSize(o.child),
-        .Void => 0,
+        .optional => |o| 1 + calculateSize(o.child),
+        .@"void" => 0,
         else => @compileError("calculateSize: unsupported type " ++ @typeName(T)),
     };
 }
 
-fn divCeilInt(comptime numerator: comptime_int, comptime denominator: comptime_int) usize {
-    return @divFloor(numerator + denominator - 1, denominator);
+fn comptimeIntSize(comptime bits: u16) usize {
+    return (bits + 7) / 8;
 }
 
-fn p_size(comptime p: std.builtin.Type.Pointer) usize {
-    return switch (p.size) {
-        .Slice => blk: {
-            if (p.child == u8) {
-                break :blk @sizeOf(u32); // length prefix only
-            }
-            break :blk @sizeOf(u32) + calculateSize(p.child);
-        },
-        else => @compileError("calculateSize: only slices supported, got " ++ @typeName(p)),
-    };
-}
-
-/// Compute the *runtime* size of a value (prefix + data).
+/// Runtime: total size of a *value*, including variable-length payload.
 pub fn sizeOf(value: anytype) usize {
     const T = @TypeOf(value);
     const fixed = calculateSize(T);
     return switch (@typeInfo(T)) {
-        .Pointer => |p| blk: {
-            if (p.size == .Slice) {
-                if (p.child == u8) {
-                    break :blk @sizeOf(u32) + value.len;
-                }
+        .pointer => |p| switch (p.size) {
+            .slice => slice_size: {
                 var total: usize = @sizeOf(u32);
                 for (value) |item| {
                     total += sizeOf(item);
                 }
-                break :blk total;
-            }
-            break :blk fixed;
+                break :slice_size total;
+            },
+            .one => @as(usize, value.len * calculateSize(p.child)),
+            else => fixed,
         },
-        .Struct => blk: {
+        .@"struct" => s_size: {
             var total: usize = fixed;
-            inline for (@typeInfo(T).Struct.fields) |f| {
-                const fv = @field(value, f.name);
-                total += switch (@typeInfo(f.type)) {
-                    .Pointer => |p| if (p.size == .Slice and p.child != u8) sliceSize(fv) else 0,
-                    else => 0,
-                };
+            inline for (@typeInfo(T).@"struct".field_names) |fname| {
+                total += sizeOf(@field(value, fname));
             }
-            break :blk total;
+            break :s_size total;
         },
-        .Array => blk: {
+        .array => a_size: {
             var total: usize = fixed;
             for (value) |item| {
                 total += sizeOf(item);
             }
-            break :blk total;
+            break :a_size total;
         },
         else => fixed,
     };
 }
 
-fn sliceSize(slice: anytype) usize {
-    var total: usize = 0;
-    for (slice) |item| {
-        total += sizeOf(item);
-    }
-    return total;
-}
-
-// =============================================================================
-// Serialize: returns an owned slice allocated with `gpa`.
-// =============================================================================
-
-pub const SerializeError = Allocator.Error || std.posix.RealAnyError || std.io.GenericWriterError;
-
-pub fn serialize(gpa: Allocator, value: anytype) SerializeError![]u8 {
+/// Serialize `value` into an allocated buffer (little-endian).
+pub fn serialize(gpa: Allocator, value: anytype) ![]u8 {
     const total = sizeOf(value);
     const buf = try gpa.alloc(u8, total);
     errdefer gpa.free(buf);
-    var stream = std.io.fixedBufferStream(buf);
-    try writeValue(&stream, value);
+    var w = Writer{ .buf = buf };
+    try writeValue(&w, value);
     return buf;
 }
-
-fn writeValue(stream: *std.io.FixedBufferStream([]u8), value: anytype) !void {
-    const T = @TypeOf(value);
-    switch (@typeInfo(T)) {
-        .Int => try writeInt(stream, value),
-        .Float => try writeFloat(stream, value),
-        .Bool => try stream.writer().writeByte(if (value) 1 else 0),
-        .Enum => try writeInt(stream, @intFromEnum(value)),
-        .Pointer => |p| switch (p.size) {
-            .Slice => try writeSlice(stream, value),
-            else => @compileError("serialize: unsupported pointer type " ++ @typeName(T)),
-        },
-        .Array => try writeArray(stream, value),
-        .Struct => try writeStruct(stream, value),
-        .Optional => try writeOptional(stream, value),
-        .Void => {},
-        else => @compileError("serialize: unsupported type " ++ @typeName(T)),
-    }
-}
-
-fn writeInt(stream: *std.io.FixedBufferStream([]u8), value: anytype) !void {
-    const T = @TypeOf(value);
-    const size = divCeilInt(@typeInfo(T).Int.bits, 8);
-    var bytes: [@sizeOf(u64)]u8 = undefined;
-    std.mem.writeInt(value, &bytes, .little);
-    try stream.writer().writeAll(bytes[0..size]);
-}
-
-fn writeFloat(stream: *std.io.FixedBufferStream([]u8), value: anytype) !void {
-    const T = @TypeOf(value);
-    const IntT = std.meta.Int(.unsigned, @typeInfo(T).Float.bits);
-    try writeInt(stream, @as(IntT, @bitCast(value)));
-}
-
-fn writeSlice(stream: *std.io.FixedBufferStream([]u8), slice: anytype) !void {
-    const T = @TypeOf(slice);
-    const ptr_info = @typeInfo(T).Pointer;
-    if (ptr_info.child == u8) {
-        try writeInt(stream, @as(u32, @intCast(slice.len)));
-        try stream.writer().writeAll(slice);
-    } else {
-        try writeInt(stream, @as(u32, @intCast(slice.len)));
-        for (slice) |item| {
-            try writeValue(stream, item);
-        }
-    }
-}
-
-fn writeArray(stream: *std.io.FixedBufferStream([]u8), array: anytype) !void {
-    for (array) |item| {
-        try writeValue(stream, item);
-    }
-}
-
-fn writeStruct(stream: *std.io.FixedBufferStream([]u8), value: anytype) !void {
-    const T = @TypeOf(value);
-    inline for (@typeInfo(T).Struct.fields) |f| {
-        try writeValue(stream, @field(value, f.name));
-    }
-}
-
-fn writeOptional(stream: *std.io.FixedBufferStream([]u8), opt: anytype) !void {
-    if (opt) |v| {
-        try stream.writer().writeByte(1);
-        try writeValue(stream, v);
-    } else {
-        try stream.writer().writeByte(0);
-    }
-}
-
-// =============================================================================
-// Deserialize: parses bytes into a value. Allocates strings / slices with gpa.
-// =============================================================================
 
 pub const DeserializeError = error{
     OutOfMemory,
@@ -209,155 +103,276 @@ pub const DeserializeError = error{
     InvalidUtf8,
     InvalidTag,
     InvalidBool,
-} || std.posix.RealAnyError;
+} || error{ AnyError };
 
+/// Deserialize `data` into a value of type `T` (allocates slices with `gpa`).
 pub fn deserialize(gpa: Allocator, comptime T: type, data: []const u8) DeserializeError!T {
-    var stream = std.io.fixedBufferStream(data);
-    return readValue(gpa, T, &stream);
+    var r = Reader{ .buf = data };
+    return readValue(gpa, T, &r);
 }
 
-fn readValue(gpa: Allocator, comptime T: type, stream: *std.io.FixedBufferStream([]const u8)) DeserializeError!T {
+// =============================================================================
+// Writer
+// =============================================================================
+
+const Writer = struct {
+    buf: []u8,
+    pos: usize = 0,
+
+    fn remaining(self: *const Writer) usize {
+        return self.buf.len - self.pos;
+    }
+
+    fn writeByte(self: *Writer, byte: u8) !void {
+        if (self.remaining() < 1) return error.BufferUnderflow;
+        self.buf[self.pos] = byte;
+        self.pos += 1;
+    }
+
+    fn writeBytes(self: *Writer, bytes: []const u8) !void {
+        if (self.remaining() < bytes.len) return error.BufferUnderflow;
+        @memcpy(self.buf[self.pos .. self.pos + bytes.len], bytes);
+        self.pos += bytes.len;
+    }
+
+    fn writeFixedInt(self: *Writer, comptime T: type, value: T) !void {
+        const size = comptime comptimeIntSize(@typeInfo(T).int.bits);
+        if (self.remaining() < size) return error.BufferUnderflow;
+        // @bitCast into a comptime-sized byte array (little-endian on dominant targets).
+        const bytes: [size]u8 = @bitCast(value);
+        @memcpy(self.buf[self.pos .. self.pos + size], &bytes);
+        self.pos += size;
+    }
+};
+
+fn writeValue(w: *Writer, value: anytype) !void {
+    const T = @TypeOf(value);
     switch (@typeInfo(T)) {
-        .Int => return try readInt(T, stream),
-        .Float => {
-            const IntT = std.meta.Int(.unsigned, @typeInfo(T).Float.bits);
-            return @bitCast(try readInt(IntT, stream));
+        .int => try w.writeFixedInt(T, value),
+        .float => try w.writeFixedInt(unsignedIntForFloat(T), @bitCast(value)),
+        .bool => try w.writeByte(if (value) 1 else 0),
+        .@"enum" => try w.writeFixedInt(std.meta.Tag(T), @intFromEnum(value)),
+        .pointer => |p| switch (p.size) {
+            .slice => try writeSlice(w, value),
+            .one => try writeArray(w, value),
+            else => @compileError("serialize: unsupported pointer type " ++ @typeName(T)),
         },
-        .Bool => {
-            const b = try stream.reader().readByte();
+        .array => try writeArray(w, value),
+        .@"struct" => try writeStruct(w, value),
+        .optional => try writeOptional(w, value),
+        .@"void" => {},
+        else => @compileError("serialize: unsupported type " ++ @typeName(T)),
+    }
+}
+
+fn writeSlice(w: *Writer, slice: anytype) !void {
+    const T = @TypeOf(slice);
+    const info = @typeInfo(T).pointer;
+    if (info.child == u8) {
+        try w.writeFixedInt(u32, @intCast(slice.len));
+        try w.writeBytes(slice);
+    } else {
+        try w.writeFixedInt(u32, @intCast(slice.len));
+        for (slice) |item| {
+            try writeValue(w, item);
+        }
+    }
+}
+
+fn writeArray(w: *Writer, array: anytype) !void {
+    for (array) |item| {
+        try writeValue(w, item);
+    }
+}
+
+fn writeStruct(w: *Writer, value: anytype) !void {
+    const T = @TypeOf(value);
+    inline for (@typeInfo(T).@"struct".field_names) |fname| {
+        try writeValue(w, @field(value, fname));
+    }
+}
+
+fn writeOptional(w: *Writer, opt: anytype) !void {
+    if (opt) |v| {
+        try w.writeByte(1);
+        try writeValue(w, v);
+    } else {
+        try w.writeByte(0);
+    }
+}
+
+fn unsignedIntForFloat(comptime T: type) type {
+    const bits = @typeInfo(T).float.bits;
+    return switch (bits) {
+        16 => u16,
+        32 => u32,
+        64 => u64,
+        80 => u80,
+        128 => u128,
+        else => @compileError("unsignedIntForFloat: unsupported float width " ++ @typeName(T)),
+    };
+}
+
+// =============================================================================
+// Reader
+// =============================================================================
+
+const Reader = struct {
+    buf: []const u8,
+    pos: usize = 0,
+
+    fn remaining(self: *const Reader) usize {
+        return self.buf.len - self.pos;
+    }
+
+    fn readByte(self: *Reader) !u8 {
+        if (self.remaining() < 1) return error.BufferUnderflow;
+        const b = self.buf[self.pos];
+        self.pos += 1;
+        return b;
+    }
+
+    fn readBytes(self: *Reader, len: usize) ![]const u8 {
+        if (self.remaining() < len) return error.BufferUnderflow;
+        const slice = self.buf[self.pos .. self.pos + len];
+        self.pos += len;
+        return slice;
+    }
+
+    fn readFixedInt(self: *Reader, comptime T: type) !T {
+        const size = comptime comptimeIntSize(@typeInfo(T).int.bits);
+        const slice = try self.readBytes(size);
+        const bytes: [size]u8 = slice[0..size].*;
+        return @bitCast(bytes);
+    }
+};
+
+fn readValue(gpa: Allocator, comptime T: type, r: *Reader) DeserializeError!T {
+    switch (@typeInfo(T)) {
+        .int => return try r.readFixedInt(T),
+        .float => {
+            const IntT = unsignedIntForFloat(T);
+            const int = try r.readFixedInt(IntT);
+            return @bitCast(int);
+        },
+        .bool => {
+            const b = try r.readByte();
             return switch (b) {
                 0 => false,
                 1 => true,
-                else => return error.InvalidBool,
+                else => error.InvalidBool,
             };
         },
-        .Enum => {
-            const tag_int = try readInt(std.meta.Tag(T), stream);
+        .@"enum" => {
+            const tag_int = try r.readFixedInt(std.meta.Tag(T));
             return std.meta.intToEnum(T, tag_int) catch return error.InvalidTag;
         },
-        .Pointer => |p| switch (p.size) {
-            .Slice => return @as(T, try readSlice(gpa, p.child, stream)),
-            else => @compileError("deserialize: unsupported pointer type " ++ @typeName(T)),
+        .pointer => |p| switch (p.size) {
+            .slice => return @as(T, try readSlice(gpa, p.child, r)),
+            else => @compileError("deserialize: unsupported pointer " ++ @typeName(T)),
         },
-        .Array => |a| {
+        .array => |a| {
             var arr: [a.len]a.child = undefined;
             for (&arr) |*item| {
-                item.* = try readValue(gpa, a.child, stream);
+                item.* = try readValue(gpa, a.child, r);
             }
             return arr;
         },
-        .Struct => |s| {
+        .@"struct" => |s| {
             var value: T = undefined;
-            inline for (s.fields) |f| {
-                @field(value, f.name) = try readValue(gpa, f.type, stream);
+            inline for (s.field_names, 0..) |fname, i| {
+                _ = fname;
+                const ftype = s.field_types[i];
+                @field(value, @typeInfo(T).@"struct".field_names[i]) =
+                    try readValue(gpa, ftype, r);
             }
             return value;
         },
-        .Optional => |o| {
-            const present = try stream.reader().readByte();
+        .optional => |o| {
+            const present = try r.readByte();
             if (present == 0) return null;
-            return try readValue(gpa, o.child, stream);
+            return try readValue(gpa, o.child, r);
         },
-        .Void => return {},
+        .@"void" => return {},
         else => @compileError("deserialize: unsupported type " ++ @typeName(T)),
     }
 }
 
-fn readInt(comptime T: type, stream: *std.io.FixedBufferStream([]const u8)) DeserializeError!T {
-    const size = divCeilInt(@typeInfo(T).Int.bits, 8);
-    const raw = try stream.reader().readBytesNoEof(size);
-    return std.mem.readInt(T, raw, .little);
-}
-
-fn readSlice(gpa: Allocator, comptime Child: type, stream: *std.io.FixedBufferStream([]const u8)) DeserializeError![]Child {
-    const len = try readInt(u32, stream);
+fn readSlice(gpa: Allocator, comptime Child: type, r: *Reader) DeserializeError![]Child {
+    const len = try r.readFixedInt(u32);
     if (Child == u8) {
-        const buf = try gpa.alloc(u8, len);
-        errdefer gpa.free(buf);
-        const raw = try stream.reader().readBytesNoEof(len);
-        @memcpy(buf, raw);
-        return buf;
+        const src = try r.readBytes(len);
+        const out = try gpa.alloc(u8, len);
+        @memcpy(out, src);
+        return out;
     }
-    const buf = try gpa.alloc(Child, len);
-    errdefer gpa.free(buf);
-    for (buf) |*item| {
-        item.* = try readValue(gpa, Child, stream);
+    const out = try gpa.alloc(Child, len);
+    errdefer gpa.free(out);
+    for (out) |*item| {
+        item.* = try readValue(gpa, Child, r);
     }
-    return buf;
+    return out;
 }
 
 // =============================================================================
 // Tests
 // =============================================================================
 
-const testing = std.testing;
-
-test "calculateSize: primitives" {
-    try testing.expectEqual(@as(usize, 1), calculateSize(u8));
-    try testing.expectEqual(@as(usize, 4), calculateSize(u32));
-    try testing.expectEqual(@as(usize, 8), calculateSize(u64));
-    try testing.expectEqual(@as(usize, 4), calculateSize(f32));
-    try testing.expectEqual(@as(usize, 8), calculateSize(f64));
-    try testing.expectEqual(@as(usize, 1), calculateSize(bool));
+test "calculateSize: scalars" {
+    try std.testing.expectEqual(@as(usize, 1), calculateSize(u8));
+    try std.testing.expectEqual(@as(usize, 2), calculateSize(u16));
+    try std.testing.expectEqual(@as(usize, 4), calculateSize(u32));
+    try std.testing.expectEqual(@as(usize, 8), calculateSize(u64));
+    try std.testing.expectEqual(@as(usize, 4), calculateSize(f32));
+    try std.testing.expectEqual(@as(usize, 8), calculateSize(f64));
+    try std.testing.expectEqual(@as(usize, 1), calculateSize(bool));
 }
 
-test "serialize + deserialize: roundtrip u32" {
-    const v: u32 = 0x12345678;
-    const buf = try serialize(testing.allocator, v);
-    defer testing.allocator.free(buf);
-    try testing.expectEqual(@as(usize, 4), buf.len);
-    const out = try deserialize(testing.allocator, u32, buf);
-    try testing.expectEqual(v, out);
+test "calculateSize: simple struct" {
+    const S = struct {
+        a: u32,
+        b: u8,
+        c: f64,
+    };
+    try std.testing.expectEqual(@as(usize, 4 + 1 + 8), calculateSize(S));
 }
 
 test "serialize + deserialize: roundtrip struct with strings and slices" {
-    const types = @import("../core/types.zig");
-    const Fact = types.Fact;
-    const cell: Fact = .{
-        .subject = "user",
-        .predicate = "asked",
-        .object = "how to use Zig 0.17",
-        .confidence = 0.95,
-        .source = "user_input",
+    const S = struct {
+        id: u64,
+        name: []const u8,
+        count: u32,
     };
-    const buf = try serialize(testing.allocator, cell);
-    defer testing.allocator.free(buf);
-
-    try testing.expect(buf.len >= 50);
-
-    const out = try deserialize(testing.allocator, Fact, buf);
-    defer testing.allocator.free(out.subject);
-    defer testing.allocator.free(out.predicate);
-    defer testing.allocator.free(out.object);
-    defer testing.allocator.free(out.source);
-    try testing.expectEqualStrings(cell.subject, out.subject);
-    try testing.expectEqualStrings(cell.object, out.object);
-    try testing.expectEqual(cell.confidence, out.confidence);
+    const alloc = std.testing.allocator;
+    const value = S{ .id = 42, .name = "hello", .count = 7 };
+    const buf = try serialize(alloc, value);
+    defer alloc.free(buf);
+    const out = try deserialize(alloc, S, buf);
+    try std.testing.expectEqual(@as(u64, 42), out.id);
+    try std.testing.expectEqualStrings("hello", out.name);
+    try std.testing.expectEqual(@as(u32, 7), out.count);
+    // The deserialized name is a fresh allocation owned by gpa.
+    alloc.free(out.name);
 }
 
-test "serialize + deserialize: roundtrip array of structs" {
-    const arr = [_]u32{ 1, 2, 3, 4, 5 };
-    const buf = try serialize(testing.allocator, &arr);
-    defer testing.allocator.free(buf);
-    try testing.expectEqual(@as(usize, 20), buf.len);
-    const out = try deserialize(testing.allocator, [5]u32, buf);
-    try testing.expectEqualSlices(u32, &arr, &out);
+test "serialize + deserialize: roundtrip slice of u32" {
+    const alloc = std.testing.allocator;
+    const value = [_]u32{ 1, 2, 3, 4, 5 };
+    const buf = try serialize(alloc, value);
+    defer alloc.free(buf);
+    const out = try deserialize(alloc, []u32, buf);
+    defer alloc.free(out);
+    try std.testing.expectEqualSlices(u32, &value, out);
 }
 
-test "serialize + deserialize: roundtrip optional" {
-    const v: ?[]const u8 = "hello";
-    const buf = try serialize(testing.allocator, v);
-    defer testing.allocator.free(buf);
-    const out = try deserialize(testing.allocator, ?[]const u8, buf);
-    defer if (out) |s| testing.allocator.free(s);
-    try testing.expectEqualStrings("hello", out.?);
-}
-
-test "serialize + deserialize: roundtrip null optional" {
-    const v: ?[]const u8 = null;
-    const buf = try serialize(testing.allocator, v);
-    defer testing.allocator.free(buf);
-    try testing.expectEqual(@as(usize, 1), buf.len);
-    const out = try deserialize(testing.allocator, ?[]const u8, buf);
-    try testing.expectEqual(@as(?[]const u8, null), out);
+test "serialize + deserialize: optional present and absent" {
+    const alloc = std.testing.allocator;
+    const present = @as(?u32, 99);
+    const absent = @as(?u32, null);
+    const buf1 = try serialize(alloc, present);
+    defer alloc.free(buf1);
+    const buf2 = try serialize(alloc, absent);
+    defer alloc.free(buf2);
+    try std.testing.expectEqual(@as(u32, 99), (try deserialize(alloc, ?u32, buf1)).?);
+    try std.testing.expect(try deserialize(alloc, ?u32, buf2) == null);
 }

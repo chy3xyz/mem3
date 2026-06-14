@@ -19,6 +19,16 @@ pub const hypermem = @import("hypermem/mod.zig");
 pub const retrieval = @import("retrieval/mod.zig");
 pub const storage = @import("storage/mod.zig");
 pub const server = @import("server/mod.zig");
+pub const store = @import("store/mod.zig");
+pub const Store = store.Store;
+pub const BuildOptions = store.BuildOptions;
+
+// Submodule re-exports — exposed so tests and downstream packages
+// can reach the deeply-nested types (`mem3.memory.Consolidator`,
+// `mem3.coherence.CoherenceCalculator`, etc.) without importing
+// every `.zig` file directly.
+pub const coherence = @import("memory/coherence.zig");
+pub const consolidator_mod = @import("memory/consolidator.zig");
 
 // Re-export the most common types at the top level so consumers can
 // `const mem3 = @import("mem3"); mem3.MemCell` etc.

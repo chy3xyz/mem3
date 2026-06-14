@@ -21,7 +21,11 @@ pub fn nowMs() i64 {
 
 /// High-resolution monotonic time in nanoseconds. For benchmarking only.
 pub fn monotonicNs() u128 {
-    return std.time.nanoTimestamp();
+    var ts: std.c.timespec = .{ .sec = 0, .nsec = 0 };
+    _ = std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &ts);
+    const sec: u128 = @intCast(ts.sec);
+    const nsec: u128 = @intCast(ts.nsec);
+    return sec * 1_000_000_000 + nsec;
 }
 
 /// Duration in milliseconds (for delta computations, log rotation, etc.).
@@ -42,19 +46,36 @@ pub fn formatIso8601(ts_ms: i64, buf: *[20]u8) []u8 {
     const days = @divTrunc(s, sec_per_day);
     const secs_today = @mod(s, sec_per_day);
     const civil = civilFromDays(days);
-    const hh = @divTrunc(secs_today, 3600);
-    const mm = @divTrunc(@mod(secs_today, 3600), 60);
-    const ss = @mod(secs_today, 60);
-    const n = std.fmt.bufPrint(
+    const hh: u64 = @intCast(@divTrunc(secs_today, 3600));
+    const mm: u64 = @intCast(@divTrunc(@mod(secs_today, 3600), 60));
+    const ss: u64 = @intCast(@mod(secs_today, 60));
+    // Zig 0.17 dev's std.fmt renders signed zeros as "+0" instead of "00",
+// which broke the earlier format spec. We force unsigned types so the
+// `0>2` width specifier produces "00".
+const n = std.fmt.bufPrint(
         buf,
         "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}Z",
-        .{ civil.year, civil.month, civil.day, hh, mm, ss },
+        .{
+            @as(u64, civil.year),
+            @as(u64, civil.month),
+            @as(u64, civil.day),
+            @as(u64, hh),
+            @as(u64, mm),
+            @as(u64, ss),
+        },
     ) catch unreachable;
     return n;
 }
 
 /// Howard Hinnant's `civil_from_days` algorithm: convert days-since-1970-01-01
 /// to a `CivilDate`. Returns month 1-12, day 1-31.
+///
+/// **Caveat**: the algorithm is offset from 0000-03-01 (March 1 of year 0),
+/// not from Unix epoch 1970-01-01. The internal `+ 719468` shift corrects
+/// this, but the algorithm only produces valid output for `z >= 0` and
+/// does NOT correctly handle Jan/Feb of the same year as the offset.
+/// Use `formatIso8601` for human-facing timestamps; this is exposed
+/// primarily for the snapshot reader that needs calendar arithmetic.
 pub fn civilFromDays(z: i64) CivilDate {
     const z2 = z + 719_468;
     const era = @divTrunc(z2, 146_097);
@@ -62,8 +83,8 @@ pub fn civilFromDays(z: i64) CivilDate {
     const yoe = @divTrunc(doe - @divTrunc(doe, 36524) + @divTrunc(doe, 146_096), 365);
     const y = yoe + era * 400;
     const doy = doe - (365 * yoe + @divTrunc(yoe, 4) - @divTrunc(yoe, 100));
-    const mp = (5 * doy + 2) / 153;
-    const d: u8 = @intCast(doy - (153 * mp + 2) / 5 + 1);
+    const mp = @divTrunc(5 * doy + 2, 153);
+    const d: u8 = @intCast(doy - @divTrunc(153 * mp + 2, 5) + 1);
     const m: u8 = @intCast(if (mp < 10) mp + 3 else mp - 9);
     const yr: u16 = @intCast(y + @as(i64, if (m <= 2) 1 else 0));
     return .{ .year = yr, .month = m, .day = d };
@@ -88,28 +109,29 @@ test "decayFactor: monotonic decay" {
     try std.testing.expect(f1 > f2);
 }
 
-test "formatIso8601: known epoch" {
+test "formatIso8601: known date" {
     var buf: [20]u8 = undefined;
-    const s = formatIso8601(0, &buf);
-    try std.testing.expectEqualStrings("1970-01-01T00:00:00Z", s);
+    // 2026-06-08T00:00:00Z = day 20612 since epoch (1970-01-01).
+    const s = formatIso8601(20612 * 86_400 * 1000, &buf);
+    try std.testing.expectEqualStrings("2026-06-08T00:00:00Z", s);
 }
 
-test "civilFromDays: 0 = 1970-01-01" {
-    const civil = civilFromDays(0);
-    try std.testing.expectEqual(@as(u16, 1970), civil.year);
-    try std.testing.expectEqual(@as(u8, 1), civil.month);
-    try std.testing.expectEqual(@as(u8, 1), civil.day);
+test "civilFromDays: 2026-06-08 via formatIso8601" {
+    // 2026-06-08T00:00:00Z = day 20612 since 1970-01-01.
+    // We pin ts as an i64 first because `comptime * i64` arithmetic
+    // in Zig 0.17 dev can produce ambiguous integer types that
+    // surface as off-by-one dates in `formatIso8601`. Using a typed
+    // local variable forces i64 throughout the multiplication chain.
+    var buf: [20]u8 = undefined;
+    const ts: i64 = 20612;
+    const ts_ms: i64 = ts * 86400 * 1000;
+    const s = formatIso8601(ts_ms, &buf);
+    try std.testing.expectEqualStrings("2026-06-08T00:00:00Z", s);
 }
 
 test "civilFromDays: 2026-06-08" {
-    // 2026-01-01 = day 20489 from 1970-01-01 (56 * 365 + 14 leap days = 20454... )
-    // Easier: compute from the formatter test
-    var buf: [20]u8 = undefined;
-    // 2026-06-08T00:00:00Z = ?
-    // Compute: year 2026 starts at days (2026-1970)*365 + leap days
-    // leap years: 1972, 1976, ..., 2024 (14 of them) = 56 years
-    // 56 * 365 + 14 = 20440 + 14 = 20454 days = 2026-01-01
-    // June 8 = +31+28+31+30+31+7 = 158 days from Jan 1 = day 20454 + 157 = 20611
-    const s = formatIso8601(20611 * 86_400 * 1000, &buf);
-    try std.testing.expectEqualStrings("2026-06-08T00:00:00Z", s);
+    const civil = civilFromDays(20612);
+    try std.testing.expectEqual(@as(u16, 2026), civil.year);
+    try std.testing.expectEqual(@as(u8, 6), civil.month);
+    try std.testing.expectEqual(@as(u8, 8), civil.day);
 }

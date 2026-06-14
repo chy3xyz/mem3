@@ -590,14 +590,14 @@ const BufferedReader = struct {
 
 test "Snapshot: write + read roundtrip preserves state" {
     const alloc = std.testing.allocator;
-    var ids: std.atomistd.c.Value(u64) = .init(1);
+    var ids: std.atomic.Value(u64) = .init(1);
     var mgr = TriSourceManager.init(alloc, &ids);
     defer mgr.deinit();
     var fuzzy = FuzzyStore.init(alloc);
     defer fuzzy.deinit();
     var goals = GoalPoset.init(alloc);
     defer goals.deinit();
-    _ = goals.create("general", "catch-all", null, 5, null, 0, &ids);
+    _ = goals.create("general", "catch-all", null, 5, null, 0, &ids) catch {};
 
     const cell: MemCell = .{
         .id = 0,
@@ -615,8 +615,9 @@ test "Snapshot: write + read roundtrip preserves state" {
     _ = try mgr.add(cell);
 
     const path = "data/test_snapshot.bin";
-    try std.fs.cwd().makePath("data");
-    defer std.fs.cwd().deleteFile(path) catch {};
+    // mkdir -p data via POSIX mkdir (Zig 0.17 removed std.fs.cwd).
+    _ = std.c.mkdir("data", 0o755);
+    defer _ = std.c.unlink(path);
 
     var w = SnapshotWriter.init(alloc, path);
     _ = try w.write(42, &goals, &mgr, &fuzzy);

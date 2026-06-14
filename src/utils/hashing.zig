@@ -19,7 +19,7 @@ pub fn stableHash(s: []const u8) u64 {
 
 /// Combine two hashes (for chaining keys).
 pub fn combine(a: u64, b: u64) u64 {
-    var h = std.hash.XxHash3.init();
+    var h = std.hash.XxHash3.init(0);
     h.update(&std.mem.toBytes(a));
     h.update(&std.mem.toBytes(b));
     return h.final();

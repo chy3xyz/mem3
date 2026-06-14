@@ -155,7 +155,12 @@ pub const GoalPoset = struct {
     /// Update a goal's status. Rejects transitions to .tombstoned unless
     /// the goal is already .unrealized for ≥ 7 days (Constitution Principle III).
     pub fn updateStatus(self: *GoalPoset, id: u64, status: GoalStatus, now_ms: i64) errors.Error!void {
-        const node = self.nodes.getPtr(id) orelse return errors.Error.GoalNotFound;
+        // `self.nodes` is AutoHashMap(u64, *GoalNode). getPtr returns
+        // `?**GoalNode` — a pointer to the value slot, which itself
+        // holds a `*GoalNode` (the pointer to the actual GoalNode
+        // struct). We deref twice to reach the struct.
+        const slot_ptr = self.nodes.getPtr(id) orelse return errors.Error.GoalNotFound;
+        const node: *GoalNode = slot_ptr.*;
         if (status == .tombstoned) {
             if (node.status != .unrealized) {
                 return errors.Error.GoalCycle; // reuse this error for "invalid transition"
@@ -202,12 +207,14 @@ pub const GoalPoset = struct {
 
     /// List MemCell ids associated with a goal.
     pub fn memcellsFor(self: *const GoalPoset, goal_id: u64) []const u64 {
-        return self.memcell_index.get(goal_id) orelse &.{};
+        const list = self.memcell_index.getPtr(goal_id) orelse return &.{};
+        return list.items;
     }
 
     /// Direct children of a goal (one step down the lattice).
     pub fn childrenOf(self: *const GoalPoset, goal_id: u64) []const u64 {
-        return self.children.get(goal_id) orelse &.{};
+        const list = self.children.getPtr(goal_id) orelse return &.{};
+        return list.items;
     }
 
     /// All descendants of a goal (transitive closure). Returns an owned slice.
@@ -219,8 +226,8 @@ pub const GoalPoset = struct {
     }
 
     fn walkDescendants(self: *const GoalPoset, id: u64, out: *std.ArrayList(u64)) errors.Error!void {
-        const kids = self.children.get(id) orelse return;
-        for (kids) |k| {
+        const kids_ptr = self.children.getPtr(id) orelse return;
+        for (kids_ptr.items) |k| {
             try out.append(self.alloc, k);
             try walkDescendants(self, k, out);
         }
@@ -242,16 +249,36 @@ pub const GoalPoset = struct {
     /// MemCells for > 7 days as .unrealized.
     pub fn evaluateMetaGoals(self: *GoalPoset, now_ms: i64) !usize {
         var unrealized_count: usize = 0;
-        var it = self.nodes.iterator();
-        while (it.next()) |entry| {
-            const node = entry.value_ptr.*;
+        // Collect ids first to avoid iterator invalidation. Zig 0.17's
+        // AutoHashMap may rehash on internal compaction; holding a
+        // value_ptr from iterator.next() across updateStatus() can lead
+        // to stale pointers and silent failures. We snapshot ids into
+        // a stack-allocated array (bounded by a sane upper limit) and
+        // re-fetch each GoalNode by id after updateStatus.
+        var ids: [256]u64 = undefined;
+        var n_ids: usize = 0;
+        {
+            var it = self.nodes.iterator();
+            while (it.next()) |entry| {
+                if (n_ids >= ids.len) break;
+                ids[n_ids] = entry.key_ptr.*;
+                n_ids += 1;
+            }
+        }
+        for (ids[0..n_ids]) |id| {
+            const node_ptr = self.nodes.getPtr(id) orelse continue;
+            const node = node_ptr.*;
             if (node.id == ROOT_GOAL_ID or node.id == TOP_GOAL_ID) continue;
             if (node.status == .tombstoned or node.status == .unrealized) continue;
 
-            const mcs = self.memcell_index.get(node.id) orelse &.{};
+            const mcs = self.memcellsFor(node.id);
             if (mcs.len == 0) {
-                if (now_ms - node.created_at > 7 * 86_400_000) {
-                    try self.updateStatus(node.id, .unrealized, now_ms);
+                const age_ms = now_ms - node.created_at;
+                if (age_ms > 7 * 86_400_000) {
+                    self.updateStatus(node.id, .unrealized, now_ms) catch |err| {
+                        std.log.warn("evaluateMetaGoals: updateStatus failed for goal {d}: {}", .{ node.id, err });
+                        continue;
+                    };
                     unrealized_count += 1;
                 }
             }
@@ -320,7 +347,15 @@ test "GoalPoset: meta-goal evaluation marks unrealized after 7 days" {
 
     const now: i64 = 1_000_000_000_000;
     const g = try poset.create("orphan", "no memories", null, 5, null, now, &next);
-    // No memcells bound. After 7 days, evaluateMetaGoals should mark it.
+
+    // Diagnostic: try updateStatus directly first to verify the
+    // mechanism works, then compare with evaluateMetaGoals.
+    try poset.updateStatus(g, .in_progress, now + 1000);
+    try std.testing.expectEqual(GoalStatus.in_progress, poset.get(g).?.status);
+    try poset.updateStatus(g, .pending, now + 2000);
+    try std.testing.expectEqual(GoalStatus.pending, poset.get(g).?.status);
+
+    // Now the actual test: meta-goal evaluation marks it unrealized.
     const later = now + 8 * 86_400_000;
     const n = try poset.evaluateMetaGoals(later);
     try std.testing.expectEqual(@as(usize, 1), n);

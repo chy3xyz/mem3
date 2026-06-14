@@ -134,8 +134,9 @@ test "Encoder: encode valid cell" {
         },
     };
     const cell = try enc.encode(input);
-    defer alloc.free(cell.episode);
-    try std.testing.expect(cell.importance_score > 0.3);
+    // Encode is zero-copy: cell.episode aliases input.episode (a string
+    // literal in this test). Don't free it.
+    try std.testing.expect(cell.metadata.importance_score > 0.3);
     try std.testing.expect(cell.metadata.decay_rate > 0.0);
 }
 
