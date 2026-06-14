@@ -872,6 +872,11 @@ pub const Store = struct {
                 // deinit covers success.
                 ctx_ptr.store.commitBuiltCell(parsed.id, built) catch |err| {
                     std.log.warn("replay insert failed: {}", .{err});
+                    // errdefer built.deinit at line above is registered
+                    // *after* buildCellFromParsed succeeded, so on
+                    // commitBuiltCell error we must deinit explicitly
+                    // to avoid leaking the BuiltCell's containers.
+                    built.deinit(ctx_ptr.store.alloc);
                     return;
                 };
                 built.deinit(ctx_ptr.store.alloc);
@@ -951,6 +956,8 @@ const ParsedInsert = struct {
     metadata: core.Metadata,
 
     pub fn deinit(self: *const ParsedInsert, alloc: Allocator) void {
+        // `source` is a MemorySource enum (by value, no heap), so no
+        // free needed — the 6-byte leak is from somewhere else.
         alloc.free(self.episode);
         alloc.free(self.facts);
     }
@@ -968,8 +975,14 @@ fn parseInsertPayload(alloc: Allocator, payload: []const u8, synthetic_id_fallba
     };
 
     const source_str = try extractJsonStringOrOwned(alloc, payload, "source", "matter");
-    errdefer alloc.free(source_str);
-    const source = MemorySource.fromString(source_str) catch return error.ParseFailed;
+    const source = MemorySource.fromString(source_str) catch {
+        alloc.free(source_str);
+        return error.ParseFailed;
+    };
+    // `source_str` is consumed by fromString (which only reads it
+    // as a comptime-friendly view); free immediately so it doesn't
+    // leak on the success path.
+    alloc.free(source_str);
     const episode = try extractJsonStringOrOwned(alloc, payload, "episode", "");
     errdefer alloc.free(episode);
     if (episode.len == 0) return error.ParseFailed;
