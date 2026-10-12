@@ -614,9 +614,7 @@ test "Snapshot: write + read roundtrip preserves state" {
     };
     _ = try mgr.add(cell);
 
-    const path = "data/test_snapshot.bin";
-    // mkdir -p data via POSIX mkdir (Zig 0.17 removed std.fs.cwd).
-    _ = std.c.mkdir("data", 0o755);
+    const path = "/tmp/mem3_test_snapshot.bin";
     defer _ = std.c.unlink(path);
 
     var w = SnapshotWriter.init(alloc, path);

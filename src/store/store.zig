@@ -645,13 +645,13 @@ pub const Store = struct {
             error.SnapshotBadMagic,
             error.SnapshotBadVersion,
             => {
-                std.debug.print("WAL: no valid snapshot at {s}, starting fresh\n", .{self.snapshot_path});
+                std.log.info("WAL: no valid snapshot at {s}, starting fresh", .{self.snapshot_path});
                 return;
             },
             else => return err,
         };
         defer data.deinit();
-        std.debug.print("WAL: snapshot has {d} cells, {d} fuzzy, counter={d}\n", .{
+        std.log.info("WAL: snapshot has {d} cells, {d} fuzzy, counter={d}", .{
             data.cells.len,
             data.fuzzy_cells.len,
             data.counter,
@@ -704,7 +704,7 @@ pub const Store = struct {
             std.log.warn("snapshot: write failed: {}", .{err});
             return;
         };
-        std.debug.print("snapshot: wrote {d} bytes to {s}\n", .{ bytes, self.snapshot_path });
+        std.log.info("snapshot: wrote {d} bytes to {s}", .{ bytes, self.snapshot_path });
         if (self.wal) |wal| {
             wal.flush() catch {};
             wal.deinit();
@@ -799,22 +799,22 @@ pub const Store = struct {
         }
 
         const wal_ptr = self.alloc.create(WAL) catch |err| {
-            std.debug.print("WAL: alloc failed: {s}\n", .{@errorName(err)});
+            std.log.err("WAL: alloc failed: {s}", .{@errorName(err)});
             return;
         };
         const init_wal = WAL.init(self.alloc, self.wal_path) catch |err| {
-            std.debug.print("WAL: init failed: {s}\n", .{@errorName(err)});
+            std.log.err("WAL: init failed: {s}", .{@errorName(err)});
             self.alloc.destroy(wal_ptr);
             return;
         };
         wal_ptr.* = init_wal;
         wal_ptr.open() catch |err| {
-            std.debug.print("WAL: open({s}) failed: {s}\n", .{ self.wal_path, @errorName(err) });
+            std.log.err("WAL: open({s}) failed: {s}", .{ self.wal_path, @errorName(err) });
             wal_ptr.deinit();
             self.alloc.destroy(wal_ptr);
             return;
         };
-        std.debug.print("WAL: opened {s} (replay={d} bytes)\n", .{ self.wal_path, existing.items.len });
+        std.log.info("WAL: opened {s} (replay={d} bytes)", .{ self.wal_path, existing.items.len });
         self.wal = wal_ptr;
 
         try self.loadSnapshot();
@@ -888,7 +888,7 @@ pub const Store = struct {
         if (max_replayed_id > 0) {
             _ = self.ids.fetchMax(max_replayed_id + 1, .monotonic);
         }
-        std.debug.print("WAL: replayed {d} memcell_insert records from {s}\n", .{ replay_count, self.wal_path });
+        std.log.info("WAL: replayed {d} memcell_insert records from {s}", .{ replay_count, self.wal_path });
     }
 };
 
@@ -1180,13 +1180,11 @@ test "Store: in-memory add + getCell" {
 
 test "Store: durable mode writes WAL, replay reconstructs state" {
     const alloc = std.testing.allocator;
-    // Use a process-unique directory per test invocation. Zig's
-    // testing harness runs tests in source order; a previous crash
-    // (segfault in earlier build) leaves WAL data behind that this
-    // test would otherwise replay on top of a fresh state. A
-    // uniquified suffix prevents cross-test contamination.
+    // Scratch dir lives outside the repo: running the test suite must not
+    // leave `data/` behind in the working tree. The pre/post unlink
+    // blocks below make this safe even after a crashed previous run.
     var data_dir_buf: [64]u8 = undefined;
-    const data_dir = std.fmt.bufPrint(&data_dir_buf, "data/test_store_e2e", .{}) catch "data/test_store_e2e";
+    const data_dir = std.fmt.bufPrint(&data_dir_buf, "/tmp/mem3_test_store_e2e", .{}) catch "/tmp/mem3_test_store_e2e";
     defer {
         // Best-effort cleanup so re-runs start fresh.
         var wal_z: [std.fs.max_path_bytes + 1]u8 = undefined;

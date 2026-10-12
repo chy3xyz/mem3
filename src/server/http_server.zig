@@ -234,13 +234,13 @@ const Store = struct {
             error.SnapshotBadMagic,
             error.SnapshotBadVersion,
             => {
-                std.debug.print("WAL: no valid snapshot at {s}, starting fresh\n", .{self.snapshot_path});
+                std.log.info("WAL: no valid snapshot at {s}, starting fresh", .{self.snapshot_path});
                 return;
             },
             else => return err,
         };
         defer data.deinit();
-        std.debug.print("WAL: snapshot has {d} cells, {d} fuzzy, counter={d}\n", .{
+        std.log.info("WAL: snapshot has {d} cells, {d} fuzzy, counter={d}", .{
             data.cells.len,
             data.fuzzy_cells.len,
             data.counter,
@@ -304,7 +304,7 @@ const Store = struct {
             std.log.warn("snapshot: write failed: {}", .{err});
             return;
         };
-        std.debug.print("snapshot: wrote {d} bytes to {s}\n", .{ bytes, self.snapshot_path });
+        std.log.info("snapshot: wrote {d} bytes to {s}", .{ bytes, self.snapshot_path });
         // Truncate the WAL. Close, delete, reopen as fresh.
         if (self.wal) |wal| {
             wal.flush() catch {};
@@ -641,22 +641,22 @@ const Store = struct {
         }
         // Now allocate the WAL (it will createFile on open()).
         const wal_ptr = self.alloc.create(WAL) catch |err| {
-            std.debug.print("WAL: alloc failed: {s}\n", .{@errorName(err)});
+            std.log.err("WAL: alloc failed: {s}", .{@errorName(err)});
             return;
         };
         const init_wal = WAL.init(self.alloc, wal_path) catch |err| {
-            std.debug.print("WAL: init failed: {s}\n", .{@errorName(err)});
+            std.log.err("WAL: init failed: {s}", .{@errorName(err)});
             self.alloc.destroy(wal_ptr);
             return;
         };
         wal_ptr.* = init_wal;
         wal_ptr.open() catch |err| {
-            std.debug.print("WAL: open({s}) failed: {s}\n", .{ wal_path, @errorName(err) });
+            std.log.err("WAL: open({s}) failed: {s}", .{ wal_path, @errorName(err) });
             wal_ptr.deinit();
             self.alloc.destroy(wal_ptr);
             return;
         };
-        std.debug.print("WAL: opened {s} (replay={d} bytes)\n", .{ wal_path, existing.items.len });
+        std.log.info("WAL: opened {s} (replay={d} bytes)", .{ wal_path, existing.items.len });
         self.wal = wal_ptr;
         // Read snapshot FIRST (if present), then replay WAL on top.
         // Snapshot is the "base" state; WAL records are deltas since
@@ -728,7 +728,7 @@ const Store = struct {
         if (max_replayed_id > 0) {
             _ = self.ids.fetchMax(max_replayed_id + 1, .monotonic);
         }
-        std.debug.print("WAL: replayed {d} memcell_insert records from {s}\n", .{ replay_count, wal_path });
+        std.log.info("WAL: replayed {d} memcell_insert records from {s}", .{ replay_count, wal_path });
     }
 
     fn allCells(self: *Store, alloc: Allocator) ![]*MemCell {
@@ -813,7 +813,7 @@ pub const Server = struct {
         //   anything else that's a valid IPv4 → use it
         //   invalid                  → warn + fall back to loopback
         addr.addr = parseBindAddr(self.bind) catch |err| blk: {
-            std.debug.print("WARN: invalid bind '{s}': {s}; falling back to 127.0.0.1\n", .{ self.bind, @errorName(err) });
+            std.log.warn("invalid bind '{s}': {s}; falling back to 127.0.0.1", .{ self.bind, @errorName(err) });
             break :blk std.mem.nativeToBig(u32, 0x7F000001);
         };
 
@@ -1383,11 +1383,11 @@ fn jsonAppendCell(alloc: Allocator, out: *std.ArrayList(u8), cell: *const MemCel
 
 test "Server: healthz route" {
     const alloc = std.testing.allocator;
-    var srv = try Server.init(alloc, "127.0.0.1", 0, "data/test_server");
+    var srv = try Server.init(alloc, "127.0.0.1", 0, "/tmp/mem3_test_server");
     defer {
         srv.deinit();
         // Test cleanup: remove the data dir the test created.
-        std.fs.cwd().deleteTree("data/test_server") catch {};
+        std.fs.cwd().deleteTree("/tmp/mem3_test_server") catch {};
     }
     const resp = try srv.route("GET", "/healthz", "");
     try std.testing.expectEqual(@as(u16, 200), resp.status);
@@ -1396,10 +1396,10 @@ test "Server: healthz route" {
 
 test "Server: GET /api/goals" {
     const alloc = std.testing.allocator;
-    var srv = try Server.init(alloc, "127.0.0.1", 0, "data/test_server");
+    var srv = try Server.init(alloc, "127.0.0.1", 0, "/tmp/mem3_test_server");
     defer {
         srv.deinit();
-        std.fs.cwd().deleteTree("data/test_server") catch {};
+        std.fs.cwd().deleteTree("/tmp/mem3_test_server") catch {};
     }
     const resp = try srv.route("GET", "/api/goals", "");
     defer alloc.free(resp.body);

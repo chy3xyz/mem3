@@ -10,6 +10,13 @@
 
 const std = @import("std");
 
+/// See `src/main.zig` for why this exists. Under `--listen=-` any stderr
+/// write from inside a test desynchronises the runner↔build protocol, so
+/// the test binary aborts and `zig build test` reports success anyway.
+pub const std_options: std.Options = .{
+    .log_level = .err,
+};
+
 comptime {
     // Unit tests — per-module focused coverage of core algorithms.
     _ = @import("unit/coherence.zig");

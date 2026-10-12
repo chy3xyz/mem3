@@ -26,6 +26,19 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
+/// Silent by default (AGENTS.md: "silent-by-default for `serve`").
+///
+/// This is also what keeps `zig build test` honest: the Zig test runner
+/// talks to the build system over the process pipes when invoked with
+/// `--listen=-`, and *any* stderr write from inside a test desynchronises
+/// that protocol — the whole test binary then dies with "failed command"
+/// while `zig build test` still exits 0. Library code must never print;
+/// user-facing CLI output goes through `std.debug.print` in the cli_*
+/// modules and is unaffected, and `std.log.err` still surfaces failures.
+pub const std_options: std.Options = .{
+    .log_level = .err,
+};
+
 const cli = @import("cli.zig");
 const version = @import("version.zig");
 

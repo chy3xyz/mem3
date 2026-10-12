@@ -13,7 +13,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
-        .strip = optimize == .ReleaseFast or optimize == .ReleaseSmall,
+        .strip = optimize == .fast or optimize == .small,
     });
 
     const exe = b.addExecutable(.{
@@ -33,6 +33,11 @@ pub fn build(b: *std.Build) void {
     // =========================================================================
     const test_step = b.step("test", "Run all tests");
     addAllTests(b, test_step, target, optimize);
+    // The HTTP e2e tests exec `zig-out/bin/mem3`. Without this dependency
+    // the binary is absent on a cold checkout and all three tests silently
+    // self-skip while still reporting OK.
+    const install_exe = b.addInstallArtifact(exe, .{});
+    test_step.dependOn(&install_exe.step);
 
     // =========================================================================
     // Bench step

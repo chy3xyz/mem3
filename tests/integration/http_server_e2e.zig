@@ -198,6 +198,7 @@ const TestServer = struct {
     pid: c.pid_t,
     port: u16,
     data_dir: []u8,
+    stopped: bool = false,
 
     fn start(data_dir: []u8) !TestServer {
         const port = try pickFreePort();
@@ -210,22 +211,33 @@ const TestServer = struct {
         return .{ .pid = pid, .port = port, .data_dir = data_dir };
     }
 
+    /// Idempotent: the restart test stops the server explicitly *and*
+    /// defers the stop, so guarding here keeps us from kill/waitpid-ing an
+    /// already-reaped pid.
     fn stop(self: *TestServer) void {
+        if (self.stopped) return;
+        self.stopped = true;
         _ = c.kill(self.pid, c.SIG.TERM);
         _ = c.waitpid(self.pid, null, 0);
     }
 };
+
+/// Skip helper. Callers must `return skipUnavailable(err);`.
+/// Returning `error.SkipZigTest` makes the runner report a real SKIP
+/// instead of counting a silently-unrun test as a pass — which is how these
+/// three e2e tests used to report OK while never executing.
+fn skipUnavailable(err: anyerror) error{SkipZigTest} {
+    std.log.warn("skipping: subprocess unavailable ({s})", .{@errorName(err)});
+    return error.SkipZigTest;
+}
 
 test "E2E HTTP: /healthz responds 200 with status:ok" {
     const data_dir = try makeDataDir("healthz");
     wipeDataDir(data_dir);
 
     var srv = TestServer.start(data_dir) catch |err| {
-        // If fork/exec fails (e.g. CI without proper /bin/sh), skip
-        // gracefully rather than fail the suite.
-        std.debug.print("skipped: subprocess unavailable ({s})\n", .{@errorName(err)});
         wipeDataDir(data_dir);
-        return;
+        return skipUnavailable(err);
     };
     defer srv.stop();
     defer wipeDataDir(srv.data_dir);
@@ -242,9 +254,8 @@ test "E2E HTTP: POST /api/memcells inserts, GET retrieves" {
     wipeDataDir(data_dir);
 
     var srv = TestServer.start(data_dir) catch |err| {
-        std.debug.print("skipped: subprocess unavailable ({s})\n", .{@errorName(err)});
         wipeDataDir(data_dir);
-        return;
+        return skipUnavailable(err);
     };
     defer srv.stop();
     defer wipeDataDir(srv.data_dir);
@@ -297,9 +308,8 @@ test "E2E HTTP: server restart preserves inserted cells" {
     // Server #1: insert 2 cells, then shutdown.
     {
         var srv1 = TestServer.start(data_dir) catch |err| {
-            std.debug.print("skipped: subprocess unavailable ({s})\n", .{@errorName(err)});
             wipeDataDir(data_dir);
-            return;
+            return skipUnavailable(err);
         };
         defer srv1.stop();
 
@@ -336,9 +346,8 @@ test "E2E HTTP: server restart preserves inserted cells" {
     // Server #2: same data dir, expect to see both cells.
     {
         var srv2 = TestServer.start(data_dir) catch |err| {
-            std.debug.print("skipped: subprocess unavailable ({s})\n", .{@errorName(err)});
             wipeDataDir(data_dir);
-            return;
+            return skipUnavailable(err);
         };
         defer srv2.stop();
         defer wipeDataDir(srv2.data_dir);

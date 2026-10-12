@@ -173,10 +173,12 @@ pub const WAL = struct {
 // =============================================================================
 
 test "WAL: append + replay" {
-    var wal = try WAL.init(std.testing.allocator, "data/test.wal");
+    // Scratch path lives outside the repo: a fresh clone has no `data/`
+    // dir, and the test must not depend on one existing.
+    var wal = try WAL.init(std.testing.allocator, "/tmp/mem3_test.wal");
     defer wal.deinit();
     try wal.open();
-    defer _ = std.c.unlink("data/test.wal");
+    defer _ = std.c.unlink("/tmp/mem3_test.wal");
 
     try wal.append(.{ .record_type = .memcell_insert, .payload = "hello", .timestamp = 1000 });
     try wal.append(.{ .record_type = .memcell_insert, .payload = "world", .timestamp = 2000 });
@@ -185,7 +187,7 @@ test "WAL: append + replay" {
     // Replay from disk. Use POSIX open via std.c — Zig 0.17 removed
     // std.fs.cwd(), and std.posix.openat wants a directory fd.
     var zpath: [std.fs.max_path_bytes + 1]u8 = undefined;
-    const z = try std.fmt.bufPrint(&zpath, "{s}\x00", .{"data/test.wal"});
+    const z = try std.fmt.bufPrint(&zpath, "{s}\x00", .{"/tmp/mem3_test.wal"});
     const zslice = z[0 .. z.len - 1 :0];
     const fd = std.c.open(zslice.ptr, std.c.O{}, @as(std.c.mode_t, 0));
     try std.testing.expect(fd >= 0);
@@ -214,17 +216,17 @@ test "WAL: append + replay" {
 }
 
 test "WAL: checksum corruption is detected" {
-    var wal = try WAL.init(std.testing.allocator, "data/test_corrupt.wal");
+    var wal = try WAL.init(std.testing.allocator, "/tmp/mem3_test_corrupt.wal");
     defer wal.deinit();
     try wal.open();
-    defer _ = std.c.unlink("data/test_corrupt.wal");
+    defer _ = std.c.unlink("/tmp/mem3_test_corrupt.wal");
     try wal.append(.{ .record_type = .memcell_insert, .payload = "x", .timestamp = 100 });
     try wal.flush();
 
     // Corrupt the file: flip a byte in the middle. Use POSIX open()
     // since std.fs.cwd() is gone in Zig 0.17.
     var zpath: [std.fs.max_path_bytes + 1]u8 = undefined;
-    const z = try std.fmt.bufPrint(&zpath, "{s}\x00", .{"data/test_corrupt.wal"});
+    const z = try std.fmt.bufPrint(&zpath, "{s}\x00", .{"/tmp/mem3_test_corrupt.wal"});
     const zslice = z[0 .. z.len - 1 :0];
     const flags: std.c.O = .{ .ACCMODE = .RDWR };
     const fd = std.c.open(zslice.ptr, flags, @as(std.c.mode_t, 0));

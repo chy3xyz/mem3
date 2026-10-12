@@ -14,7 +14,7 @@
 | Build | `zig build` → one binary, < 10MB, zero external runtime deps |
 | Theory | 三源合恰论 (物/象/性) + GHW 范式 (Goal/Harness/World) |
 | Spec-kit | Initialized; spec at `specs/001-trisource-everos-mvp/` |
-| Status | **v0.2.0 shipped** (CLI + persistence + 89 tests + 0 leaks). All 7 constitutional principles active. |
+| Status | **v0.2.0** (CLI + persistence + 78 tests, cold-tree verified). All 7 constitutional principles active. |
 
 ## Read Order for New Agents
 
@@ -112,8 +112,16 @@ tests/                        # v0.2.0 added these three test trees
 | `mem3 forget` | ✅ | Existence-gain-driven forgetting sweep |
 | `mem3 serve` | ✅ | HTTP daemon with /healthz /metrics /api/sync /api/memcells /api/memcells/:id |
 | Persistence | ✅ | WAL-first + snapshot. WAL truncated on sync. |
-| Tests | ✅ | 52 (main) + 11 (constitution) + 26 (e2e/unit/property) = 89, 0 leaks |
+| Tests | ✅ | 78 total: 52 (`src/main.zig`-rooted, which already includes the 11 constitution tests) + 26 (`tests/main.zig`-rooted), 0 leaks |
 | Binary | ✅ | 3.3 MB stripped, only links libSystem |
+| Toolchain | ✅ | Pinned via `.zigversion` (Zig 0.17.0). Tested on a cold tree: `zig build`, `zig build test`, `zig build check-constitution` all exit 0 |
+
+**Test-suite rules (learned the hard way — do not regress these):**
+1. **A library must never write to stderr.** `zig build test` runs each test binary with `--listen=-`; any stderr write from inside a test desynchronises the runner↔build protocol and the binary dies with `failed command`. `src/main.zig` and `tests/main.zig` therefore set `std_options.log_level = .err`, and all persistence logging goes through `std.log`, never `std.debug.print`.
+2. **Never silently skip.** A test that cannot run must `return error.SkipZigTest`, not `return;`. The HTTP e2e tests used to print "skipped" and be counted as passes.
+3. **The test step depends on the install artifact**, because the e2e tests exec `zig-out/bin/mem3`.
+4. **Tests must not write inside the repo.** All scratch paths live under `/tmp`.
+5. **Verify the gate actually fails.** Inject a deliberately failing test and confirm `zig build test` exits non-zero — a green gate that cannot go red is worse than no gate.
 
 **Known limitations tracked for v0.2.1:**
 - Goal create doesn't write to WAL — only default seed goals survive restart (TODO in `src/storage/snapshot.zig:collectGoals`).

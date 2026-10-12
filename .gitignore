@@ -5,6 +5,10 @@
 
 # Runtime data (per spec §FR-018)
 /data/
+# Default data-dir is ".", so a bare `mem3 serve`/`mem3 add` drops these in
+# the repo root. They are runtime artifacts, never source.
+/mem3.wal
+/snapshot.bin
 
 # OS noise
 .DS_Store
