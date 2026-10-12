@@ -175,10 +175,21 @@ fn addBench(
     parent_step: *std.Build.Step,
     target: std.Build.ResolvedTarget,
 ) void {
+    // The benchmark imports the library so it measures the same code the
+    // CLI and the daemon run. Built optimised: an unoptimised bench would
+    // report numbers nobody ships.
+    const bench_lib = b.createModule(.{
+        .root_source_file = b.path("src/lib.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
     const bench_module = b.createModule(.{
         .root_source_file = b.path("bench/main.zig"),
         .target = target,
         .optimize = .ReleaseFast,
+        .imports = &.{
+            .{ .name = "mem3", .module = bench_lib },
+        },
     });
     const bench_exe = b.addExecutable(.{
         .name = "mem3-bench",

@@ -265,7 +265,8 @@ fn readValue(gpa: Allocator, comptime T: type, r: *Reader) DeserializeError!T {
         },
         .@"enum" => {
             const tag_int = try r.readFixedInt(std.meta.Tag(T));
-            return std.meta.intToEnum(T, tag_int) catch return error.InvalidTag;
+            // Zig 0.17 moved `intToEnum` to `std.enums.fromInt`.
+            return std.enums.fromInt(T, tag_int) orelse return error.InvalidTag;
         },
         .pointer => |p| switch (p.size) {
             .slice => return @as(T, try readSlice(gpa, p.child, r)),

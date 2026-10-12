@@ -136,3 +136,48 @@ test "serializer: array of struct round-trips" {
     const out = try mem3.utils.serializer.deserialize(alloc, [3]u32, buf);
     try testing.expectEqualSlices(u32, &arr, &out);
 }
+// Regression guard for the enum branch of `deserialize`.
+//
+// A `MemCell` carries `source: MemorySource`, an enum. The enum code path
+// used `std.meta.intToEnum`, which no longer exists in Zig 0.17, so any
+// round-trip of a struct containing an enum failed to *compile*. Nothing
+// tested that, so the bench harness found it before any test did.
+// This test exists so it can never regress silently again.
+test "serializer: MemCell with an enum field round-trips" {
+    const alloc = testing.allocator;
+
+    for ([_]mem3.MemorySource{ .matter, .form, .spirit }) |source| {
+        const original: mem3.MemCell = .{
+            .id = 7,
+            .source = source,
+            .episode = "an episode that exercises every enum-backed field",
+            .atomic_facts = &.{.{ .subject = "a", .predicate = "b", .object = "c", .confidence = 0.5, .source = "s" }},
+            .foresight = &.{.{ .description = "d", .valid_from = 1, .valid_until = 2, .confidence = 0.5 }},
+            .goal_associations = &.{.{ .goal_id = 1, .relevance = 0.5, .priority = 3 }},
+            .metadata = .{
+                .created_at = 100,
+                .updated_at = 200,
+                .source_confidence = 0.9,
+                .emotional_valence = 0.0,
+                .importance_score = 0.5,
+                .decay_rate = 0.05,
+                .is_fuzzy = false,
+                .location = "here",
+            },
+        };
+
+        const bytes = try mem3.utils.serialize(alloc, original);
+        defer alloc.free(bytes);
+
+        const back = try mem3.utils.deserialize(alloc, mem3.MemCell, bytes);
+        defer back.deinit(alloc);
+
+        try testing.expectEqual(original.source, back.source);
+        try testing.expectEqual(original.id, back.id);
+        try testing.expectEqualStrings(original.episode, back.episode);
+        try testing.expectEqual(original.atomic_facts.len, back.atomic_facts.len);
+        try testing.expectEqual(original.foresight.len, back.foresight.len);
+        try testing.expectEqual(original.goal_associations.len, back.goal_associations.len);
+        try testing.expectEqual(original.metadata.importance_score, back.metadata.importance_score);
+    }
+}
