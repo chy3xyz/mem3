@@ -61,6 +61,12 @@ comptime {
     _ = @import("memory/forgetter.zig");
     _ = @import("memory/lifecycle.zig");
     _ = @import("storage/wal.zig");
+    // `cli_commands/*.zig` are reached only through the lazy `@import`
+    // in `main`'s dispatch switch, so a `test` block in one of them is
+    // never compiled by `zig build test` and silently never runs. That
+    // is how a whole CLI module could sit outside the gate without
+    // anyone noticing. Import the ones that now carry tests.
+    _ = @import("cli_commands/goal.zig");
 }
 
 const log = std.log.scoped(.mem3_main);

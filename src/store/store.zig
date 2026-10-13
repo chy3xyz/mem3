@@ -421,8 +421,54 @@ pub const Store = struct {
     }
 
     /// Update a goal's status.
+    /// Update a goal's status. WAL-first, like `createGoal`.
+    ///
+    /// This used to mutate only the in-memory poset, so a status change
+    /// was silently lost on restart: `mem3 goal status 4 in_progress`
+    /// looked like it worked and then reverted to `pending` on the next
+    /// process. The record type `goal_update = 0x11` was already
+    /// declared in `wal.zig` and simply unused; using the reserved value
+    /// is safe because no such record exists on any disk yet, and
+    /// renumbering an existing type would corrupt older WALs.
     pub fn updateGoalStatus(self: *Store, id: u64, status: core.GoalStatus, now_ms: i64) !void {
+        // Precondition first: a status update for a goal that does not
+        // exist must fail BEFORE anything is journaled, or replay would
+        // try to apply an update to an absent goal.
+        if (!self.goals.nodes.contains(id)) return core.Error.GoalNotFound;
+
+        if (self.wal) |wal| {
+            const payload = try self.encodeGoalUpdatePayload(id, status, now_ms);
+            defer self.alloc.free(payload);
+            try wal.append(.{
+                .record_type = .goal_update,
+                .payload = payload,
+                .timestamp = wallClockSec(),
+            });
+        }
         try self.goals.updateStatus(id, status, now_ms);
+    }
+
+    /// `{"id":N,"status":"<tag>","updated_at":MS}`
+    fn encodeGoalUpdatePayload(
+        self: *Store,
+        id: u64,
+        status: core.GoalStatus,
+        updated_at: i64,
+    ) ![]u8 {
+        var out = std.ArrayList(u8).empty;
+        errdefer out.deinit(self.alloc);
+        try out.append(self.alloc, '{');
+        try jsonFieldUintRaw(self.alloc, &out, "id", id);
+        try out.append(self.alloc, ',');
+        // `status` is a fixed enum tag, so escaping is overkill but
+        // harmless and keeps this consistent with encodeGoalWALPayload.
+        try jsonFieldStringRaw(self.alloc, &out, "status", @tagName(status));
+        try out.append(self.alloc, ',');
+        var num_buf: [24]u8 = undefined;
+        try out.appendSlice(self.alloc, "\"updated_at\":");
+        try out.appendSlice(self.alloc, try std.fmt.bufPrint(&num_buf, "{d}", .{updated_at}));
+        try out.append(self.alloc, '}');
+        return out.toOwnedSlice(self.alloc);
     }
 
     // =================================================================
@@ -626,7 +672,13 @@ pub const Store = struct {
         }
     }
 
-    fn encodeWALPayload(
+    /// Encode a `memcell_insert` payload. Public because `mem3 add` must
+    /// produce byte-identical records to `addRaw`: when `add` hand-rolled a
+    /// second copy of this format it interpolated `episode` and the facts
+    /// payload raw into a JSON string context, so any quote or backslash in
+    /// user text produced a record that replay mis-parsed or dropped outright
+    /// while `add` still reported success. One encoder, one escaping rule.
+    pub fn encodeWALPayload(
         self: *Store,
         id: u64,
         source: MemorySource,
@@ -955,6 +1007,10 @@ pub const Store = struct {
                     ctx_ptr.store.applyGoalRecord(rec.payload, ctx_ptr.max_id, ctx_ptr.goals);
                     return;
                 }
+                if (rec.record_type == .goal_update) {
+                    ctx_ptr.store.applyGoalStatusRecord(rec.payload, ctx_ptr.goals);
+                    return;
+                }
                 if (rec.record_type != .memcell_insert) return;
                 const synthetic_id = SYNTHETIC_ID_BASE + @atomicRmw(u64, ctx_ptr.synthetic_seq, .Add, 1, .seq_cst);
                 const parsed = parseInsertPayload(
@@ -1006,6 +1062,33 @@ pub const Store = struct {
             _ = self.ids.fetchMax(max_replayed_id + 1, .monotonic);
         }
         std.log.info("WAL: replayed {d} memcell_insert + {d} goal_create records from {s}", .{ replay_count, replayed_goals, self.wal_path });
+    }
+
+    /// Replay one `goal_update` record. Idempotent and order-independent:
+/// an update for a goal whose `goal_create` has not been replayed yet
+/// is dropped, because `rejournalGoals` always emits the create first.
+fn applyGoalStatusRecord(self: *Store, payload: []const u8, count: *u64) void {
+        const id = extractJsonInt(payload, "id") orelse return;
+        const status_str = extractJsonStringOrOwned(self.alloc, payload, "status", "") catch return;
+        defer self.alloc.free(status_str);
+        const status = std.meta.stringToEnum(core.GoalStatus, status_str) orelse {
+            log.warn("WAL: goal_update id={d} carries unknown status '{s}', skipped", .{ id, status_str });
+            return;
+        };
+        if (!self.goals.nodes.contains(@intCast(id))) {
+            log.warn("WAL: goal_update id={d} skipped — goal not in poset", .{id});
+            return;
+        }
+        // Replay in file order; only count records that actually changed
+        // something, so the log line reflects real work rather than the
+        // number of records read.
+        const now = extractJsonInt(payload, "updated_at") orelse 0;
+        const before = self.goals.get(@intCast(id)).?.status;
+        self.goals.updateStatus(@intCast(id), status, now) catch |err| {
+            log.warn("WAL: goal_update id={d} failed: {}", .{ id, err });
+            return;
+        };
+        if (self.goals.get(@intCast(id)).?.status != before) count.* += 1;
     }
 
     /// Replay one `goal_create` record back into the poset, with the
@@ -1094,6 +1177,26 @@ pub const Store = struct {
                     };
                 }
                 written += 1;
+                // `goal_create` carries no status field, and
+                // `GoalPoset.create` always starts at `.pending`. Without
+                // this the snapshot truncation that `rejournalGoals`
+                // exists to survive would silently reset every completed
+                // or failed goal back to pending.
+                if (node.status != .pending) {
+                    const st_payload = self.encodeGoalUpdatePayload(child_id, node.status, node.updated_at) catch |err| {
+                        log.warn("rejournalGoals: status encode failed for goal {d}: {}", .{ child_id, err });
+                        continue;
+                    };
+                    defer self.alloc.free(st_payload);
+                    wal.append(.{
+                        .record_type = .goal_update,
+                        .payload = st_payload,
+                        .timestamp = wallClockSec(),
+                    }) catch |err| {
+                        log.warn("rejournalGoals: status append failed for goal {d}: {}", .{ child_id, err });
+                        return;
+                    };
+                }
                 queue.append(self.alloc, child_id) catch {
                     log.warn("rejournalGoals: out of memory at depth {d} — subtree dropped", .{head});
                     return;
@@ -1114,7 +1217,7 @@ fn wallClockSec() i64 {
     return @intCast(ts.sec);
 }
 
-fn jsonFieldStringRaw(alloc: Allocator, out: *std.ArrayList(u8), key: []const u8, value: []const u8) !void {
+pub fn jsonFieldStringRaw(alloc: Allocator, out: *std.ArrayList(u8), key: []const u8, value: []const u8) !void {
     try out.append(alloc, '"');
     for (key) |kc| try out.append(alloc, kc);
     try out.appendSlice(alloc, "\":\"");
@@ -1138,19 +1241,19 @@ fn jsonFieldStringRaw(alloc: Allocator, out: *std.ArrayList(u8), key: []const u8
     try out.append(alloc, '"');
 }
 
-fn jsonFieldUintRaw(alloc: Allocator, out: *std.ArrayList(u8), key: []const u8, value: u64) !void {
+pub fn jsonFieldUintRaw(alloc: Allocator, out: *std.ArrayList(u8), key: []const u8, value: u64) !void {
     var buf: [32]u8 = undefined;
     const s = try std.fmt.bufPrint(&buf, "\"{s}\":{d}", .{ key, value });
     try out.appendSlice(alloc, s);
 }
 
-fn jsonFieldIntRaw(alloc: Allocator, out: *std.ArrayList(u8), key: []const u8, value: i64) !void {
+pub fn jsonFieldIntRaw(alloc: Allocator, out: *std.ArrayList(u8), key: []const u8, value: i64) !void {
     var buf: [32]u8 = undefined;
     const s = try std.fmt.bufPrint(&buf, "\"{s}\":{d}", .{ key, value });
     try out.appendSlice(alloc, s);
 }
 
-fn jsonFieldFloatRaw(alloc: Allocator, out: *std.ArrayList(u8), key: []const u8, value: f32) !void {
+pub fn jsonFieldFloatRaw(alloc: Allocator, out: *std.ArrayList(u8), key: []const u8, value: f32) !void {
     var buf: [48]u8 = undefined;
     const s = try std.fmt.bufPrint(&buf, "\"{s}\":{d:.6}", .{ key, value });
     try out.appendSlice(alloc, s);

@@ -18,34 +18,63 @@ const time_util = @import("../utils/time.zig");
 
 const Subcommand = enum { add, list, status, unknown };
 
+/// A handler's own view of the command line: which subcommand was
+/// selected, plus the args that follow it.
+const Dispatch = struct {
+    sub: Subcommand,
+    args: []const cli.Arg,
+};
+
+/// Split `items` into the subcommand token and everything after it.
+///
+/// The split happens exactly once, here, so that no handler has to know
+/// it was dispatched at some offset into a shared list. Handlers receive
+/// `args` — a slice that already starts at their own first argument.
+///
+/// The token is the *first* item naming a subcommand. First-match wins
+/// so a stray positional can never re-route an already-dispatched
+/// command (`goal add --name list` must stay `add`). Flag values cannot
+/// be mistaken for the token because the parser stores a flag and its
+/// value as a single `Arg` whose `key` is the flag, not the value.
+fn split(items: []const cli.Arg) Dispatch {
+    for (items, 0..) |arg, i| {
+        const token = if (std.mem.eql(u8, arg.key, "positional")) arg.value orelse "" else arg.key;
+        if (std.mem.eql(u8, token, "add") or std.mem.eql(u8, token, "list") or std.mem.eql(u8, token, "status")) {
+            return .{
+                .sub = std.meta.stringToEnum(Subcommand, token) orelse .unknown,
+                .args = items[i + 1 ..],
+            };
+        }
+    }
+    return .{ .sub = .unknown, .args = items };
+}
+
 pub fn run(alloc: std.mem.Allocator, parsed: cli.Parsed) !void {
+    const d = split(parsed.args.items);
+    // Fatal on an unknown subcommand before touching the disk: a
+    // mistyped command should not create a data dir as a side effect.
+    if (d.sub == .unknown) cli_common.fatal("error: expected: goal add|list|status <args>\n", .{});
+
     var store = try cli_common.openStore(alloc, parsed);
     defer store.deinit();
 
-    var sub: Subcommand = .unknown;
-    for (parsed.args.items) |arg| {
-        const key = if (std.mem.eql(u8, arg.key, "positional")) arg.value orelse "" else arg.key;
-        if (std.mem.eql(u8, key, "add") or std.mem.eql(u8, key, "list") or std.mem.eql(u8, key, "status")) {
-            sub = std.meta.stringToEnum(Subcommand, key) orelse .unknown;
-        }
-    }
-
-    switch (sub) {
-        .add => try goalAdd(store, parsed),
-        .list => try goalList(store, parsed, alloc),
-        .status => try goalStatus(store, parsed),
-        .unknown => cli_common.fatal("error: expected: goal add|list|status <args>\n", .{}),
+    switch (d.sub) {
+        .add => try goalAdd(store, parsed.json, d.args),
+        .list => try goalList(store, parsed.json, alloc),
+        .status => try goalStatus(store, d.args),
+        .unknown => unreachable, // guarded above
     }
 }
 
-fn goalAdd(store: *Store, parsed: cli.Parsed) !void {
+/// `args` holds only what followed the `add` token.
+fn goalAdd(store: *Store, json: bool, args: []const cli.Arg) !void {
     var name: ?[]const u8 = null;
     var description: []const u8 = "";
     var parent_id: ?u64 = null;
     var priority: u8 = 5;
     var deadline: ?i64 = null;
 
-    for (parsed.args.items) |arg| {
+    for (args) |arg| {
         if (std.mem.eql(u8, arg.key, "--name") or std.mem.eql(u8, arg.key, "-n")) {
             name = arg.value orelse cli_common.fatal("error: --name requires a value\n", .{});
         } else if (std.mem.eql(u8, arg.key, "--description") or std.mem.eql(u8, arg.key, "-d")) {
@@ -66,7 +95,7 @@ fn goalAdd(store: *Store, parsed: cli.Parsed) !void {
     const now_ms = time_util.nowMs();
     const id = try store.createGoal(n, description, parent_id, priority, deadline, now_ms);
 
-    if (parsed.json) {
+    if (json) {
         var buf: [256]u8 = undefined;
         // SAFETY: format is `{"id":<u64>}`; id is u64 (<= 20 digits) and
         // the literal is 7 bytes, so the longest output is 27 bytes into a
@@ -82,11 +111,11 @@ fn goalAdd(store: *Store, parsed: cli.Parsed) !void {
     }
 }
 
-fn goalList(store: *Store, parsed: cli.Parsed, alloc: std.mem.Allocator) !void {
+fn goalList(store: *Store, json: bool, alloc: std.mem.Allocator) !void {
     const goals = try store.listGoals(alloc);
     defer alloc.free(goals);
 
-    if (parsed.json) {
+    if (json) {
         var buf = std.ArrayList(u8).empty;
         defer buf.deinit(alloc);
         try buf.appendSlice(alloc, "{\"goals\":[");
@@ -119,10 +148,13 @@ fn goalList(store: *Store, parsed: cli.Parsed, alloc: std.mem.Allocator) !void {
     }
 }
 
-fn goalStatus(store: *Store, parsed: cli.Parsed) !void {
+/// `args` holds only what followed the `status` token, so the first
+/// two positionals here are genuinely `<id>` and `<status>` — the
+/// subcommand word itself is no longer in the slice.
+fn goalStatus(store: *Store, args: []const cli.Arg) !void {
     var target_id: ?u64 = null;
     var new_status: ?GoalStatus = null;
-    for (parsed.args.items) |arg| {
+    for (args) |arg| {
         if (std.mem.eql(u8, arg.key, "positional")) {
             if (target_id == null) {
                 target_id = std.fmt.parseInt(u64, arg.value orelse "", 10) catch

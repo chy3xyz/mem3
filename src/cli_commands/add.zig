@@ -11,7 +11,15 @@
 //!   are empty).
 //! - Importance score is computed at encoding time.
 //! - When `--data-dir` is set, the cell is journaled to WAL before
-//!   becoming observable in memory (Constitution VII).
+//!   becoming observable in memory (Constitution VII). The WAL record is
+//!   written first and the cell is committed to the manager / cell_index /
+//!   HNSW only afterwards, so a failed journal leaves no observable cell.
+//!
+//! **Failure behaviour**: none of the three failure points (WAL encode,
+//! WAL append, HNSW insert) is swallowed. Each aborts the command with a
+//! message on stderr, exit status 1, and an explicit statement of what did
+//! and did not persist — and crucially, without printing `added memory
+//! id=N`, which is reserved for a fully committed cell.
 
 const std = @import("std");
 const cli = @import("../cli.zig");
@@ -97,26 +105,28 @@ pub fn run(alloc: std.mem.Allocator, parsed: cli.Parsed) !void {
         .goal_associations = goal_associations.items,
     };
 
-    // Encode via the lifecycle (constitutional validation), then add
-    // through the Store so it journals to WAL.
-    // We construct a MemCell by going through the lifecycle once
-    // (for validation + importance scoring) then handing the cell
-    // to the Store with its pre-allocated id.
+    // Encode via the lifecycle (constitutional validation), then journal and
+    // commit. The ordering below is deliberate and load-bearing:
+    //
+    //   1. encode      — validation + importance scoring, no side effects
+    //   2. reserve id  — so the WAL record can name the cell before it exists
+    //   3. WAL append  — Constitution VII: journal BEFORE observable
+    //   4. commit      — manager + cell_index + HNSW
+    //
+    // Steps 1-3 mutate nothing `mem3 query` / `mem3 dump` can see, so a
+    // failure at step 3 leaves nothing behind to roll back. `Store.addRaw`
+    // already used this order; `add` did not, which is exactly what turned
+    // its WAL `catch {}` into silent data loss.
     var lc = store.lc;
     const cell = try lc.encoder.encode(input);
-    const id = store.mgr.add(cell) catch |err| {
-        cli_common.fatal("error: add failed: {s}\n", .{@errorName(err)});
-    };
-    // Add to the cell_index (the Store.addRaw path does this; we
-    // bypassed it so the index needs manual sync).
-    if (store.mgr.get(id)) |stored| {
-        try store.cell_index.put(id, stored);
-        const v = try store.emb.embed(alloc, stored.episode);
-        defer alloc.free(v);
-        store.hnsw.insert(id, v) catch {};
-    }
 
-    // Persist to WAL if durable.
+    // `store.mgr.next_id` aliases `store.ids`, the same monotonic source
+    // `TriSourceManager.add` draws from, so this yields the id the old code
+    // would have produced — just reserved earlier in time.
+    const id = store.mgr.next_id.fetchAdd(1, .monotonic);
+
+    // Persist to WAL if durable. Anything that fails here aborts before the
+    // cell becomes observable, so the user is left with no partial state.
     if (store.wal) |wal| {
         // Serialize facts to "s|p|o;s|p|o;..." format. The splitScalar
         // walks the parsed facts list once.
@@ -134,16 +144,70 @@ pub fn run(alloc: std.mem.Allocator, parsed: cli.Parsed) !void {
         const first_goal_id: u64 = if (goal_associations.items.len > 0) goal_associations.items[0].goal_id else 0;
         const first_relevance: f32 = if (goal_associations.items.len > 0) goal_associations.items[0].relevance else 0.5;
 
-        const payload = try std.fmt.allocPrint(alloc,
-            \\{{"id":{d},"source":"{s}","episode":"{s}","facts":"{s}","goal_id":{d},"relevance":{d:.4},"created_at":{d},"updated_at":{d},"last_accessed_at":{d},"importance_score":{d:.4},"coherence_score":{d:.4},"decay_rate":{d:.6},"source_confidence":{d:.4},"emotional_valence":{d:.4},"access_count":{d}}}
-        , .{
-            id, @tagName(source.?), episode.?, facts_payload_buf.items, first_goal_id, first_relevance,
-            cell.metadata.created_at, cell.metadata.updated_at, cell.metadata.last_accessed_at,
-            cell.metadata.importance_score, cell.metadata.coherence_score, cell.metadata.decay_rate,
-            cell.metadata.source_confidence, cell.metadata.emotional_valence, cell.metadata.access_count,
-        });
+        // Reuse the Store's encoder rather than a second hand-rolled copy of
+        // the format — that copy was the source of the unescaped-JSON bug.
+        const payload = store.encodeWALPayload(
+            id,
+            source.?,
+            episode.?,
+            facts_payload_buf.items,
+            first_goal_id,
+            first_relevance,
+            cell.metadata,
+        ) catch |err| {
+            cli_common.fatal("error: add failed: WAL encode failed ({s}); nothing was written\n", .{@errorName(err)});
+        };
         defer alloc.free(payload);
-        wal.append(.{ .record_type = .memcell_insert, .payload = payload, .timestamp = @intCast(@divTrunc(now_ms, 1000)) }) catch {};
+        wal.append(.{
+            .record_type = .memcell_insert,
+            .payload = payload,
+            .timestamp = @intCast(@divTrunc(now_ms, 1000)),
+        }) catch |err| {
+            // No rollback needed or attempted: nothing has been committed to
+            // memory. `id` is simply burned — the monotonic counter advanced
+            // past it, leaving a harmless gap. Replay never assumes
+            // contiguous ids (it restores the counter with fetchMax), and a
+            // burned id was never written to the WAL, so it cannot collide.
+            cli_common.fatal(
+                "error: add failed: WAL append failed ({s}). id={d} was NOT journaled and NOT stored; nothing was persisted.\n",
+                .{ @errorName(err), id },
+            );
+        };
+    }
+
+    // Commit to in-memory state. `addWithId` re-runs the manager's invariants,
+    // but the encoder already enforced the same three (empty episode, spirit
+    // dim, source confidence), so only DuplicateId / OOM can surface here.
+    _ = store.mgr.addWithId(id, cell) catch |err| {
+        // A durable WAL record naming `id` may already exist. Replay will
+        // re-apply it, so say exactly that instead of implying a clean
+        // rollback that did not happen.
+        cli_common.fatal(
+            "error: add failed: {s} (id={d}). A WAL record for id={d} was already written and will be re-applied on the next run.\n",
+            .{ @errorName(err), id, id },
+        );
+    };
+
+    // Add to the cell_index (the Store.addRaw path does this; we bypassed it
+    // so the index needs manual sync).
+    if (store.mgr.get(id)) |stored| {
+        try store.cell_index.put(id, stored);
+        const v = try store.emb.embed(alloc, stored.episode);
+        defer alloc.free(v);
+        store.hnsw.insert(id, v) catch |err| {
+            // No rollback is attempted here, deliberately. `HNSW` exposes no
+            // remove/delete, so unwinding the manager and cell_index would
+            // leave a durable WAL record that resurrects the cell on the next
+            // run — a different inconsistency, not a repair, and a
+            // half-rollback would be worse than an honest report. The real
+            // end state is: durable on disk, invisible to `mem3 query` until
+            // the next process replays the WAL. Report it and exit non-zero
+            // rather than printing `added memory id=N`.
+            cli_common.fatal(
+                "error: add failed: vector index insert failed ({s}). id={d} IS journaled to the WAL and will become searchable on the next run, but it is NOT searchable by `mem3 query` in this process.\n",
+                .{ @errorName(err), id },
+            );
+        };
     }
 
     if (parsed.json) {

@@ -288,3 +288,82 @@ test "E2E: in-memory mode is correctly isolated from durable mode" {
     wipeDataDir(data_dir_a);
     wipeDataDir(data_dir_b);
 }
+test "E2E: goal status survives a restart (WAL goal_update)" {
+    // `updateGoalStatus` used to mutate only the in-memory poset, so
+    // `mem3 goal status <id> in_progress` reported success and then
+    // silently reverted to `pending` on the next process. The record
+    // type `goal_update = 0x11` was already reserved in wal.zig and
+    // simply unused. This test fails against that behaviour.
+    const alloc = testing.allocator;
+    const data_dir = try makeDataDir(alloc, "goalstatus");
+    defer alloc.free(data_dir);
+    defer wipeDataDir(data_dir);
+
+    const goal_name = "status-persistence-probe";
+    {
+        wipeDataDir(data_dir);
+        var store = try mem3.Store.init(alloc, .{ .data_dir = data_dir });
+        defer store.deinit();
+
+        const gid = try store.createGoal(goal_name, "status probe", null, 5, null, 0);
+        try store.updateGoalStatus(gid, .in_progress, 1_700_000_000_000);
+        try store.sync();
+    }
+
+    {
+        var store = try mem3.Store.init(alloc, .{ .data_dir = data_dir });
+        defer store.deinit();
+
+        const goals = try store.listGoals(alloc);
+        defer alloc.free(goals);
+
+        var found = false;
+        for (goals) |g| {
+            if (!std.mem.eql(u8, g.name, goal_name)) continue;
+            found = true;
+            try testing.expectEqual(mem3.core.GoalStatus.in_progress, g.status);
+        }
+        try testing.expect(found);
+    }
+}
+
+test "E2E: non-default goal status survives snapshot truncation" {
+    // `rejournalGoals` exists so that truncating the WAL when a
+    // snapshot is taken does not delete user goals. But `goal_create`
+    // carries no status and `GoalPoset.create` always starts at
+    // `.pending`, so without an explicit `goal_update` every completed
+    // goal silently reverted to pending at the next snapshot. This
+    // exercises exactly that path: sync() truncates the WAL.
+    const alloc = testing.allocator;
+    const data_dir = try makeDataDir(alloc, "goaltrunc");
+    defer alloc.free(data_dir);
+    defer wipeDataDir(data_dir);
+
+    const goal_name = "truncation-status-probe";
+    {
+        wipeDataDir(data_dir);
+        var store = try mem3.Store.init(alloc, .{ .data_dir = data_dir });
+        defer store.deinit();
+
+        const gid = try store.createGoal(goal_name, "truncation probe", null, 5, null, 0);
+        try store.updateGoalStatus(gid, .completed, 1_700_000_000_000);
+        // sync() -> takeSnapshot() -> truncate WAL + rejournalGoals
+        try store.sync();
+    }
+
+    {
+        var store = try mem3.Store.init(alloc, .{ .data_dir = data_dir });
+        defer store.deinit();
+
+        const goals = try store.listGoals(alloc);
+        defer alloc.free(goals);
+
+        var found = false;
+        for (goals) |g| {
+            if (!std.mem.eql(u8, g.name, goal_name)) continue;
+            found = true;
+            try testing.expectEqual(mem3.core.GoalStatus.completed, g.status);
+        }
+        try testing.expect(found);
+    }
+}

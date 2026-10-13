@@ -255,6 +255,7 @@ const DistStats = struct {
     imp_min: f64 = 0,
     imp_max: f64 = 0,
     coh_mean: f64 = 0,
+    decay_mean: f64 = 0,
 };
 
 /// O(n) walk over the live cells. Sampled, not run every cycle — see
@@ -262,18 +263,22 @@ const DistStats = struct {
 fn sampleDist(alloc: Allocator, store: *mem3.Store, out_dist: *DistStats) !void {
     const cells = try store.allCells(alloc);
     defer alloc.free(cells);
-    if (cells.len == 0) return;
+    if (cells.len == 0) {
+        return;
+    }
 
     var imp_sum: f64 = 0;
     var imp_min: f64 = std.math.floatMax(f64);
     var imp_max: f64 = -std.math.floatMax(f64);
     var coh_sum: f64 = 0;
+    var decay_sum: f64 = 0;
     for (cells) |cell| {
         const imp: f64 = cell.metadata.importance_score;
         imp_sum += imp;
         if (imp < imp_min) imp_min = imp;
         if (imp > imp_max) imp_max = imp;
         coh_sum += cell.metadata.coherence_score;
+        decay_sum += cell.metadata.decay_rate;
     }
     const n: f64 = @floatFromInt(cells.len);
     out_dist.* = .{
@@ -282,6 +287,7 @@ fn sampleDist(alloc: Allocator, store: *mem3.Store, out_dist: *DistStats) !void 
         .imp_min = imp_min,
         .imp_max = imp_max,
         .coh_mean = coh_sum / n,
+        .decay_mean = decay_sum / n,
     };
 }
 
@@ -308,17 +314,32 @@ fn writeRecord(fd: std.c.fd_t, rec: CycleRecord, wal_kb: u64, snap_kb: u64, t_ms
     // The optional distribution fields must be rendered BEFORE the main
     // line, into a buffer that outlives the bufPrint call — a helper
     // returning a slice of its own stack buffer would dangle.
+    //
+    // The selector MUST be the loop index. It used to be `switch (l.*)`,
+    // which reads `opt_len[i]` *before* this iteration writes it — i.e.
+    // uninitialised stack memory. The four fields therefore came out
+    // scrambled: an observed record had imp_mean=0.67944 with
+    // imp_min=0.74657 (mean below the minimum) and imp_max=0.00000.
+    // A wrong number here is worse than a missing one, because nothing
+    // about the output looks broken.
     var opt_buf: [4][32]u8 = undefined;
     var opt_len: [4]usize = undefined;
-    for (&opt_buf, &opt_len) |*b, *l| {
+    for (&opt_buf, &opt_len, 0..) |*b, *l, i| {
         if (d.sampled) {
-            const v = switch (l.*) {
+            const v = switch (i) {
                 0 => d.imp_mean,
                 1 => d.imp_min,
                 2 => d.imp_max,
                 else => d.coh_mean,
             };
-            const s = std.fmt.bufPrint(b, "{d:.5}", .{v}) catch "null";
+            // A formatting failure must not render as `null`: that is
+            // indistinguishable from "this cycle was not a sample
+            // cycle", so the failure would be invisible in the curve.
+            // 32 bytes holds far more than any `{d:.5}` f64 can need.
+            const s = std.fmt.bufPrint(b, "{d:.5}", .{v}) catch |e| {
+                err("longrun: imp field {d} failed to format: {s}\n", .{ i, @errorName(e) });
+                return error.LineTooLong;
+            };
             l.* = s.len;
         } else {
             @memcpy(b[0..4], "null");
@@ -462,6 +483,11 @@ pub fn main(init: std.process.Init.Minimal) !void {
     const start_ms = mem3.utils.time.nowMs();
     const t0 = ClockFn.nowNs();
     var last_progress = t0;
+    // End timestamp, so the summary can compare the run's wall clock
+    // against the age at which forgetting would first trigger.
+    var end_ns: i128 = t0;
+    // Most recent successful sample, reused by the summary block.
+    var last_dist: DistStats = .{};
     var prev_cells: usize = store.cellCount();
     var total_ingested: usize = 0;
     var total_fuzzied: usize = 0;
@@ -473,10 +499,11 @@ pub fn main(init: std.process.Init.Minimal) !void {
     var last_decile_d: i64 = 0;
     var last_decile_n: usize = 0;
 
-    err("longrun: cycles={d} per_cycle={d} seed={d} data_dir={s}{s}\n", .{
+    err("longrun: cycles={d} per_cycle={d} seed={d} stats_every={d} data_dir={s}{s}\n", .{
         p.cycles,
         p.per_cycle,
         p.seed,
+        p.stats_every,
         p.data_dir,
         if (p.dry_data) " (in-memory)" else "",
     });
@@ -554,8 +581,17 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
         var dist = DistStats{};
         if (p.stats_every > 0 and (cycle % p.stats_every == 0)) {
-            sampleDist(alloc, store, &dist) catch {};
+            sampleDist(alloc, store, &dist) catch |e| {
+                // Previously `catch {}`: a failure here silently pinned
+                // imp_mean/imp_min/imp_max/coh_mean to `null` for the
+                // entire run, which is exactly the diagnostic needed to
+                // explain whether the lifecycle is converging.
+                err("longrun: sampleDist failed at cycle {d}: {s}\n", .{ cycle, @errorName(e) });
+                std.process.exit(1);
+            };
+            last_dist = dist;
         }
+        end_ns = ClockFn.nowNs();
 
         const rec = CycleRecord{
             .cycle = cycle,
@@ -653,6 +689,36 @@ pub fn main(init: std.process.Init.Minimal) !void {
     });
     out("  => d_cells trending to 0 means the loop reached a steady state.\n", .{});
     out("  => if the last-decile mean equals the first, it did NOT plateau.\n", .{});
+
+    // Why `fuzzied` stayed at 0 — this is almost never a bug in the run.
+    //
+    // Forgetter.existenceContribution is `importance * exp(-decay_rate *
+    // age_days)` and a cell is only fuzzied once that drops below
+    // `forgetting_threshold`. Solving for the crossover:
+    //
+    //     age_days > ln(importance / threshold) / decay_rate
+    //
+    // With the observed defaults that lands around 30 days, so no run
+    // shorter than a month will ever forget anything — a 24h baseline
+    // produces a perfectly flat `fuzzied: 0` and that is the CORRECT
+    // answer, not a broken sweep. Printing the arithmetic turns a
+    // mysterious flat line into a checkable prediction.
+    if (last_dist.sampled and last_dist.decay_mean > 0 and last_dist.imp_mean > 0) {
+        const T: f64 = 0.1; // Lifecycle default forgetting_threshold
+        const ratio = last_dist.imp_mean / T;
+        const age_days = if (ratio > 1.0) @log(ratio) / last_dist.decay_mean else 0.0;
+        const run_days = @as(f64, @floatFromInt(@as(u64, @intCast(@max(0, end_ns - t0))))) / 86_400_000_000_000.0;
+        out("forgetting crossover (why fuzzied may be 0)\n", .{});
+        out("  mean importance     : {d:.4}\n", .{last_dist.imp_mean});
+        out("  mean decay_rate     : {d:.5} /day\n", .{last_dist.decay_mean});
+        out("  threshold           : {d:.2}\n", .{T});
+        out("  first cell forgotten: ~{d:.1} days after creation\n", .{age_days});
+        out("  run wall clock      : {d:.4} days\n", .{run_days});
+        if (age_days > run_days) {
+            out("  => this run is {d:.0}x too short to trigger forgetting; fuzzied=0 is expected.\n", .{age_days / @max(run_days, 1e-9)});
+        }
+    }
+
     out("{s}\n", .{WALL_RULE});
     out("curve written to {s} — plot the `d_cells` column.\n", .{p.out_path});
 }
