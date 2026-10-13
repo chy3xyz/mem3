@@ -152,8 +152,17 @@ pub const HNSW = struct {
         try frontier.append(self.alloc, current);
         try result_set.put(current, self.cosineSim(query, self.nodes.get(current).?.vector));
 
-        var target_ef = ef;
-        while (frontier.items.len > 0) {
+        const target_ef = ef;
+        // The ef budget bounds how many candidates we keep expanding.
+        // It must gate the WHOLE beam search, not just one neighbour
+        // loop: previously the counter only ever decremented inside the
+        // expansion loop and the `break` only left the inner loop, so the
+        // outer loop kept running, re-entered the inner loop with
+        // `target_ef == 0`, and underflowed. Tests never reached it
+        // because they insert a handful of nodes — the budget is
+        // `hnsw_ef_construction` (200) neighbour expansions.
+        var exhausted = false;
+        while (frontier.items.len > 0 and !exhausted) {
             // Pick the frontier node with highest score (lowest distance / highest sim).
             // For cosine, higher is better.
             var best_idx: usize = 0;
@@ -178,8 +187,12 @@ pub const HNSW = struct {
                 try frontier.append(self.alloc, nid);
                 const s = self.cosineSim(query, self.nodes.get(nid).?.vector);
                 try result_set.put(nid, s);
-                target_ef -= 1;
-                if (target_ef == 0) break;
+                // Stop on the size of the candidate set, which is what
+                // `ef` actually means, and cannot underflow.
+                if (result_set.count() >= target_ef) {
+                    exhausted = true;
+                    break;
+                }
             }
         }
 
@@ -288,4 +301,61 @@ test "HNSW: cosine similarity" {
     try std.testing.expectApproxEqAbs(@as(f32, 1.0), hnsw.cosineSim(&.{ 1.0, 0.0, 0.0 }, &.{ 1.0, 0.0, 0.0 }), 1e-6);
     try std.testing.expectApproxEqAbs(@as(f32, 0.0), hnsw.cosineSim(&.{ 1.0, 0.0, 0.0 }, &.{ 0.0, 1.0, 0.0 }), 1e-6);
     try std.testing.expect(hnsw.cosineSim(&.{ 1.0, 0.0, 0.0 }, &.{ 0.7, 0.7, 0.0 }) > 0.5);
+}
+
+// Regression guard for the ef-budget underflow in `searchInternal`.
+//
+// The candidate budget was decremented only inside the neighbour-expansion
+// loop, and the `break` left just that inner loop. Once the budget hit
+// zero the outer beam loop kept running, re-entered the inner loop, and
+// decremented zero into an integer overflow. Every pre-existing test
+// inserted at most a handful of nodes, so the budget
+// (`hnsw_ef_construction`, 200 neighbour expansions) was never exhausted
+// and the bug stayed invisible. The long-run harness tripped it on the
+// first ingest of a few thousand cells.
+//
+// This test deliberately inserts far more nodes than the budget can
+// expand, then searches. It must not panic, and search results must stay
+// ranked.
+test "HNSW: ef budget exhaustion does not underflow" {
+    const alloc = std.testing.allocator;
+    const dim: u16 = 32;
+    const n: usize = 400; // comfortably past ef_construction = 200
+
+    var cfg = Config{};
+    cfg.hnsw_ef_construction = 200;
+    var hnsw = HNSW.init(alloc, cfg, dim);
+    defer hnsw.deinit();
+
+    // Deterministic pseudo-random unit vectors, no PRNG dependency.
+    var seed: u64 = 0x1234_5678_9ABC_DEF0;
+    var vec: [dim]f32 = undefined;
+    var i: usize = 1;
+    while (i <= n) : (i += 1) {
+        for (&vec) |*v| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            v.* = @as(f32, @floatFromInt(seed % 20_001)) / 10_000.0 - 1.0;
+        }
+        var norm: f32 = 0;
+        for (vec) |x| norm += x * x;
+        norm = @sqrt(norm);
+        if (norm > 0) {
+            for (&vec) |*v| v.* /= norm;
+        }
+        try hnsw.insert(@intCast(i), &vec);
+    }
+    try std.testing.expectEqual(@as(usize, n), hnsw.count);
+
+    // Searching an index this size is what re-enters the exhausted loop.
+    const results = try hnsw.search(alloc, &vec, 10);
+    defer alloc.free(results);
+    try std.testing.expect(results.len > 0);
+
+    // Ranking must still be sane: descending by score.
+    var r: usize = 1;
+    while (r < results.len) : (r += 1) {
+        try std.testing.expect(results[r - 1].score >= results[r].score);
+    }
 }

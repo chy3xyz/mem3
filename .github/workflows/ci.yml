@@ -1,0 +1,118 @@
+name: CI
+
+# This workflow exists because this repo once shipped a green CI gate that
+# could never go red. Four separate causes conspired:
+#
+#   1. `zig build` referenced an OptimizeMode name removed in Zig 0.17, so the
+#      binary did not compile — but nothing ever ran it.
+#   2. Library code wrote to stderr from inside a test. Zig's test runner
+#      talks to the build system over the process pipes under `--listen=-`;
+#      any stderr write desynchronises the protocol, the test binary dies with
+#      `failed command`, and `zig build test` STILL exits 0.
+#   3. Three e2e tests silently skipped themselves (`return;` instead of
+#      `return error.SkipZigTest`) and were counted as passes.
+#   4. Tests wrote into the repo's `data/` dir, which only existed because
+#      someone's working tree was dirty; on a fresh clone they died with
+#      `WALOpenFailed`.
+#
+# All four are fixed. The step named "Guard: the test gate can go red" below is
+# the permanent guard for this whole class of bug: it proves the gate fails
+# when a test fails. If that step ever goes red, the gate is lying to you.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    name: Build, test, prove the gate can go red
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # `.zigversion` at the repo root pins 0.17.0. setup-zig's input is
+      # `version` (it is NOT `zig-version`), and it resolves 0.17.0 from the
+      # same community-mirror index as ziglang.org/download.
+      - name: Install Zig 0.17.0
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.0
+
+      - name: Verify toolchain matches .zigversion
+        run: |
+          set -euo pipefail
+          pinned="$(tr -d '[:space:]' < .zigversion)"
+          installed="$(zig version)"
+          echo "pinned=$pinned installed=$installed"
+          if [ "$pinned" != "$installed" ]; then
+            echo "::error::toolchain drift: .zigversion says $pinned, runner has $installed"
+            exit 1
+          fi
+
+      # Cause #1: the build system itself used to be broken and nothing ran it.
+      - name: zig build
+        run: zig build
+
+      - name: zig build test
+        run: zig build test
+
+      # Kept as a separate, more visible step (Constitution Principle VI).
+      # Causes #3 and #4 live behind this one, so it is not folded into the
+      # main test run.
+      - name: zig build check-constitution
+        run: zig build check-constitution
+
+      # Smoke test that the ReleaseFast build path still links and runs.
+      # Benchmarks are machine-dependent, so their numbers are never a gate:
+      # this step must not be able to fail the job.
+      - name: zig build bench (smoke, never a gate)
+        continue-on-error: true
+        run: zig build bench
+
+      # Project rule: tests must never write into the repo. Build/runtime
+      # litter (.zig-cache/, zig-out/, data/) is covered by .gitignore by
+      # policy, so `--porcelain` deliberately reports only real source-tree
+      # pollution — which is the failure mode we care about.
+      - name: Verify tests left the working tree clean
+        run: |
+          set -euo pipefail
+          dirty="$(git status --porcelain)"
+          if [ -n "$dirty" ]; then
+            echo "::error::tests wrote into the working tree:"
+            echo "$dirty"
+            exit 1
+          fi
+          echo "working tree clean"
+
+      # The most important step in this file. Injects a failing test, asserts
+      # the gate goes NON-ZERO, and reverts.
+      #
+      # Cleanup reasoning: the revert is a shell `trap ... EXIT`, so it runs
+      # on every exit path — success, gate-ran-red, `set -e` abort, or an
+      # unexpected crash. A later step therefore never inherits a modified
+      # tests/main.zig. It is written as `git checkout --` (discard, not
+      # `git stash`) so the restore is unconditional and leaves no stash entry.
+      - name: 'Guard: the test gate can go red'
+        run: |
+          set -euo pipefail
+          trap 'git checkout -- tests/main.zig' EXIT
+
+          printf '\ntest "CI gate probe" { try std.testing.expect(1 == 2); }\n' >> tests/main.zig
+
+          if zig build test; then
+            echo "::error::injected failing test did NOT fail the gate — this gate is always green"
+            exit 1
+          fi
+
+          echo "gate correctly went red on an injected failure"

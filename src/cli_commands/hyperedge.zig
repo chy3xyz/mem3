@@ -106,10 +106,17 @@ fn edgeAdd(store: *Store, alloc: std.mem.Allocator, parsed: cli.Parsed) !void {
 
     if (parsed.json) {
         var buf: [128]u8 = undefined;
+        // SAFETY: format is `{"id":<u64>}`; id is u64 (<= 20 digits) and
+        // the literal is 7 bytes, so the longest output is 27 bytes into a
+        // 128-byte buffer. No user-supplied text is interpolated.
         const s = std.fmt.bufPrint(&buf, "{{\"id\":{d}}}", .{id}) catch unreachable;
         cli_common.println(s);
     } else {
         var buf: [256]u8 = undefined;
+        // SAFETY: id is u64 (<= 20 digits), nodes.len is a usize (<= 20
+        // digits), and EdgeType.label() is drawn from the four fixed tags
+        // in core/types.zig (longest "associative" = 11). With a 40-byte
+        // literal that is 91 bytes into a 256-byte buffer.
         const s = std.fmt.bufPrint(
             &buf,
             "hyperedge added: id={d} type={s} nodes={d}",
@@ -140,6 +147,9 @@ fn edgeList(store: *Store, alloc: std.mem.Allocator, parsed: cli.Parsed) !void {
         cli_common.println(buf.items);
     } else {
         var buf: [256]u8 = undefined;
+        // SAFETY: format is `hyperedges (<usize>):`; the literal is 14
+        // bytes and edges.len is a usize (<= 20 digits) -> 34 bytes into a
+        // 256-byte buffer. No user-supplied text is interpolated.
         const header = std.fmt.bufPrint(&buf, "hyperedges ({d}):", .{edges.len}) catch unreachable;
         cli_common.println(header);
         for (edges) |e| {
@@ -196,6 +206,12 @@ fn edgeMultiHop(store: *Store, alloc: std.mem.Allocator, parsed: cli.Parsed) !vo
         cli_common.println(buf.items);
     } else {
         var buf: [256]u8 = undefined;
+        // SAFETY: seed is u64 and visited.len is a usize (each <= 20
+        // digits), max_hops is a u8 (<= 3 digits), and the f32
+        // `{d:.2}` confidence is bounded by the widest f32 in decimal
+        // ("-340282350000000000000000000000000000000.00" = 43 bytes).
+        // With a 43-byte literal the worst case is 131 bytes into a
+        // 256-byte buffer.
         const header = std.fmt.bufPrint(
             &buf,
             "multi-hop from {d} (<={d} hops, conf>={d:.2}): {d} reachable",

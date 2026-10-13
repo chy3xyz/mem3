@@ -31,7 +31,7 @@ fn makeDataDir(label: []const u8) ![]u8 {
         &data_dir_buf,
         "/tmp/mem3_http_{d}_{s}",
         .{ c.getpid(), label },
-    ) catch unreachable).len;
+    ) catch return error.NoSpaceLeft).len;
     return data_dir_buf[0..data_dir_len];
 }
 
@@ -270,7 +270,7 @@ test "E2E HTTP: POST /api/memcells inserts, GET retrieves" {
         &post_req_buf,
         "POST /api/memcells HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}",
         .{ post_body.len, post_body },
-    ) catch unreachable;
+    ) catch return error.NoSpaceLeft;
     const post_resp = try httpRequest(alloc, srv.port, post_req);
     defer post_resp.deinit(alloc);
     try testing.expectEqual(@as(u16, 201), post_resp.status);
@@ -294,7 +294,7 @@ test "E2E HTTP: POST /api/memcells inserts, GET retrieves" {
         &get_req_buf,
         "GET /api/memcells/{d} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
         .{inserted_id},
-    ) catch unreachable;
+    ) catch return error.NoSpaceLeft;
     const get_resp = try httpRequest(alloc, srv.port, get_req);
     defer get_resp.deinit(alloc);
     try testing.expectEqual(@as(u16, 200), get_resp.status);
@@ -321,17 +321,20 @@ test "E2E HTTP: server restart preserves inserted cells" {
                 &body_buf,
                 "{{\"source\":\"matter\",\"episode\":\"{s}\",\"facts\":\"\",\"goalId\":1,\"relevance\":0.5}}",
                 .{episode},
-            ) catch unreachable;
+            ) catch return error.NoSpaceLeft;
             const post_req = std.fmt.bufPrint(
                 &post_req_buf,
                 "POST /api/memcells HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}",
                 .{ post_body.len, post_body },
-            ) catch unreachable;
+            ) catch return error.NoSpaceLeft;
             const resp = try httpRequest(alloc, srv1.port, post_req);
             try testing.expectEqual(@as(u16, 201), resp.status);
             resp.deinit(alloc);
         }
         var sync_req_buf: [256]u8 = undefined;
+        // SAFETY: this format string has zero arguments, so the rendered
+        // request is a compile-time constant 82 bytes; sync_req_buf holds
+        // 256. bufPrint cannot fail.
         const sync_req = std.fmt.bufPrint(
             &sync_req_buf,
             "POST /api/sync HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",

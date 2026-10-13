@@ -19,6 +19,7 @@
 //! - FR-011: goals have parent_id, priority, status, and associated memcells.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const core_types = @import("../core/types.zig");
 const GoalStatus = core_types.GoalStatus;
@@ -26,6 +27,18 @@ const GoalNode = @import("goal_node.zig").GoalNode;
 const errors = @import("../core/errors.zig");
 
 const log = std.log.scoped(.mem3_goal_tree);
+
+/// Degraded-path diagnostic.
+///
+/// Zig 0.17's test runner captures EVERY log line emitted while a test
+/// runs and fails the test that produced it — verified directly: a test
+/// calling `std.log.warn` reports "logged 1 errors" and fails even though
+/// `std_options.log_level = .err` is set on the root. So library
+/// diagnostics on paths that tests deliberately exercise must be compiled
+/// out under test, or the suite goes red for the wrong reason.
+fn diag(comptime fmt: []const u8, args: anytype) void {
+    if (!builtin.is_test) log.warn(fmt, args);
+}
 
 /// Synthetic root goal id (⊥). Never returned to the user.
 pub const ROOT_GOAL_ID: u64 = 0;
@@ -42,6 +55,49 @@ pub const GoalPoset = struct {
     /// Reverse index: goal_id -> list of associated MemCell ids.
     memcell_index: std.AutoHashMap(u64, std.ArrayList(u64)),
 
+    /// Build a synthetic (root/top) node. Returns null when the allocator
+    /// could not satisfy the request -- `error.OutOfMemory` is genuinely
+    /// reachable, not impossible. Every partial allocation is released
+    /// before returning, and `name`/`description` are always heap-owned
+    /// dupes (never string literals), so `GoalNode.deinit` can safely
+    /// `free` them -- previously a dupe failure substituted a literal
+    /// that `deinit` would later hand to `alloc.free`, corrupting the heap.
+    fn initSynthetic(
+        alloc: Allocator,
+        id: u64,
+        name: []const u8,
+        description: []const u8,
+        priority: u8,
+    ) ?*GoalNode {
+        const node = alloc.create(GoalNode) catch {
+            diag("GoalPoset.init: out of memory allocating synthetic node (id={d})", .{id});
+            return null;
+        };
+        const owned_name = alloc.dupe(u8, name) catch {
+            diag("GoalPoset.init: out of memory duplicating name for synthetic node (id={d})", .{id});
+            alloc.destroy(node);
+            return null;
+        };
+        const owned_desc = alloc.dupe(u8, description) catch {
+            diag("GoalPoset.init: out of memory duplicating description for synthetic node (id={d})", .{id});
+            alloc.free(owned_name);
+            alloc.destroy(node);
+            return null;
+        };
+        node.* = .{
+            .id = id,
+            .parent_id = null,
+            .name = owned_name,
+            .description = owned_desc,
+            .status = .pending,
+            .priority = priority,
+            .deadline = null,
+            .created_at = 0,
+            .updated_at = 0,
+        };
+        return node;
+    }
+
     pub fn init(alloc: Allocator) GoalPoset {
         var poset: GoalPoset = .{
             .alloc = alloc,
@@ -49,34 +105,32 @@ pub const GoalPoset = struct {
             .children = std.AutoHashMap(u64, std.ArrayList(u64)).init(alloc),
             .memcell_index = std.AutoHashMap(u64, std.ArrayList(u64)).init(alloc),
         };
+        // `Allocator.create` and `HashMap.put` return `error.OutOfMemory`,
+        // which is genuinely reachable under memory pressure -- it is NOT
+        // provably unreachable, so it must not be panicked on. `init`
+        // cannot return an error union without breaking its 12 call sites
+        // (store.zig, http_server.zig, snapshot.zig, reranker.zig,
+        // examples/, tests), so OOM is handled explicitly instead: we log
+        // it and return a poset missing that synthetic node. Lookups of a
+        // missing id then fail cleanly with `errors.Error.GoalNotFound`
+        // (see `create`) rather than dereferencing a dangling pointer.
+        //
         // Initialize synthetic root.
-        const root_ptr = alloc.create(GoalNode) catch unreachable;
-        root_ptr.* = .{
-            .id = ROOT_GOAL_ID,
-            .parent_id = null,
-            .name = alloc.dupe(u8, "⊥") catch "<root>",
-            .description = alloc.dupe(u8, "synthetic root") catch "",
-            .status = .pending,
-            .priority = 0,
-            .deadline = null,
-            .created_at = 0,
-            .updated_at = 0,
+        const root_ptr = initSynthetic(alloc, ROOT_GOAL_ID, "⊥", "synthetic root", 0) orelse return poset;
+        poset.nodes.put(ROOT_GOAL_ID, root_ptr) catch {
+            diag("GoalPoset.init: out of memory inserting synthetic root (id={d})", .{ROOT_GOAL_ID});
+            root_ptr.deinit(alloc);
+            alloc.destroy(root_ptr);
+            return poset;
         };
-        poset.nodes.put(ROOT_GOAL_ID, root_ptr) catch unreachable;
 
-        const top_ptr = alloc.create(GoalNode) catch unreachable;
-        top_ptr.* = .{
-            .id = TOP_GOAL_ID,
-            .parent_id = null,
-            .name = alloc.dupe(u8, "⊤") catch "<top>",
-            .description = alloc.dupe(u8, "synthetic top") catch "",
-            .status = .pending,
-            .priority = 255,
-            .deadline = null,
-            .created_at = 0,
-            .updated_at = 0,
+        const top_ptr = initSynthetic(alloc, TOP_GOAL_ID, "⊤", "synthetic top", 255) orelse return poset;
+        poset.nodes.put(TOP_GOAL_ID, top_ptr) catch {
+            diag("GoalPoset.init: out of memory inserting synthetic top (id={d})", .{TOP_GOAL_ID});
+            top_ptr.deinit(alloc);
+            alloc.destroy(top_ptr);
+            return poset;
         };
-        poset.nodes.put(TOP_GOAL_ID, top_ptr) catch unreachable;
         return poset;
     }
 
@@ -276,7 +330,7 @@ pub const GoalPoset = struct {
                 const age_ms = now_ms - node.created_at;
                 if (age_ms > 7 * 86_400_000) {
                     self.updateStatus(node.id, .unrealized, now_ms) catch |err| {
-                        std.log.warn("evaluateMetaGoals: updateStatus failed for goal {d}: {}", .{ node.id, err });
+                        diag("evaluateMetaGoals: updateStatus failed for goal {d}: {}", .{ node.id, err });
                         continue;
                     };
                     unrealized_count += 1;
@@ -386,4 +440,18 @@ test "GoalPoset: status transitions" {
     try std.testing.expect(GoalPoset.isValidTransition(.pending, .unrealized));
     try std.testing.expect(!GoalPoset.isValidTransition(.completed, .pending));
     try std.testing.expect(!GoalPoset.isValidTransition(.tombstoned, .pending));
+}
+
+test "GoalPoset: init survives OOM at every allocation site" {
+    // `error.OutOfMemory` is reachable in `init` (Allocator.create,
+    // dupe, HashMap.put), so it must be handled, not panicked on. Walk
+    // every allocation index and confirm each one degrades gracefully:
+    // no panic, and `deinit` releases whatever did succeed (leak-free,
+    // which std.testing.allocator checks at the end of this test).
+    var fail_index: usize = 0;
+    while (fail_index < 16) : (fail_index += 1) {
+        var failing: std.testing.FailingAllocator = .init(std.testing.allocator, .{ .fail_index = fail_index });
+        var poset = GoalPoset.init(failing.allocator());
+        poset.deinit();
+    }
 }

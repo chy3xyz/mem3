@@ -67,6 +67,8 @@ pub const HyMem = hypermem.HyMem;
 // Retrieval re-exports
 pub const HNSW = retrieval.HNSW;
 pub const StubEmbedder = retrieval.StubEmbedder;
+pub const LexicalEmbedder = retrieval.LexicalEmbedder;
+pub const Embedder = retrieval.Embedder;
 pub const HybridRetriever = retrieval.HybridRetriever;
 pub const Candidate = retrieval.Candidate;
 pub const RerankContext = retrieval.RerankContext;

@@ -20,7 +20,13 @@ test "constitution II: every MemCell has spirit dimension" {
     for (corpus.cells, 0..) |cell, i| {
         const has_spirit = cell.foresight.len > 0 or cell.goal_associations.len > 0;
         if (!has_spirit) {
-            std.debug.print("cell {d} (source={s}) is missing spirit dim\n", .{
+            // std.log, never std.debug.print: Zig's test runner talks to
+            // the build system over the process pipes under `--listen=-`,
+            // and any stderr write from inside a test desynchronises that
+            // protocol — the binary dies with "failed command" while
+            // `zig build test` still exits 0. Logging through the std.log
+            // facade keeps this at .err and off the wire in normal runs.
+            std.log.err("cell {d} (source={s}) is missing spirit dim", .{
                 i, @tagName(cell.source),
             });
         }

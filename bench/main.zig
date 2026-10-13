@@ -200,7 +200,7 @@ const HashCtx = struct {
 fn hashBody(c: *anyopaque, _: usize) void {
     const s: *HashCtx = @ptrCast(@alignCast(c));
     var n: usize = 0;
-    while (n < 2000) : (n += 1) {
+    while (n < 10000) : (n += 1) {
         s.ops += 1;
         // Mutate the input every iteration. Hashing a constant buffer is
         // foldable and the optimiser will hoist the whole batch into a
@@ -222,7 +222,7 @@ fn benchHashing(alloc: Allocator, reps: usize) !Stats {
         "ns/op",
         "xxHash3 over 64 bytes (one cache line)",
         1,
-        2000,
+        10000,
         reps,
         @ptrCast(&ctx),
         &ctx.ops,
@@ -240,7 +240,7 @@ const CombineCtx = struct {
 fn combineBody(c: *anyopaque, _: usize) void {
     const s: *CombineCtx = @ptrCast(@alignCast(c));
     var n: usize = 0;
-    while (n < 2000) : (n += 1) {
+    while (n < 20000) : (n += 1) {
         s.ops += 1;
         s.acc +%= mem3.utils.hashing.combine(s.a +% s.ops, s.b ^ s.ops);
     }
@@ -253,9 +253,9 @@ fn benchHashCombine(alloc: Allocator, reps: usize) !Stats {
         alloc,
         "hashing.combine",
         "ns/op",
-        "two u64 -> one u64 avalanche mix",
+        "two u64 -> one u64 avalanche mix; one-shot, not the streaming state machine",
         1,
-        2000,
+        20000,
         reps,
         @ptrCast(&ctx),
         &ctx.ops,

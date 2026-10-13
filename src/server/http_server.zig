@@ -25,6 +25,9 @@ const fact = @import("../core/types.zig").Fact;
 const foresight_t = @import("../core/types.zig").Foresight;
 const goal_assoc_t = @import("../core/types.zig").GoalAssociation;
 const ghw = @import("../ghw/mod.zig");
+const ghw_goal_tree = @import("../ghw/goal_tree.zig");
+const jsonl = @import("../utils/jsonl.zig");
+const mem3_store = @import("../store/store.zig");
 const memory = @import("../memory/mod.zig");
 const retrieval = @import("../retrieval/mod.zig");
 const HNSW = retrieval.HNSW;
@@ -38,6 +41,24 @@ const log = std.log.scoped(.mem3_server);
 
 /// Embedded web UI (loaded at compile time via @embedFile).
 const WEB_INDEX: []const u8 = @embedFile("web_index.html");
+
+/// Adapter so the shared `jsonl.writeJsonString` helper — written against
+/// a stream writer — can target an `std.ArrayList(u8)`. Zig 0.17's
+/// unmanaged ArrayList exposes `print(gpa, ...)` but has no `.writer()`.
+const ListWriter = struct {
+    list: *std.ArrayList(u8),
+    gpa: Allocator,
+
+    pub fn writeByte(self: ListWriter, b: u8) !void {
+        try self.list.append(self.gpa, b);
+    }
+    pub fn writeAll(self: ListWriter, bytes: []const u8) !void {
+        try self.list.appendSlice(self.gpa, bytes);
+    }
+    pub fn print(self: ListWriter, comptime fmt: []const u8, args: anytype) !void {
+        try self.list.print(self.gpa, fmt, args);
+    }
+};
 
 fn nowNs() u128 {
     var ts: std.c.timespec = .{ .sec = 0, .nsec = 0 };
@@ -66,7 +87,7 @@ const Store = struct {
     mgr: *memory.TriSourceManager,
     lc: *memory.Lifecycle,
     hnsw: *HNSW,
-    emb: retrieval.StubEmbedder,
+    emb: retrieval.Embedder,
     cell_index: std.AutoHashMap(u64, *MemCell),
     /// WAL for crash-safe persistence. Optional so tests / dry-runs can opt out.
     wal: ?*WAL,
@@ -108,7 +129,7 @@ const Store = struct {
         const hnsw = try alloc.create(HNSW);
         hnsw.* = HNSW.init(alloc, .{}, 384);
         self.hnsw = hnsw;
-        self.emb = retrieval.StubEmbedder.init(384);
+        self.emb = retrieval.Embedder.init(.lexical_hash, 384);
         // Compute snapshot path: <data_dir>/snapshot.bin
         self.snapshot_path = std.fs.path.join(self.alloc, &.{ data_dir, "snapshot.bin" }) catch {
             log.err("snapshot path too long; persistence disabled", .{});
@@ -667,6 +688,7 @@ const Store = struct {
         // Replay records.
         var replay_count: u64 = 0;
         var max_replayed_id: u64 = 0;
+        var replayed_goals: u64 = 0;
         // Records from before commit 5c3fdb9 (which added the "id" WAL
         // field) have no id. We synthesize one in a high range
         // (≥ 1_000_000_000) so they can't collide with fresh inserts. The
@@ -681,15 +703,26 @@ const Store = struct {
             count: *u64,
             max_id: *u64,
             synthetic_seq: *u64,
+            goal_count: *u64,
         };
         var ctx = Ctx{
             .store = self,
             .count = &replay_count,
             .max_id = &max_replayed_id,
             .synthetic_seq = &synthetic_id_seq,
+            .goal_count = &replayed_goals,
         };
         wal_ptr.replay(existing.items, &ctx, struct {
             fn cb(ctx_ptr: *Ctx, rec: WALRecord) anyerror!void {
+                // `goal_create` records used to be dropped here entirely,
+                // because this daemon carries its own duplicate `Store`
+                // with its own replay loop. So `mem3 goal add` wrote a
+                // durable goal record that this process never read back,
+                // and `GET /api/goals` disagreed with `mem3 goal list`.
+                if (rec.record_type == .goal_create) {
+                    applyGoalRecord(ctx_ptr.store, rec.payload, ctx_ptr.goal_count, ctx_ptr.max_id);
+                    return;
+                }
                 if (rec.record_type != .memcell_insert) return;
                 const synthetic_id = SYNTHETIC_ID_BASE + @atomicRmw(u64, ctx_ptr.synthetic_seq, .Add, 1, .seq_cst);
                 const parsed = parseInsertPayload(
@@ -728,7 +761,50 @@ const Store = struct {
         if (max_replayed_id > 0) {
             _ = self.ids.fetchMax(max_replayed_id + 1, .monotonic);
         }
-        std.log.info("WAL: replayed {d} memcell_insert records from {s}", .{ replay_count, wal_path });
+        std.log.info("WAL: replayed {d} memcell_insert + {d} goal_create records from {s}", .{ replay_count, replayed_goals, wal_path });
+    }
+
+    /// Replay one `goal_create` record into the daemon's poset.
+    ///
+    /// Mirrors `store.Store.applyGoalRecord`, which cannot be reused
+    /// directly because this file carries its own duplicate `Store` type.
+    /// The payload parser itself IS shared (`mem3_store.parseGoalPayload`)
+    /// so the two can never drift on the wire format.
+    ///
+    /// Idempotent: an id already in the poset is skipped, so replaying a
+    /// WAL on top of a snapshot is a no-op rather than a duplicate. Logs
+    /// are gated on `builtin.is_test` because the Zig 0.17 test runner
+    /// fails any test that emits a log line.
+    fn applyGoalRecord(store_self: *Store, payload: []const u8, count: *u64, max_id: *u64) void {
+        const g = mem3_store.parseGoalPayload(store_self.alloc, payload) catch |err| {
+            if (!builtin.is_test) log.warn("WAL: skipping goal_create record (parse failed: {})", .{err});
+            return;
+        };
+        defer g.deinit(store_self.alloc);
+
+        if (g.id == ghw_goal_tree.ROOT_GOAL_ID or g.id == ghw_goal_tree.TOP_GOAL_ID) return;
+        // Clear the id even for skipped records, so a later insert can
+        // never mint an id a durable record already claims.
+        if (g.id > max_id.*) max_id.* = g.id;
+        if (store_self.goals.nodes.contains(g.id)) return;
+        if (g.parent_id) |p| {
+            if (!store_self.goals.nodes.contains(p)) {
+                if (!builtin.is_test) log.warn("WAL: goal_create id={d} dropped — parent {d} absent from poset", .{ g.id, p });
+                return;
+            }
+        }
+        // A private counter seeded to the journaled id makes the poset
+        // mint exactly this id, matching how it was first created.
+        var slot: std.atomic.Value(u64) = .init(g.id);
+        const created = store_self.goals.create(g.name, g.description, g.parent_id, g.priority, g.deadline, g.created_at, &slot) catch |err| {
+            if (!builtin.is_test) log.warn("replay: goal_create id={d} failed: {}", .{ g.id, err });
+            return;
+        };
+        if (created != g.id) {
+            if (!builtin.is_test) log.err("replay: goal_create id drift — record {d}, poset {d}", .{ g.id, created });
+            return;
+        }
+        count.* += 1;
     }
 
     fn allCells(self: *Store, alloc: Allocator) ![]*MemCell {
@@ -996,13 +1072,50 @@ pub const Server = struct {
         return self.rawJson(201, body_resp);
     }
 
+    /// `GET /api/goals` — the real goals from the in-memory poset.
+    ///
+    /// This used to be a hardcoded three-element literal (`general`,
+    /// `research`, `system`) that never consulted the store, so any goal
+    /// created outside that literal — via `mem3 goal create`, which is
+    /// WAL-journaled and replayed on boot — was invisible here. Names and
+    /// descriptions are user input, so every string goes through the JSON
+    /// escaper: a goal named `a"b` could otherwise emit invalid JSON.
     fn handleListGoals(self: *Server) !Response {
-        const body = try std.fmt.allocPrint(self.alloc,
-            \\[{{"id":1,"name":"general","priority":5}},
-            \\{{"id":2,"name":"research","priority":7}},
-            \\{{"id":3,"name":"system","priority":6}}]
-        , .{});
-        return self.rawJson(200, body);
+        var body = std.ArrayList(u8).empty;
+        errdefer body.deinit(self.alloc);
+        const w = ListWriter{ .list = &body, .gpa = self.alloc };
+        try w.writeAll("{\"goals\":[");
+        var first = true;
+        var it = self.store.goals.nodes.iterator();
+        while (it.next()) |entry| {
+            const node = entry.value_ptr.*;
+            // The ⊥/⊤ anchors are poset structure, not user-facing goals.
+            if (node.id == ghw_goal_tree.ROOT_GOAL_ID) continue;
+            if (node.id == ghw_goal_tree.TOP_GOAL_ID) continue;
+            if (!first) try w.writeByte(',');
+            first = false;
+            try w.writeAll("{\"id\":");
+            try w.print("{d}", .{node.id});
+            try w.writeAll(",\"name\":");
+            try jsonl.writeJsonString(w, node.name);
+            try w.writeAll(",\"description\":");
+            try jsonl.writeJsonString(w, node.description);
+            try w.writeAll(",\"status\":");
+            try w.print("\"{s}\"", .{@tagName(node.status)});
+            try w.writeAll(",\"priority\":");
+            try w.print("{d}", .{node.priority});
+            try w.writeAll(",\"parent_id\":");
+            if (node.parent_id) |pid| {
+                try w.print("{d}", .{pid});
+            } else {
+                try w.writeAll("null");
+            }
+            try w.writeAll(",\"memcell_count\":");
+            try w.print("{d}", .{self.store.goals.memcellsFor(node.id).len});
+            try w.writeByte('}');
+        }
+        try w.writeAll("]}");
+        return self.rawJson(200, try body.toOwnedSlice(self.alloc));
     }
 
     fn handleQuery(self: *Server, full_request: []const u8) !Response {
@@ -1329,6 +1442,8 @@ fn jsonFieldStringRaw(alloc: Allocator, out: *std.ArrayList(u8), key: []const u8
             12 => try out.appendSlice(alloc, "\\f"),
             0...7, 11, 14...31 => {
                 var buf: [8]u8 = undefined;
+                // SAFETY: this prong bounds vc to 0...31, so "{x:0>4}" always
+                // emits exactly 4 hex digits. "\uXXXX" is 6 bytes; buf is 8.
                 const s = std.fmt.bufPrint(&buf, "\\u{x:0>4}", .{vc}) catch unreachable;
                 try out.appendSlice(alloc, s);
             },
@@ -1340,13 +1455,13 @@ fn jsonFieldStringRaw(alloc: Allocator, out: *std.ArrayList(u8), key: []const u8
 
 fn jsonFieldInt(alloc: Allocator, out: *std.ArrayList(u8), key: []const u8, value: u64) !void {
     var buf: [24]u8 = undefined;
-    const s = std.fmt.bufPrint(&buf, "\"{s}\":{d}", .{ key, value }) catch unreachable;
+    const s = std.fmt.bufPrint(&buf, "\"{s}\":{d}", .{ key, value }) catch return error.NoSpaceLeft;
     try out.appendSlice(alloc, s);
 }
 
 fn jsonFieldFloat(alloc: Allocator, out: *std.ArrayList(u8), key: []const u8, value: f32) !void {
     var buf: [48]u8 = undefined;
-    const s = std.fmt.bufPrint(&buf, "\"{s}\":{d:.4}", .{ key, value }) catch unreachable;
+    const s = std.fmt.bufPrint(&buf, "\"{s}\":{d:.4}", .{ key, value }) catch return error.NoSpaceLeft;
     try out.appendSlice(alloc, s);
 }
 
@@ -1394,17 +1509,50 @@ test "Server: healthz route" {
     try std.testing.expect(std.mem.indexOf(u8, resp.body, "ok") != null);
 }
 
-test "Server: GET /api/goals" {
+test "Server: GET /api/goals reflects the live poset, not a fixed literal" {
     const alloc = std.testing.allocator;
     var srv = try Server.init(alloc, "127.0.0.1", 0, "/tmp/mem3_test_server");
     defer {
         srv.deinit();
         std.fs.cwd().deleteTree("/tmp/mem3_test_server") catch {};
     }
-    const resp = try srv.route("GET", "/api/goals", "");
-    defer alloc.free(resp.body);
-    try std.testing.expectEqual(@as(u16, 200), resp.status);
-    try std.testing.expect(std.mem.indexOf(u8, resp.body, "general") != null);
+
+    // Seeded goals must be present.
+    const before = try srv.route("GET", "/api/goals", "");
+    defer alloc.free(before.body);
+    try std.testing.expectEqual(@as(u16, 200), before.status);
+    try std.testing.expect(std.mem.indexOf(u8, before.body, "general") != null);
+
+    // The regression guard: the old implementation returned a hardcoded
+    // literal, so ANY goal outside that literal proves we are now
+    // reading the store. The name contains a quote and non-ASCII on
+    // purpose — it must survive JSON escaping intact.
+    const tricky_name = "e2e-quote\"and-中文";
+    var slot: std.atomic.Value(u64) = .init(4242);
+    _ = srv.store.goals.create(tricky_name, "desc with \\ backslash", null, 8, null, 0, &slot) catch |err| {
+        std.log.warn("goal create failed: {s}", .{@errorName(err)});
+        return err;
+    };
+
+    const after = try srv.route("GET", "/api/goals", "");
+    defer alloc.free(after.body);
+
+    // Parses as JSON at all — the old builder would not have.
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, after.body, .{});
+    defer parsed.deinit();
+    const arr = parsed.value.object.get("goals").?.array;
+    var found = false;
+    for (arr.items) |item| {
+        const o = item.object;
+        if (std.mem.eql(u8, o.get("name").?.string, tricky_name)) {
+            found = true;
+            try std.testing.expectEqual(@as(i64, 8), o.get("priority").?.integer);
+            try std.testing.expect(o.get("description") != null);
+            try std.testing.expect(o.get("status") != null);
+            try std.testing.expect(o.get("parent_id") != null);
+        }
+    }
+    try std.testing.expect(found);
 }
 
 // =============================================================================
@@ -1427,6 +1575,8 @@ fn jsonFieldString(alloc: Allocator, out: *std.ArrayList(u8), key: []const u8, v
             12 => try out.appendSlice(alloc, "\\f"),
             0...7, 11, 14...31 => {
                 var buf: [8]u8 = undefined;
+                // SAFETY: this prong bounds vc to 0...31, so "{x:0>4}" always
+                // emits exactly 4 hex digits. "\uXXXX" is 6 bytes; buf is 8.
                 const s = std.fmt.bufPrint(&buf, "\\u{x:0>4}", .{vc}) catch unreachable;
                 try out.appendSlice(alloc, s);
             },
@@ -1438,19 +1588,19 @@ fn jsonFieldString(alloc: Allocator, out: *std.ArrayList(u8), key: []const u8, v
 
 fn jsonFieldUintRaw(alloc: Allocator, out: *std.ArrayList(u8), key: []const u8, value: u64) !void {
     var buf: [32]u8 = undefined;
-    const s = std.fmt.bufPrint(&buf, "\"{s}\":{d}", .{ key, value }) catch unreachable;
+    const s = std.fmt.bufPrint(&buf, "\"{s}\":{d}", .{ key, value }) catch return error.NoSpaceLeft;
     try out.appendSlice(alloc, s);
 }
 
 fn jsonFieldFloatRaw(alloc: Allocator, out: *std.ArrayList(u8), key: []const u8, value: f32) !void {
     var buf: [48]u8 = undefined;
-    const s = std.fmt.bufPrint(&buf, "\"{s}\":{d:.6}", .{ key, value }) catch unreachable;
+    const s = std.fmt.bufPrint(&buf, "\"{s}\":{d:.6}", .{ key, value }) catch return error.NoSpaceLeft;
     try out.appendSlice(alloc, s);
 }
 
 fn jsonFieldIntRaw(alloc: Allocator, out: *std.ArrayList(u8), key: []const u8, value: i64) !void {
     var buf: [32]u8 = undefined;
-    const s = std.fmt.bufPrint(&buf, "\"{s}\":{d}", .{ key, value }) catch unreachable;
+    const s = std.fmt.bufPrint(&buf, "\"{s}\":{d}", .{ key, value }) catch return error.NoSpaceLeft;
     try out.appendSlice(alloc, s);
 }
 

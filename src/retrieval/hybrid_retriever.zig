@@ -9,7 +9,7 @@ const core = @import("../core/mod.zig");
 const MemCell = core.MemCell;
 const HNSW = @import("hnsw.zig").HNSW;
 const HyMem = @import("../hypermem/engine.zig").HyMem;
-const StubEmbedder = @import("embedder.zig").StubEmbedder;
+const Embedder = @import("embedder.zig").Embedder;
 const config = @import("../core/config.zig").Config;
 
 pub const Candidate = struct {
@@ -30,7 +30,7 @@ pub const HybridRetriever = struct {
     cfg: config,
     hnsw: *HNSW,
     hypergraph: *HyMem,
-    embedder: StubEmbedder,
+    embedder: Embedder,
 
     pub fn init(
         alloc: Allocator,
@@ -43,7 +43,7 @@ pub const HybridRetriever = struct {
             .cfg = cfg,
             .hnsw = hnsw,
             .hypergraph = hypergraph,
-            .embedder = StubEmbedder.init(cfg.embedder_dim),
+            .embedder = Embedder.init(cfg.embedder_kind, cfg.embedder_dim),
         };
     }
 

@@ -184,7 +184,7 @@ pub fn printHelp() !void {
         \\SUBCOMMANDS:
         \\  add           Encode and persist a TS-MemCell
         \\  query         Three-way recall with GHW-prioritized ranking
-        \\  goal          Manage the Goal Poset (add/list/delete)
+        \\  goal          Manage the Goal Poset (add/list/status)
         \\  hyperedge     Manage hypergraph edges
         \\  dump          Export the full store as JSONL
         \\  inspect       Show a MemCell + its hypergraph neighborhood

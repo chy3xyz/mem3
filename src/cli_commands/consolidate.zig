@@ -22,6 +22,9 @@ pub fn run(alloc: std.mem.Allocator, parsed: cli.Parsed) !void {
 
     if (parsed.json) {
         var buf: [256]u8 = undefined;
+        // SAFETY: three usize counters (each <= 20 digits on a 64-bit
+        // target) plus a 62-byte literal -> worst case 122 bytes into a
+        // 256-byte buffer.
         const s = std.fmt.bufPrint(
             &buf,
             "{{\"abstracts_created\":{d},\"cells_before\":{d},\"cells_after\":{d}}}",
@@ -30,6 +33,8 @@ pub fn run(alloc: std.mem.Allocator, parsed: cli.Parsed) !void {
         cli_common.println(s);
     } else {
         var buf: [256]u8 = undefined;
+        // SAFETY: three usize counters (each <= 20 digits) plus a 56-byte
+        // literal -> worst case 116 bytes into a 256-byte buffer.
         const s = std.fmt.bufPrint(
             &buf,
             "consolidate: abstracts_created={d}\n  cells: {d} -> {d}",

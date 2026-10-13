@@ -30,3 +30,10 @@ bench-results.json
 
 # Stray runtime dir from earlier bash typo (literal 0x16 SYN char)
 //
+
+# Long-run baseline harness output (default --out)
+/longrun.jsonl
+
+# Local git worktrees and agent scratch dirs
+/.worktrees/
+/.opencode/

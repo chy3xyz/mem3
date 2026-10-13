@@ -68,10 +68,15 @@ fn goalAdd(store: *Store, parsed: cli.Parsed) !void {
 
     if (parsed.json) {
         var buf: [256]u8 = undefined;
+        // SAFETY: format is `{"id":<u64>}`; id is u64 (<= 20 digits) and
+        // the literal is 7 bytes, so the longest output is 27 bytes into a
+        // 256-byte buffer. No user-supplied text is interpolated.
         const s = std.fmt.bufPrint(&buf, "{{\"id\":{d}}}", .{id}) catch unreachable;
         cli_common.println(s);
     } else {
         var buf: [256]u8 = undefined;
+        // SAFETY: format is `goal added: id=<u64>`; literal is 16 bytes
+        // and id is u64 (<= 20 digits) -> 36 bytes into a 256-byte buffer.
         const s = std.fmt.bufPrint(&buf, "goal added: id={d}", .{id}) catch unreachable;
         cli_common.println(s);
     }
@@ -98,6 +103,9 @@ fn goalList(store: *Store, parsed: cli.Parsed, alloc: std.mem.Allocator) !void {
         cli_common.println(buf.items);
     } else {
         var buf: [256]u8 = undefined;
+        // SAFETY: format is `goals (<usize>):`; the literal is 9 bytes and
+        // goals.len is a usize (<= 20 digits) -> 29 bytes into a 256-byte
+        // buffer. No user-supplied text is interpolated.
         const header = std.fmt.bufPrint(&buf, "goals ({d}):", .{goals.len}) catch unreachable;
         cli_common.println(header);
         for (goals) |g| {
@@ -133,6 +141,10 @@ fn goalStatus(store: *Store, parsed: cli.Parsed) !void {
         cli_common.fatal("error: status update failed: {s}\n", .{@errorName(err)});
 
     var buf: [256]u8 = undefined;
+    // SAFETY: format is `goal <u64> -> <status>`; literal is 9 bytes, id
+    // is u64 (<= 20 digits) and @tagName(GoalStatus) is drawn from the
+    // six fixed tags in core/types.zig (longest "in_progress" = 11) ->
+    // 40 bytes into a 256-byte buffer. No user-supplied text.
     const s = std.fmt.bufPrint(&buf, "goal {d} -> {s}", .{ id, @tagName(status) }) catch unreachable;
     cli_common.println(s);
 }

@@ -48,9 +48,14 @@ pub fn run(alloc: std.mem.Allocator, parsed: cli.Parsed) !void {
     try cli_common.appendFmt(&buf, alloc, ",\"decay_rate\":{d:.6}", .{cell.metadata.decay_rate});
     try cli_common.appendFmt(&buf, alloc, ",\"created_at\":{d}", .{cell.metadata.created_at});
     try cli_common.appendFmt(&buf, alloc, ",\"access_count\":{d}", .{cell.metadata.access_count});
-    try buf.append(alloc, '}');
 
     // Find the hypergraph neighborhood if requested.
+    //
+    // NOTE: the object's closing brace comes AFTER this block. It used
+    // to sit on the line above, which meant that whenever --max-hops
+    // produced a neighborhood the output was `{"id":…,…},"neighborhood":[…`
+    // — the comma landed outside the object and the result did not
+    // parse as JSON at all. `mem3 inspect --max-hops 2 | jq` failed.
     if (max_hops > 0) {
         const seeds = [_]u64{id};
         const visited = try store.multiHop(alloc, &seeds, max_hops, 0.0, null);
@@ -69,6 +74,7 @@ pub fn run(alloc: std.mem.Allocator, parsed: cli.Parsed) !void {
         }
         try buf.append(alloc, ']');
     }
+    try buf.append(alloc, '}');
 
     cli_common.println(buf.items);
 }

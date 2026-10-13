@@ -100,22 +100,32 @@ test "E2E: insert 5 cells, restart, verify all survive" {
     }
 }
 
-test "E2E: goal list reflects defaults after restart" {
-    // Note: v0.2.0 snapshot only persists (counter, cells, fuzzy) and
-    // does NOT include user-created goals (those are WAL-only and the
-    // current goal-create path doesn't WAL-append). Default seed
-    // goals (general/research/system) are re-seeded on every boot
-    // because `seed_default_goals` is on by default. So we can only
-    // assert that the seed goals survive a restart. This is a known
-    // v0.2.0 limitation tracked in store.zig:collectGoals TODO.
+test "E2E: goal list reflects defaults and survives restart with user goals" {
+    // Rewritten: this used to carry a comment excusing itself because
+    // "the current goal-create path doesn't WAL-append", so it could
+    // only assert the re-seeded defaults. `createGoal` is now WAL-first
+    // and `takeSnapshot` re-journals goals into the fresh WAL, so a
+    // user-created goal must genuinely survive a restart — which is
+    // the stronger property and the one actually worth testing.
     const alloc = testing.allocator;
     const data_dir = try makeDataDir(alloc, "goal1");
 
     defer alloc.free(data_dir);
+    const user_goal_name = "user-created-goal";
     {
         wipeDataDir(data_dir);
         var store = try mem3.Store.init(alloc, .{ .data_dir = data_dir });
         defer store.deinit();
+
+        const gid = try store.createGoal(
+            user_goal_name,
+            "created before restart",
+            null,
+            9,
+            null,
+            0,
+        );
+        try testing.expect(gid != 0);
         try store.sync();
     }
 
@@ -130,14 +140,18 @@ test "E2E: goal list reflects defaults after restart" {
         var saw_general = false;
         var saw_research = false;
         var saw_system = false;
+        var saw_user = false;
         for (goals) |g| {
             if (std.mem.eql(u8, g.name, "general")) saw_general = true;
             if (std.mem.eql(u8, g.name, "research")) saw_research = true;
             if (std.mem.eql(u8, g.name, "system")) saw_system = true;
+            if (std.mem.eql(u8, g.name, user_goal_name)) saw_user = true;
         }
         try testing.expect(saw_general);
         try testing.expect(saw_research);
         try testing.expect(saw_system);
+        // The point of the rewrite: this used to be impossible to assert.
+        try testing.expect(saw_user);
 
         wipeDataDir(data_dir);
     }

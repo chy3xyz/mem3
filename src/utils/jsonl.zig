@@ -18,8 +18,16 @@ pub fn writeJsonString(writer: anytype, s: []const u8) !void {
             '\n' => try writer.writeAll("\\n"),
             '\r' => try writer.writeAll("\\r"),
             '\t' => try writer.writeAll("\\t"),
-            0...31 => try writer.print("\\u{x:0>4}", .{c}),
-            127...255 => try writer.print("\\u{x:0>4}", .{c}),
+            // NOTE: the sub-ranges must skip 9, 10 and 13, which the arms
+            // above already claim. A plain `0...31` here overlaps them —
+            // Zig used to accept the dead branch, 0.17 rejects it outright.
+            0...8, 11...12, 14...31 => try writer.print("\\u{x:0>4}", .{c}),
+            // DEL gets escaped; everything above it is passed through
+            // raw. JSON strings are UTF-8, so escaping each byte of a
+            // multi-byte sequence independently (`127...255`, the old
+            // behaviour) turned any non-ASCII text — a Chinese goal
+            // name, for instance — into mojibake.
+            127 => try writer.print("\\u{x:0>4}", .{c}),
             else => try writer.writeByte(c),
         }
     }

@@ -2,21 +2,41 @@
 //!
 //! Per the spec: `mem3 query "text" --topk 10 [--source-filter M,F,S]`
 //!
-//! v0.1.0 query is in-memory only. v0.2.0 will load from WAL on startup.
+//! ## Why this reads the Store
 //!
-//! For US1 acceptance, the query:
-//! 1. Embeds the text via StubEmbedder.
-//! 2. Searches HNSW for top-k candidates by cosine.
-//! 3. Returns id list sorted by score (descending).
+//! v0.1.0 built a throwaway `HNSW.init()` and searched *that*, so the
+//! index was empty on every invocation and `mem3 query` always reported
+//! zero results regardless of the corpus. The store already owns a
+//! populated index: `Store.commitBuiltCell` embeds each cell's episode
+//! and inserts it into `store.hnsw`, and the WAL replay path routes
+//! through the same commit. So the fix is to search `store.hnsw` rather
+//! than build a second, empty one.
+//!
+//! ## The recall path
+//!
+//! 1. Embed the text with the store's StubEmbedder.
+//! 2. Search `store.hnsw` for dense candidates (over-fetched 3x so that
+//!    filtering and re-ranking still have material to work with).
+//! 3. Apply `--source-filter` / `--goal-ids`, re-rank by GHW goal
+//!    relevance and importance, truncate to `--topk`.
+//!
+//! Ranking mirrors the server's `POST /api/query` so the CLI and the
+//! HTTP surface agree on ordering and score.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const cli = @import("../cli.zig");
+const cli_common = @import("cli_common.zig");
 const core = @import("../core/mod.zig");
 const MemorySource = core.MemorySource;
-const HNSW = @import("../retrieval/hnsw.zig").HNSW;
-const StubEmbedder = @import("../retrieval/embedder.zig").StubEmbedder;
-const config = @import("../core/config.zig").Config;
+const MemCell = core.MemCell;
+
+/// A ranked hit. Score is cosine similarity after GHW-prioritised
+/// re-ranking; see `rerank`.
+const Hit = struct {
+    id: u64,
+    score: f32,
+};
 
 pub fn run(alloc: Allocator, p: cli.Parsed) !void {
     var query_text: ?[]const u8 = null;
@@ -53,34 +73,92 @@ pub fn run(alloc: Allocator, p: cli.Parsed) !void {
     }
 
     if (query_text == null) {
-        std.debug.print("error: query text required\n", .{});
+        cli_common.eprintln("error: query text required (usage: mem3 query \"text\" [--topk N])");
         return error.MissingFlag;
     }
+    const text = query_text.?;
 
-    // Build an empty in-memory HNSW for the demo.
-    var hnsw = HNSW.init(alloc, .{}, 384);
-    defer hnsw.deinit();
-    var emb = StubEmbedder.init(384);
-    const qvec = try emb.embed(alloc, query_text.?);
+    // Same durable store `add` / `dump` / `inspect` use, so results
+    // survive across CLI invocations when --data-dir matches.
+    var store = try cli_common.openStore(alloc, p);
+    defer store.deinit();
+
+    const qvec = try store.emb.embed(alloc, text);
     defer alloc.free(qvec);
 
-    // No corpus in this minimal demo: just embed and report.
-    const results = try hnsw.search(alloc, qvec, topk);
-    defer alloc.free(results);
+    // Over-fetch: the dense stage only needs to supply candidates.
+    const dense = store.hnsw.search(alloc, qvec, topk * 3) catch &.{};
+    defer {
+        // `catch &.{}` hands back a static empty slice; freeing that is
+        // not ours to do.
+        if (dense.len > 0) alloc.free(dense);
+    }
+
+    var ranked = std.ArrayList(Hit).empty;
+    defer ranked.deinit(alloc);
+
+    for (dense) |r| {
+        const cell = store.getCell(r.id) orelse continue;
+        if (source_filter.items.len > 0 and !matchesSource(source_filter.items, cell.source)) continue;
+        if (goal_ids.items.len > 0 and !matchesGoal(cell, goal_ids.items)) continue;
+        try ranked.append(alloc, .{ .id = r.id, .score = rerank(r.score, cell) });
+    }
+
+    // Highest score first.
+    std.mem.sort(@TypeOf(ranked.items[0]), ranked.items, {}, struct {
+        fn lt(_: void, a: Hit, b: Hit) bool {
+            return a.score > b.score;
+        }
+    }.lt);
+
+    const shown = ranked.items[0..@min(topk, ranked.items.len)];
 
     if (p.json) {
-        std.debug.print("{{\"query\":\"", .{});
-        // simpler: just print the id list as JSON
-        std.debug.print("[", .{});
-        for (results, 0..) |r, i| {
-            if (i > 0) std.debug.print(",", .{});
-            std.debug.print("{d}", .{r.id});
+        var buf = std.ArrayList(u8).empty;
+        defer buf.deinit(alloc);
+        try buf.appendSlice(alloc, "{\"query\":[");
+        for (shown, 0..) |r, i| {
+            if (i > 0) try buf.append(alloc, ',');
+            try cli_common.appendFmt(&buf, alloc, "{d}", .{r.id});
         }
-        std.debug.print("]}}\n", .{});
+        try cli_common.appendFmt(&buf, alloc, "],\"count\":{d}}}", .{shown.len});
+        cli_common.println(buf.items);
     } else {
-        std.debug.print("query: \"{s}\" — {d} results\n", .{ query_text.?, results.len });
-        for (results) |r| {
-            std.debug.print("  id={d} score={d:.4}\n", .{ r.id, r.score });
+        var buf = std.ArrayList(u8).empty;
+        defer buf.deinit(alloc);
+        try cli_common.appendFmt(&buf, alloc, "query: \"{s}\" — {d} results", .{ text, shown.len });
+        cli_common.println(buf.items);
+        for (shown) |r| {
+            buf.clearRetainingCapacity();
+            try cli_common.appendFmt(&buf, alloc, "  id={d} score={d:.4}", .{ r.id, r.score });
+            cli_common.println(buf.items);
         }
     }
+}
+
+/// GHW-prioritised re-rank: cosine similarity scaled by the cell's
+/// strongest goal relevance and by its importance score. Matches the
+/// server's `POST /api/query` weighting.
+fn rerank(score: f32, cell: *const MemCell) f32 {
+    var goal_bonus: f32 = 0.0;
+    for (cell.goal_associations) |ga| {
+        if (ga.relevance > goal_bonus) goal_bonus = ga.relevance;
+    }
+    return score * (1.0 + 0.4 * goal_bonus) * (1.0 + 0.3 * cell.metadata.importance_score);
+}
+
+fn matchesSource(filter: []const MemorySource, source: MemorySource) bool {
+    for (filter) |f| {
+        if (f == source) return true;
+    }
+    return false;
+}
+
+fn matchesGoal(cell: *const MemCell, wanted: []const u64) bool {
+    for (cell.goal_associations) |ga| {
+        for (wanted) |w| {
+            if (ga.goal_id == w) return true;
+        }
+    }
+    return false;
 }

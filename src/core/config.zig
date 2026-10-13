@@ -61,7 +61,12 @@ pub const Config = struct {
 
     pub const EmbedderKind = enum {
         /// Deterministic hash-based stub (v0.1.0 default; ~zero deps).
+        /// Semantically blind — kept for reproducibility, not relevance.
         stub_xxhash,
+        /// Real lexical embedder: hashed word unigram/bigram + character
+        /// 3-gram features, sublinear tf, signed hashing, L2-normalised.
+        /// Pure Zig, deterministic, no external deps.
+        lexical_hash,
         /// Reserved for v0.2.0 (ONNX model load).
         onnx_external,
     };

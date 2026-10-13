@@ -148,10 +148,16 @@ pub fn run(alloc: std.mem.Allocator, parsed: cli.Parsed) !void {
 
     if (parsed.json) {
         var buf: [256]u8 = undefined;
+        // SAFETY: format is `{"id":<u64>}`; id is u64 (<= 20 digits) and
+        // the literal is 7 bytes, so the longest output is 27 bytes into a
+        // 256-byte buffer. No user-supplied text is interpolated.
         const s = std.fmt.bufPrint(&buf, "{{\"id\":{d}}}", .{id}) catch unreachable;
         cli_common.println(s);
     } else {
         var buf: [256]u8 = undefined;
+        // SAFETY: format is `added memory id=<u64>`; literal is 16 bytes
+        // and id is u64 (<= 20 digits), so the longest output is 36 bytes
+        // into a 256-byte buffer.
         const s = std.fmt.bufPrint(&buf, "added memory id={d}", .{id}) catch unreachable;
         cli_common.println(s);
     }

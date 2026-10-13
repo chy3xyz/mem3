@@ -126,6 +126,30 @@ pub fn build(b: *std.Build) void {
     const run_loadtest = b.addRunArtifact(loadtest_exe);
     const loadtest_step = b.step("example-loadtest", "Run the production load test (1000 cells + 200 queries)");
     loadtest_step.dependOn(&run_loadtest.step);
+
+    // =========================================================================
+    // Example: `zig build example-longrun`
+    //
+    // Long-run lifecycle baseline. Run with defaults, or drive it
+    // directly for a wall-clock experiment:
+    //   ./zig-out/bin/mem3-longrun --duration-sec=86400 --data-dir=/tmp/mem3_lr
+    // =========================================================================
+    const longrun_module = b.createModule(.{
+        .root_source_file = b.path("examples/longrun.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+        .imports = &.{
+            .{ .name = "mem3", .module = libmem3_module },
+        },
+    });
+    const longrun_exe = b.addExecutable(.{
+        .name = "mem3-longrun",
+        .root_module = longrun_module,
+    });
+    b.installArtifact(longrun_exe);
+    const run_longrun = b.addRunArtifact(longrun_exe);
+    const longrun_step = b.step("example-longrun", "Run the long-run lifecycle baseline (JSONL per cycle)");
+    longrun_step.dependOn(&run_longrun.step);
 }
 
 fn addAllTests(
