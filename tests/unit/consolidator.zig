@@ -70,7 +70,8 @@ test "Consolidator: two similar cells produce one abstract" {
 
     try testing.expectEqual(@as(usize, 3), s.mgr.count());
 
-    const result = try s.cons.consolidate();
+    var result = try s.cons.consolidate();
+    defer result.deinitAbstractIds(alloc);
     try testing.expectEqual(@as(usize, 1), result.abstracts_created);
     // 3 originals + 1 abstract.
     try testing.expectEqual(@as(usize, 4), s.mgr.count());
@@ -85,7 +86,8 @@ test "Consolidator: dissimilar cells produce no abstract" {
     try addCell(s.mgr, "potato recipe for dinner", .form, 1);
     try addCell(s.mgr, "quantum gravity theory revisited", .form, 1);
 
-    const result = try s.cons.consolidate();
+    var result = try s.cons.consolidate();
+    defer result.deinitAbstractIds(alloc);
     try testing.expectEqual(@as(usize, 0), result.abstracts_created);
     // Originals preserved.
     try testing.expectEqual(@as(usize, 3), s.mgr.count());
@@ -102,7 +104,8 @@ test "Consolidator: PCR — originals are never deleted" {
     try addCell(s.mgr, "deep learning speech models", .form, 1);
 
     const before = s.mgr.count();
-    _ = try s.cons.consolidate();
+    var res = try s.cons.consolidate();
+    defer res.deinitAbstractIds(alloc);
     const after = s.mgr.count();
 
     // After consolidation: at least `before` cells (originals) plus 1
@@ -115,6 +118,7 @@ test "Consolidator: empty corpus produces zero abstracts" {
     var s = try buildStore(alloc);
     defer s.deinit();
 
-    const result = try s.cons.consolidate();
+    var result = try s.cons.consolidate();
+    defer result.deinitAbstractIds(alloc);
     try testing.expectEqual(@as(usize, 0), result.abstracts_created);
 }

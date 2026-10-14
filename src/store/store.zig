@@ -300,8 +300,72 @@ pub const Store = struct {
 
     /// Run HAC consolidation. Returns the number of abstract cells
     /// created (0 if the corpus is too small to cluster).
+    ///
+    /// The consolidator itself only holds the TriSourceManager, so it
+    /// used to insert abstracts that reached nothing else: not
+    /// `cell_index`, not HNSW, not the WAL. Measured before this was
+    /// wired: `consolidate` reported `abstracts_created=1, cells:
+    /// 6 -> 7` while `dump` still listed 6 records and `query` could
+    /// not retrieve any of them — consolidation produced data no
+    /// user-facing path could observe. Each abstract is now indexed,
+    /// embedded and journaled like any other cell.
     pub fn consolidate(self: *Store) !usize {
-        return self.lc.consolidate();
+        var result = try self.lc.consolidateDetailed();
+        defer result.deinitAbstractIds(self.alloc);
+
+        for (result.abstract_ids) |id| {
+            self.indexAbstract(id);
+        }
+        return result.abstracts_created;
+    }
+
+    /// Put one consolidation abstract into the paths that make a cell
+    /// usable: `cell_index`, the vector index, and the WAL.
+    fn indexAbstract(self: *Store, id: u64) void {
+        const cell = self.mgr.get(id) orelse return;
+
+        self.cell_index.put(id, cell) catch |err| {
+            log.warn("consolidate: cell_index.put failed for abstract {d}: {}", .{ id, err });
+            return;
+        };
+
+        // Embed and index. A failure here leaves the abstract
+        // unsearchable, which is exactly the state this function
+        // exists to prevent, so it is reported rather than swallowed.
+        const v = self.emb.embed(self.alloc, cell.episode) catch |err| {
+            log.warn("consolidate: embed failed for abstract {d}: {}", .{ id, err });
+            return;
+        };
+        defer self.alloc.free(v);
+        self.hnsw.insert(id, v) catch |err| {
+            log.warn("consolidate: hnsw insert failed for abstract {d}: {}", .{ id, err });
+        };
+
+        // Journal last. The abstract is already observable in memory,
+        // so a WAL failure here means it will not survive a restart
+        // that does not also take a snapshot.
+        if (self.wal) |wal| {
+            const payload = self.encodeWALPayload(
+                id,
+                cell.source,
+                cell.episode,
+                cell.episode,
+                0,
+                0.0,
+                cell.metadata,
+            ) catch |err| {
+                log.warn("consolidate: WAL encode failed for abstract {d}: {}", .{ id, err });
+                return;
+            };
+            defer self.alloc.free(payload);
+            wal.append(.{
+                .record_type = .memcell_insert,
+                .payload = payload,
+                .timestamp = wallClockSec(),
+            }) catch |err| {
+                log.warn("consolidate: WAL append failed for abstract {d}: {}", .{ id, err });
+            };
+        }
     }
 
     /// Take a snapshot + truncate the WAL. No-op when WAL is disabled.

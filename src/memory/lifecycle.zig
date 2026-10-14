@@ -81,8 +81,17 @@ pub const Lifecycle = struct {
     /// Consolidation: run HAC clustering + abstract generation. Returns
     /// the number of abstract cells created (1 per cluster ≥ 2 cells).
     pub fn consolidate(self: *Lifecycle) !usize {
-        const result = try self.consolidator.consolidate();
+        var result = try self.consolidator.consolidate();
+        defer result.deinitAbstractIds(self.alloc);
         return result.abstracts_created;
+    }
+
+    /// Consolidation plus the ids of the abstracts it created, so the
+    /// caller can index and journal them. The consolidator only knows
+    /// about the TriSourceManager; without this the abstract cells it
+    /// produces are unreachable from every retrieval path.
+    pub fn consolidateDetailed(self: *Lifecycle) !Consolidator.ConsolidationResult {
+        return self.consolidator.consolidate();
     }
 };
 

@@ -34,6 +34,9 @@ bench-results.json
 # Long-run baseline harness output (default --out)
 /longrun.jsonl
 
+# Forgetting-metric harness output (default --out)
+/forgetting_eval.jsonl
+
 # Local git worktrees and agent scratch dirs
 /.worktrees/
 /.opencode/

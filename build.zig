@@ -150,6 +150,33 @@ pub fn build(b: *std.Build) void {
     const run_longrun = b.addRunArtifact(longrun_exe);
     const longrun_step = b.step("example-longrun", "Run the long-run lifecycle baseline (JSONL per cycle)");
     longrun_step.dependOn(&run_longrun.step);
+
+    // =========================================================================
+    // Example: `zig build example-forgetting-eval`
+    //
+    // Forgetting evaluation harness. Sweeps a simulated cell age (by
+    // back-dating `metadata.created_at` on the cells it owns) so the
+    // forgetting crossover is measurable in seconds instead of months,
+    // and scores each config with FAMA. Run it with defaults, or drive
+    // it directly for a wider sweep:
+    //   ./zig-out/bin/mem3-forgetting-eval --data-dir=/tmp/mem3_fe
+    // =========================================================================
+    const forgetting_eval_module = b.createModule(.{
+        .root_source_file = b.path("examples/forgetting_eval.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+        .imports = &.{
+            .{ .name = "mem3", .module = libmem3_module },
+        },
+    });
+    const forgetting_eval_exe = b.addExecutable(.{
+        .name = "mem3-forgetting-eval",
+        .root_module = forgetting_eval_module,
+    });
+    b.installArtifact(forgetting_eval_exe);
+    const run_forgetting_eval = b.addRunArtifact(forgetting_eval_exe);
+    const forgetting_eval_step = b.step("example-forgetting-eval", "Run the forgetting evaluation harness (JSONL per config)");
+    forgetting_eval_step.dependOn(&run_forgetting_eval.step);
 }
 
 fn addAllTests(

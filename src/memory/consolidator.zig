@@ -56,6 +56,23 @@ pub const Consolidator = struct {
         clusters: usize,
         abstracts_created: usize,
         cells_processed: usize,
+        /// Ids of the abstract cells this run inserted, so the caller
+        /// can index and journal them.
+        ///
+        /// The consolidator owns no index and no WAL — it inserts
+        /// straight into the TriSourceManager. That meant every abstract
+        /// it produced landed in a store the retrieval path cannot see:
+        /// not in `cell_index`, not embedded into HNSW, not in the WAL.
+        /// Measured before the fix: consolidate reported
+        /// `abstracts_created=1, cells: 6 -> 7` while `dump` still
+        /// listed 6 records and `query` could not retrieve any of them.
+        /// Caller owns the slice; free with `deinitAbstractIds`.
+        abstract_ids: []u64 = &.{},
+
+        pub fn deinitAbstractIds(self: *ConsolidationResult, alloc: Allocator) void {
+            if (self.abstract_ids.len > 0) alloc.free(self.abstract_ids);
+            self.abstract_ids = &.{};
+        }
     };
 
     /// Run HAC over the manager's cells. Threshold comes from cfg.
@@ -127,17 +144,22 @@ pub const Consolidator = struct {
 
         // Step 4: for each cluster of size ≥ 2, generate abstract.
         var abstracts_created: usize = 0;
+        var abstract_ids: std.ArrayList(u64) = .empty;
+        defer abstract_ids.deinit(self.alloc);
         var it = cluster_map.iterator();
         while (it.next()) |entry| {
             const indices = entry.value_ptr.items;
             if (indices.len < 2) continue;
-            try self.generateAbstract(cells.items, indices);
-            abstracts_created += 1;
+            if (try self.generateAbstract(cells.items, indices)) |aid| {
+                try abstract_ids.append(self.alloc, aid);
+                abstracts_created += 1;
+            }
         }
 
         return .{
             .clusters = cluster_map.count(),
             .abstracts_created = abstracts_created,
+            .abstract_ids = try abstract_ids.toOwnedSlice(self.alloc),
             .cells_processed = n,
         };
     }
@@ -169,7 +191,9 @@ for (0..coherence_mod.MAX_TRACKED_TOKENS) |i| {
     /// Generate an abstract cell that captures the common vocabulary
     /// of the cluster. Uses matter + form fields from a representative
     /// cell (first in cluster) and a synthetic foresight + goals.
-    fn generateAbstract(self: *Consolidator, cells: []const *MemCell, indices: []const usize) !void {
+    /// Returns the id of the abstract it inserted, so the caller can
+    /// index and journal it.
+    fn generateAbstract(self: *Consolidator, cells: []const *MemCell, indices: []const usize) !?u64 {
         const alloc = self.alloc;
         const rep = cells[indices[0]];
 
@@ -270,14 +294,16 @@ for (0..coherence_mod.MAX_TRACKED_TOKENS) |i| {
         }
         _ = self.mgr.addWithId(cell_ptr.id, cell_ptr.*) catch |err| {
             // On duplicate id (extremely unlikely), drop the abstract
-            // silently. The errdefer at line 231 frees cell_ptr; the
+            // silently. The errdefer above frees cell_ptr; the
             // defer above frees the slices.
             std.log.warn("consolidator: addWithId failed: {}", .{err});
-            return;
+            return null;
         };
         // mgr.addWithId dups all owned slices (episode, atomic_facts,
         // etc.); the local cell_ptr is no longer needed.
+        const cell_id = cell_ptr.id;
         alloc.destroy(cell_ptr);
+        return cell_id;
     }
 };
 
@@ -371,7 +397,8 @@ test "Consolidator: two similar cells → 1 abstract" {
     _ = try mgr.add(a);
     _ = try mgr.add(b);
 
-    const result = try con.consolidate();
+    var result = try con.consolidate();
+    defer result.deinitAbstractIds(std.testing.allocator);
     try std.testing.expect(result.abstracts_created >= 1);
     try std.testing.expect(result.cells_processed == 2);
     // The abstract cell should be in the manager now.
@@ -408,6 +435,7 @@ test "Consolidator: no cluster when cells too dissimilar" {
     };
     _ = try mgr.add(a);
     _ = try mgr.add(b);
-    const result = try con.consolidate();
+    var result = try con.consolidate();
+    defer result.deinitAbstractIds(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 0), result.abstracts_created);
 }

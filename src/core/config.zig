@@ -15,6 +15,11 @@ pub const Config = struct {
     hnsw_m_max0: u16 = 32,
     hnsw_ef_construction: u16 = 200,
     hnsw_ef_search: u16 = 100,
+    /// Seed for the index's level-assignment RNG. Explicit so graph
+    /// construction is reproducible: the benchmark reports a stability
+    /// figure and the tests assert measured numbers, both of which are
+    /// meaningless if every run builds a different graph.
+    hnsw_seed: u64 = 0x5EED_1234_ABCD_0001,
     embedder_dim: u16 = 384,
     embedder_kind: EmbedderKind = .stub_xxhash,
 

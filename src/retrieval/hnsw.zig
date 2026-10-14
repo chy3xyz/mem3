@@ -41,10 +41,23 @@ pub const HNSW = struct {
     cfg: Config,
     dim: u16,
     nodes: std.AutoHashMap(u64, *Node),
-    /// Entry point: the topmost node's id. Null if empty.
+    /// Entry point: the topmost node's id. Null if empty. Promoted
+    /// whenever a node arrives with a higher level than `max_level`.
     entry_point: ?u64,
+    /// Highest level currently occupied. Starts at 0 and only grows.
+    max_level: u8 = 0,
     /// Total node count.
     count: usize = 0,
+    /// Persistent level-assignment RNG.
+    ///
+    /// This must be *state carried across calls*. It used to be
+    /// reconstructed from `@intFromPtr(&self)` on every call to
+    /// `randomLevel`, so every insert drew the identical sequence and
+    /// every node received the same level. Measured on a 400-node
+    /// insert: `max_level_seen = 0`, i.e. the upper layers were never
+    /// populated at all and `greedyDescend` above level 0 was dead
+    /// code — the "hierarchical" graph was flat.
+    prng: std.Random.DefaultPrng,
 
     pub fn init(alloc: Allocator, cfg: Config, dim: u16) HNSW {
         return .{
@@ -53,6 +66,8 @@ pub const HNSW = struct {
             .dim = dim,
             .nodes = std.AutoHashMap(u64, *Node).init(alloc),
             .entry_point = null,
+            .max_level = 0,
+            .prng = std.Random.DefaultPrng.init(cfg.hnsw_seed),
         };
     }
 
@@ -89,6 +104,7 @@ pub const HNSW = struct {
 
         if (self.entry_point == null) {
             self.entry_point = id;
+            self.max_level = level;
             return;
         }
 
@@ -131,6 +147,21 @@ pub const HNSW = struct {
                 linked += 1;
                 if (linked >= link_limit) break;
             }
+        }
+
+        // Promote the entry point only once the node is fully linked.
+        //
+        // Doing this before the links are built makes the multi-layer
+        // branch below descend from the node being inserted, whose
+        // neighbour lists at those levels are still empty — so the
+        // descent has nowhere to go and the upper layers stay
+        // unpopulated. It used to be fixed at the very first insert for
+        // a different reason: search always began at whichever node
+        // happened to be inserted first, which has no links above
+        // level 0 either.
+        if (level > self.max_level) {
+            self.max_level = level;
+            self.entry_point = id;
         }
     }
 
@@ -397,15 +428,21 @@ pub const HNSW = struct {
     }
 
     fn randomLevel(self: *HNSW) u8 {
-        // Exponential distribution with `1/M` probability.
-        var prng = std.Random.DefaultPrng.init(@intCast(@intFromPtr(&self) ^ 0xDEADBEEF));
-        const rand = prng.random();
-        var lvl: u8 = 0;
-        while (lvl < 16) : (lvl += 1) {
-            const r = rand.float(f32);
-            if (r > 1.0 / @as(f32, @floatFromInt(self.cfg.hnsw_m))) break;
-        }
-        return lvl;
+        // Geometric draw, Hinnant's form: level = floor(-ln(U) * mL),
+        // with mL = 1/ln(M). A single draw per node, and the draw comes
+        // from the *persistent* PRNG — the previous version rebuilt the
+        // PRNG from a constant every call, so every node got the same
+        // level and the graph came out flat.
+        const m: f32 = @floatFromInt(@max(self.cfg.hnsw_m, 2));
+        const m_l: f32 = 1.0 / @log(m);
+        // `float(f32)` can return exactly 0.0; ln(0) is -inf, which
+        // would floor to a huge level. Reject the degenerate draw.
+        var u = self.prng.random().float(f32);
+        if (u <= 0.0 or u >= 1.0) u = 0.5;
+        const lvl_f = -@log(u) * m_l;
+        // Cap so a freak draw cannot ask for a 200-level graph.
+        const lvl: u32 = @intFromFloat(lvl_f);
+        return @intCast(@min(lvl, @as(u32, 16)));
     }
 
     pub fn cosineSim(self: *HNSW, a: []const f32, b: []const f32) f32 {
@@ -756,7 +793,17 @@ test "HNSW: adjacency degree stays bounded by m_max0" {
         for (nd.neighbors, 0..) |list, layer| {
             const limit = if (layer == 0) max0 else max_upper;
             try std.testing.expect(list.items.len <= limit);
-            try std.testing.expect(list.items.len > 0); // never stranded
+            // Layer 0 must never strand a node — once there is more
+            // than one node in the index, every one of them needs a
+            // level-0 neighbour or it is unreachable.
+            //
+            // Upper layers may legitimately be empty: when exactly one
+            // node reaches the top level it has no peer there. This
+            // assertion used to demand non-empty at every layer, which
+            // only held while every node sat at level 0.
+            if (layer == 0) {
+                try std.testing.expect(hnsw.count <= 1 or list.items.len > 0);
+            }
             observed_max = @max(observed_max, list.items.len);
             sum += list.items.len;
             lists += 1;
@@ -769,11 +816,91 @@ test "HNSW: adjacency degree stays bounded by m_max0" {
             }
         }
     }
-    try std.testing.expect(lists == oracle_n); // every node is layer 0
+    // Every node contributes at least its layer-0 list. This used to
+    // assert `lists == oracle_n`, i.e. that every node sits at level 0
+    // — which encoded the flat-graph bug as if it were the contract.
+    // A hierarchical graph has strictly more lists than nodes.
+    try std.testing.expect(lists >= oracle_n);
+    try std.testing.expect(lists > oracle_n); // and now genuinely more than one
+    // Upper layers must use the tighter limit.
+    var upper_lists: usize = 0;
+    var upper_max: usize = 0;
+    var uit = hnsw.nodes.iterator();
+    while (uit.next()) |entry| {
+        const nd2 = entry.value_ptr.*;
+        for (nd2.neighbors, 0..) |list2, layer2| {
+            if (layer2 == 0) continue; // layer 0 uses m_max0, not m
+            upper_lists += list2.items.len;
+            upper_max = @max(upper_max, list2.items.len);
+        }
+    }
+    if (upper_lists > 0) {
+        try std.testing.expect(upper_max <= max_upper);
+    }
     // Un-pruned this is 299.5 (near-complete); pruned it must collapse onto
     // the limit without over-shooting into isolation.
     try std.testing.expect(observed_max <= max0);
     try std.testing.expect(observed_max >= @as(usize, max0 / 2)); // the limit is actually reached
     const mean = @as(f32, @floatFromInt(sum)) / @as(f32, @floatFromInt(lists));
     try std.testing.expect(mean > 4.0); // still navigable, not amputated
+}
+
+test "HNSW: node levels are actually distributed, not all identical" {
+    // Regression guard for a bug that made the index nominally
+    // hierarchical and actually flat. `randomLevel` rebuilt its PRNG
+    // from `@intFromPtr(&self)` on every call, so the seed never
+    // changed and every insert drew the same value. Measured on a
+    // 400-node insert: max_level_seen = 0, i.e. not one node reached
+    // level 1, the upper layers were empty, and `greedyDescend` above
+    // level 0 was unreachable code.
+    const alloc = std.testing.allocator;
+    var idx = HNSW.init(alloc, .{ .hnsw_m = 16 }, 8);
+    defer idx.deinit();
+
+    const n = 400;
+    var v: [8]f32 = undefined;
+    var max_level: u8 = 0;
+    var level_mask: u32 = 0;
+
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        // Deterministic, well-spread vectors.
+        for (&v, 0..) |*x, j| {
+            x.* = @as(f32, @floatFromInt((i * 31 + j * 17) % 23)) - 11.0;
+        }
+        try idx.insert(@intCast(i + 1), &v);
+    }
+
+    var it = idx.nodes.iterator();
+    while (it.next()) |e| {
+        const lvl = e.value_ptr.*.level;
+        level_mask |= (@as(u32, 1) << @intCast(lvl));
+        if (lvl > max_level) max_level = lvl;
+    }
+
+    // The graph must be genuinely hierarchical: more than one distinct
+    // level occupied, and at least one node above layer 0.
+    try std.testing.expect(@popCount(level_mask) >= 2);
+    try std.testing.expect(max_level >= 1);
+    // The entry point must sit at the top, not at whatever was
+    // inserted first.
+    try std.testing.expectEqual(max_level, idx.max_level);
+    try std.testing.expectEqual(max_level, idx.nodes.get(idx.entry_point.?).?.level);
+
+    // Determinism: the same seed must rebuild the same level profile.
+    var idx2 = HNSW.init(alloc, .{ .hnsw_m = 16 }, 8);
+    defer idx2.deinit();
+    i = 0;
+    while (i < n) : (i += 1) {
+        for (&v, 0..) |*x, j| {
+            x.* = @as(f32, @floatFromInt((i * 31 + j * 17) % 23)) - 11.0;
+        }
+        try idx2.insert(@intCast(i + 1), &v);
+    }
+    var max2: u8 = 0;
+    var it2 = idx2.nodes.iterator();
+    while (it2.next()) |e| {
+        if (e.value_ptr.*.level > max2) max2 = e.value_ptr.*.level;
+    }
+    try std.testing.expectEqual(max_level, max2);
 }
