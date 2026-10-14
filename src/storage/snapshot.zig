@@ -932,7 +932,8 @@ test "Snapshot: write + read roundtrip preserves state" {
     };
     _ = try mgr.add(cell);
 
-    const path = "/tmp/mem3_test_snapshot.bin";
+    var path_buf: [96]u8 = undefined;
+    const path = goalTestPath(&path_buf, "roundtrip");
     defer {
         var zb: [std.fs.max_path_bytes + 1]u8 = undefined;
         // `bufPrint` can only fail by overflow; a path too long cannot be

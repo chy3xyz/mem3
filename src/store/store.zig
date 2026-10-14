@@ -2506,7 +2506,7 @@ test "Store: durable mode writes WAL, replay reconstructs state" {
     // leave `data/` behind in the working tree. The pre/post unlink
     // blocks below make this safe even after a crashed previous run.
     var data_dir_buf: [64]u8 = undefined;
-    const data_dir = std.fmt.bufPrint(&data_dir_buf, "/tmp/mem3_test_store_e2e", .{}) catch "/tmp/mem3_test_store_e2e";
+    const data_dir = testDataDir(&data_dir_buf, "store_e2e");
     defer {
         // Best-effort cleanup so re-runs start fresh.
         var wal_z: [std.fs.max_path_bytes + 1]u8 = undefined;
@@ -2655,8 +2655,10 @@ fn wipeStoreDir(data_dir: []const u8) void {
 
 test "Store: createGoal is WAL-journaled and survives restart" {
     const alloc = std.testing.allocator;
-    const data_dir = "/tmp/mem3_test_store_goal";
-    const legacy_dir = "/tmp/mem3_test_store_goal_legacy";
+    var data_dir_buf: [64]u8 = undefined;
+    const data_dir = testDataDir(&data_dir_buf, "store_goal");
+    var legacy_buf: [64]u8 = undefined;
+    const legacy_dir = testDataDir(&legacy_buf, "store_goal_legacy");
     wipeStoreDir(data_dir);
     wipeStoreDir(legacy_dir);
     defer {
@@ -2994,7 +2996,8 @@ test "Store: cross-layer log stays bounded under sustained traffic" {
 
 test "Store: GHW state is released across many encode/decode cycles" {
     const alloc = std.testing.allocator;
-    const data_dir = "/tmp/mem3_test_store_ghw_cycles";
+    var data_dir_buf: [64]u8 = undefined;
+    const data_dir = testDataDir(&data_dir_buf, "store_ghw_cycles");
     wipeStoreDir(data_dir);
     defer wipeStoreDir(data_dir);
 
@@ -3049,7 +3052,8 @@ test "Store: goalRelevance consults the Goal layer, the bare relevance does not"
 
 test "Store: an illegal goal transition is rejected before it reaches the WAL" {
     const alloc = std.testing.allocator;
-    const data_dir = "/tmp/mem3_test_store_transition";
+    var data_dir_buf: [64]u8 = undefined;
+    const data_dir = testDataDir(&data_dir_buf, "store_transition");
     wipeStoreDir(data_dir);
     defer wipeStoreDir(data_dir);
 
@@ -3199,6 +3203,12 @@ fn parseHyperedgePayload(alloc: Allocator, payload: []const u8) !ParsedEdge {
 /// Pid-scoped scratch directory. The older persistence tests above use
 /// fixed paths, which is fine for one binary but means a crashed run
 /// leaves state that silently becomes the next run's input.
+/// Scratch directory under /tmp, **pid-isolated**. A fixed path is not
+/// merely untidy: these tests clean up only on the path that runs to
+/// completion, so a run that dies part-way leaves a WAL or snapshot
+/// behind and the *next* run inherits it. The same command then gives a
+/// different answer depending on what happened before it. Every test
+/// scratch path in this repository is pid-scoped for that reason.
 fn testDataDir(buf: []u8, name: []const u8) []const u8 {
     const pid: u64 = @intCast(std.c.getpid());
     return std.fmt.bufPrint(buf, "/tmp/mem3_test_{s}_{d}", .{ name, pid }) catch unreachable;

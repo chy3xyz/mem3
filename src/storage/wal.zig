@@ -172,13 +172,33 @@ pub const WAL = struct {
 // Tests
 // =============================================================================
 
+/// Scratch path under /tmp, pid-isolated. A fixed path means a run that
+/// died before its cleanup could leave a WAL behind, and the next run
+/// would replay someone else's records: the same command then gives a
+/// different answer depending on what ran before it.
+/// `std.c.unlink` needs a sentinel-terminated slice; a `bufPrint` result is
+/// not one, and a string literal only coerces because it is.
+fn unlinkIfPresent(path: []const u8) void {
+    var buf: [std.fs.max_path_bytes + 1]u8 = undefined;
+    if (std.fmt.bufPrint(&buf, "{s}\x00", .{path})) |z| {
+        _ = std.c.unlink(z[0 .. z.len - 1 :0].ptr);
+    } else |_| {}
+}
+
+fn walTestPath(buf: []u8, name: []const u8) []const u8 {
+    const pid: u64 = @intCast(std.c.getpid());
+    return std.fmt.bufPrint(buf, "/tmp/mem3_wal_{d}_{s}", .{ pid, name }) catch unreachable;
+}
+
 test "WAL: append + replay" {
     // Scratch path lives outside the repo: a fresh clone has no `data/`
     // dir, and the test must not depend on one existing.
-    var wal = try WAL.init(std.testing.allocator, "/tmp/mem3_test.wal");
+    var path_buf: [96]u8 = undefined;
+    const wal_path = walTestPath(&path_buf, "append");
+    var wal = try WAL.init(std.testing.allocator, wal_path);
     defer wal.deinit();
     try wal.open();
-    defer _ = std.c.unlink("/tmp/mem3_test.wal");
+    defer unlinkIfPresent(wal_path);
 
     try wal.append(.{ .record_type = .memcell_insert, .payload = "hello", .timestamp = 1000 });
     try wal.append(.{ .record_type = .memcell_insert, .payload = "world", .timestamp = 2000 });
@@ -187,7 +207,7 @@ test "WAL: append + replay" {
     // Replay from disk. Use POSIX open via std.c — Zig 0.17 removed
     // std.fs.cwd(), and std.posix.openat wants a directory fd.
     var zpath: [std.fs.max_path_bytes + 1]u8 = undefined;
-    const z = try std.fmt.bufPrint(&zpath, "{s}\x00", .{"/tmp/mem3_test.wal"});
+    const z = try std.fmt.bufPrint(&zpath, "{s}\x00", .{wal_path});
     const zslice = z[0 .. z.len - 1 :0];
     const fd = std.c.open(zslice.ptr, std.c.O{}, @as(std.c.mode_t, 0));
     try std.testing.expect(fd >= 0);
@@ -216,17 +236,19 @@ test "WAL: append + replay" {
 }
 
 test "WAL: checksum corruption is detected" {
-    var wal = try WAL.init(std.testing.allocator, "/tmp/mem3_test_corrupt.wal");
+    var cpath_buf: [96]u8 = undefined;
+    const corrupt_path = walTestPath(&cpath_buf, "corrupt");
+    var wal = try WAL.init(std.testing.allocator, corrupt_path);
     defer wal.deinit();
     try wal.open();
-    defer _ = std.c.unlink("/tmp/mem3_test_corrupt.wal");
+    defer unlinkIfPresent(corrupt_path);
     try wal.append(.{ .record_type = .memcell_insert, .payload = "x", .timestamp = 100 });
     try wal.flush();
 
     // Corrupt the file: flip a byte in the middle. Use POSIX open()
     // since std.fs.cwd() is gone in Zig 0.17.
     var zpath: [std.fs.max_path_bytes + 1]u8 = undefined;
-    const z = try std.fmt.bufPrint(&zpath, "{s}\x00", .{"/tmp/mem3_test_corrupt.wal"});
+    const z = try std.fmt.bufPrint(&zpath, "{s}\x00", .{corrupt_path});
     const zslice = z[0 .. z.len - 1 :0];
     const flags: std.c.O = .{ .ACCMODE = .RDWR };
     const fd = std.c.open(zslice.ptr, flags, @as(std.c.mode_t, 0));

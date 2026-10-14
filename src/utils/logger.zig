@@ -49,11 +49,20 @@ pub fn writeJsonlLine(
             '\n' => try writer.writeAll("\\n"),
             '\r' => try writer.writeAll("\\r"),
             '\t' => try writer.writeAll("\\t"),
-            0...31 => try writer.print("\\u{x:0>4}", .{c}),
+            // Everything else in the C0 range, minus 9/10/13 which the
+            // named escapes above already claimed — naming them twice is a
+            // duplicate switch value, and Zig rejects the whole file for it.
+            0...8, 11...12, 14...31 => try writer.print("\\u{x:0>4}", .{c}),
             else => try writer.writeByte(c),
         }
     }
-    try writer.writeAll("\"}}\n");
+    // Close the `msg` string, then the object, then the record. This used
+    // to write `"}}\n` — two closing braces — so every JSONL line this
+    // function produced was malformed and a strict reader would reject the
+    // whole stream. The test that caught it had never run: `logger.zig`
+    // was reachable from `lib.zig`, which re-exports it, and a re-export
+    // does not register a file's `test` blocks with the runner.
+    try writer.writeAll("\"}\n");
 }
 
 test "writeJsonlLine: roundtrip a known message" {

@@ -25,6 +25,7 @@ const core_types = @import("../core/types.zig");
 const GoalStatus = core_types.GoalStatus;
 const GoalNode = @import("goal_node.zig").GoalNode;
 const errors = @import("../core/errors.zig");
+const Timer = @import("../platform/clock.zig").Timer;
 
 const log = std.log.scoped(.mem3_goal_tree);
 
@@ -589,4 +590,290 @@ test "GoalPoset: init survives OOM at every allocation site" {
         var poset = GoalPoset.init(failing.allocator());
         poset.deinit();
     }
+}
+
+// =============================================================================
+// Binding index: complexity, dedup, ordering, release
+// =============================================================================
+
+/// Best-of-`reps` nanoseconds per `bindMemcell` when filling one goal with
+/// `count` strictly increasing ids — the shape `Store.encodeAcrossLayers`
+/// produces, since it binds the id it just minted.
+///
+/// `std.heap.smp_allocator`, deliberately **not** `std.testing.allocator`:
+/// DebugAllocator captures a multi-frame stack trace on *every* allocation,
+/// which measures the allocator rather than the code under test (a no-op
+/// `Store.init`+`deinit` measures 1,320us under it and 11.8us under a plain
+/// allocator). Leak detection for these containers is the job of the
+/// `std.testing.allocator` test at the bottom of this section instead.
+fn bestBindNsPerOp(count: usize, reps: usize) !i128 {
+    const alloc = std.heap.smp_allocator;
+    var best: i128 = std.math.maxInt(i128);
+    var rep: usize = 0;
+    while (rep < reps) : (rep += 1) {
+        var poset = GoalPoset.init(alloc);
+        defer poset.deinit();
+        var next: std.atomic.Value(u64) = .init(1);
+        const goal_id = try poset.create("throughput", "d", null, 5, null, 0, &next);
+
+        // One untimed bind first, so the measurement covers growth rather
+        // than first-touch page faults on the list's initial pages.
+        try poset.bindMemcell(goal_id, 1);
+
+        var timer = Timer.start();
+        var filled: usize = 1;
+        while (filled < count) : (filled += 1) {
+            try poset.bindMemcell(goal_id, @intCast(filled + 1));
+        }
+        const per_op = @divTrunc(timer.elapsedNs(), @as(i128, @intCast(count - 1)));
+        if (per_op < best) best = per_op;
+    }
+    return best;
+}
+
+test "GoalPoset: bindMemcell is O(1) amortised, not O(k) per insert" {
+    // Fill one goal with 2,000 cells, then 16,000 -- an 8x larger corpus.
+    //
+    // Constant per-insert cost predicts the per-op time barely moves; the
+    // linear duplicate scan this replaced predicts it grows with the corpus,
+    // measured in Debug (best-of-3, this machine):
+    //
+    //     linear scan      1,953 ns/op ->  13,943 ns/op   ratio 6.9x
+    //     high_water fast     346 ns/op ->     359 ns/op   ratio 1.0x
+    //
+    // The bound is 3x, between those two predictions with room on both
+    // sides, and it is a *ratio* rather than a wall-clock threshold so a
+    // slow or contended machine cannot flip it -- only removing the fast
+    // path can.
+    _ = try bestBindNsPerOp(2_000, 3); // warm up: page in the code first
+    const small = try bestBindNsPerOp(2_000, 3);
+    const large = try bestBindNsPerOp(16_000, 3);
+    try std.testing.expect(large < small * 3);
+}
+
+test "GoalPoset: binding the same cell twice is a no-op on both bind paths" {
+    var poset = GoalPoset.init(std.testing.allocator);
+    defer poset.deinit();
+    var next: std.atomic.Value(u64) = .init(1);
+    const goal_id = try poset.create("dedup", "d", null, 5, null, 0, &next);
+
+    // Above the high-water mark: the O(1) fast path. Nothing can already
+    // be above the mark, so a repeat here is a real duplicate.
+    try poset.bindMemcell(goal_id, 10);
+    try poset.bindMemcell(goal_id, 20);
+    try poset.bindMemcell(goal_id, 30);
+    try std.testing.expectEqual(@as(usize, 3), poset.memcellsFor(goal_id).len);
+
+    // At or below the mark: the scan path, which is what actually has to
+    // reject the duplicate. Dropping this scan is the tempting "optimisation"
+    // that would silently reintroduce double bindings.
+    try poset.bindMemcell(goal_id, 20);
+    try poset.bindMemcell(goal_id, 10);
+    try poset.bindMemcell(goal_id, 30);
+    try std.testing.expectEqual(@as(usize, 3), poset.memcellsFor(goal_id).len);
+
+    // An absent id below the mark is still accepted, exactly once.
+    try poset.bindMemcell(goal_id, 25);
+    try poset.bindMemcell(goal_id, 25);
+    try std.testing.expectEqual(@as(usize, 4), poset.memcellsFor(goal_id).len);
+    try std.testing.expect(std.mem.indexOfScalar(u64, poset.memcellsFor(goal_id), 25) != null);
+
+    // Same guarantee per-goal, not per-poset: the same cell id on two
+    // goals is two bindings, and each keeps its own mark.
+    const other_id = try poset.create("other", "d", null, 5, null, 0, &next);
+    try poset.bindMemcell(other_id, 10);
+    try poset.bindMemcell(other_id, 10);
+    try std.testing.expectEqual(@as(usize, 1), poset.memcellsFor(other_id).len);
+    try std.testing.expectEqual(@as(usize, 4), poset.memcellsFor(goal_id).len);
+}
+
+test "GoalPoset: high_water stays an upper bound that removal never lowers" {
+    var poset = GoalPoset.init(std.testing.allocator);
+    defer poset.deinit();
+    var next: std.atomic.Value(u64) = .init(1);
+    const goal_id = try poset.create("mark", "d", null, 5, null, 0, &next);
+
+    try poset.bindMemcell(goal_id, 7);
+    try poset.bindMemcell(goal_id, 9);
+    try poset.bindMemcell(goal_id, 5); // below the mark -> scan path
+
+    // The invariant the fast path rests on: nothing in `ids` is above the
+    // mark. If this ever fails, the O(1) branch would admit a duplicate.
+    const slot = poset.memcell_index.getPtr(goal_id).?;
+    for (slot.ids.items) |id| try std.testing.expect(id <= slot.high_water);
+    try std.testing.expectEqual(@as(u64, 9), slot.high_water);
+
+    // Removing the highest bound must NOT lower the mark: a stale-high
+    // mark can only cost one extra scan, whereas a mark that tracked the
+    // removals would be one more thing that can drift from `ids`.
+    try poset.unbindMemcell(goal_id, 9);
+    try std.testing.expectEqual(@as(u64, 9), slot.high_water);
+
+    // Re-binding the now-absent 9 is a genuine new binding, not a
+    // duplicate -- and it arrives through the scan path, because 9 sits at
+    // the mark rather than above it.
+    try poset.bindMemcell(goal_id, 9);
+    try std.testing.expectEqual(@as(usize, 3), poset.memcellsFor(goal_id).len);
+
+    // Binding it a second time must be rejected there and then. This is
+    // the case the stale mark has to get right: the id is present, it is
+    // not above the mark, so only the scan can catch it.
+    try poset.bindMemcell(goal_id, 9);
+    try std.testing.expectEqual(@as(usize, 3), poset.memcellsFor(goal_id).len);
+    var occurrences: usize = 0;
+    for (poset.memcellsFor(goal_id)) |id| {
+        if (id == 9) occurrences += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), occurrences);
+
+    // ...while a genuinely new id below the stale mark is still accepted.
+    try poset.bindMemcell(goal_id, 8);
+    try std.testing.expectEqual(@as(usize, 4), poset.memcellsFor(goal_id).len);
+}
+
+test "GoalPoset: memcellsFor preserves binding order, empty and single cases" {
+    var poset = GoalPoset.init(std.testing.allocator);
+    defer poset.deinit();
+    var next: std.atomic.Value(u64) = .init(1);
+    const goal_id = try poset.create("ordered", "d", null, 5, null, 0, &next);
+
+    // A goal with no bindings at all: an empty slice, never null. Callers
+    // -- `staleGoals` (invariant c), http_server's memcell_count, the
+    // snapshot writer -- all read `.len` off this without a null check.
+    try std.testing.expectEqual(@as(usize, 0), poset.memcellsFor(goal_id).len);
+    try std.testing.expectEqual(@as(usize, 0), poset.memcellsFor(999_999).len);
+    try std.testing.expectEqual(@as(usize, 0), poset.memcellsFor(ROOT_GOAL_ID).len);
+
+    // Single element, bound out of ascending order on purpose: position 0
+    // is what `memcellsFor(gid)[0]` callers anchor on.
+    try poset.bindMemcell(goal_id, 4242);
+    try std.testing.expectEqual(@as(usize, 1), poset.memcellsFor(goal_id).len);
+    try std.testing.expectEqual(@as(u64, 4242), poset.memcellsFor(goal_id)[0]);
+
+    // Insertion order is the contract, not sort order: a lower id bound
+    // later still goes to the end.
+    try poset.bindMemcell(goal_id, 3);
+    try poset.bindMemcell(goal_id, 900);
+    try poset.bindMemcell(goal_id, 17);
+    const expected = [_]u64{ 4242, 3, 900, 17 };
+    try std.testing.expectEqualSlices(u64, &expected, poset.memcellsFor(goal_id));
+}
+
+test "GoalPoset: unbindMemcell removes one binding and keeps the rest in order" {
+    var poset = GoalPoset.init(std.testing.allocator);
+    defer poset.deinit();
+    var next: std.atomic.Value(u64) = .init(1);
+    const goal_id = try poset.create("unbind", "d", null, 5, null, 0, &next);
+    for ([_]u64{ 1, 2, 3, 4, 5 }) |id| try poset.bindMemcell(goal_id, id);
+
+    // Removing from the middle: `orderedRemove` shifts the tail down, so
+    // the survivors stay in binding order. (`swapRemove` would be O(1) but
+    // would move the last element into the hole -- a silent reordering of
+    // a slice callers read positionally, so the shift is the right trade.)
+    try poset.unbindMemcell(goal_id, 3);
+    const after_middle = [_]u64{ 1, 2, 4, 5 };
+    try std.testing.expectEqualSlices(u64, &after_middle, poset.memcellsFor(goal_id));
+
+    // Removing an id that is not bound changes nothing.
+    try poset.unbindMemcell(goal_id, 999);
+    try std.testing.expectEqualSlices(u64, &after_middle, poset.memcellsFor(goal_id));
+
+    // Unbinding every binding leaves an empty (not stale) slice, which is
+    // what lets the 7-day rule in `staleGoals` fire again.
+    for ([_]u64{ 1, 2, 4, 5 }) |id| try poset.unbindMemcell(goal_id, id);
+    try std.testing.expectEqual(@as(usize, 0), poset.memcellsFor(goal_id).len);
+}
+
+test "GoalPoset: unbindCellsEverywhere drops forgotten cells and keeps survivors ordered" {
+    var poset = GoalPoset.init(std.testing.allocator);
+    defer poset.deinit();
+    var next: std.atomic.Value(u64) = .init(1);
+    const busy_id = try poset.create("busy", "d", null, 5, null, 0, &next);
+    const thin_id = try poset.create("thin", "d", null, 5, null, 0, &next);
+    const empty_id = try poset.create("empty", "d", null, 5, null, 0, &next);
+
+    for ([_]u64{ 10, 20, 30, 40, 50 }) |id| try poset.bindMemcell(busy_id, id);
+    try poset.bindMemcell(thin_id, 20);
+    try poset.bindMemcell(thin_id, 40);
+
+    // With a corpus behind it, `busy_id` reads as covered by invariant (c)
+    // and is therefore never a candidate for the 7-day rule.
+    const horizon_ms: i64 = 1_000_000_000_000 + 8 * 86_400_000;
+    {
+        const stale_before = try poset.staleGoals(std.testing.allocator, horizon_ms);
+        defer std.testing.allocator.free(stale_before);
+        try std.testing.expect(std.mem.indexOfScalar(u64, stale_before, busy_id) == null);
+    }
+
+    // An empty sweep is a no-op, not an error: `Store.forget` calls this
+    // on every run, including the ones that forget nothing.
+    try poset.unbindCellsEverywhere(&.{});
+
+    // Ids that were never bound anywhere are likewise harmless.
+    try poset.unbindCellsEverywhere(&[_]u64{ 999, 1000 });
+
+    try poset.unbindCellsEverywhere(&[_]u64{ 20, 40, 50 });
+    const survivors = [_]u64{ 10, 30 };
+    try std.testing.expectEqualSlices(u64, &survivors, poset.memcellsFor(busy_id));
+    try std.testing.expectEqual(@as(usize, 0), poset.memcellsFor(thin_id).len);
+    // A goal that never had a binding is left alone rather than created.
+    try std.testing.expectEqual(@as(usize, 0), poset.memcellsFor(empty_id).len);
+
+    // `busy_id` still has survivors, so it still reads as covered. Only
+    // once the rest of the corpus is swept does invariant (c) stop
+    // counting it -- a goal must not read as covered by memories that
+    // were explicitly judged not worth keeping.
+    {
+        const stale_mid = try poset.staleGoals(std.testing.allocator, horizon_ms);
+        defer std.testing.allocator.free(stale_mid);
+        try std.testing.expect(std.mem.indexOfScalar(u64, stale_mid, busy_id) == null);
+    }
+
+    try poset.unbindCellsEverywhere(&survivors);
+    try std.testing.expectEqual(@as(usize, 0), poset.memcellsFor(busy_id).len);
+
+    {
+        const stale_after = try poset.staleGoals(std.testing.allocator, horizon_ms);
+        defer std.testing.allocator.free(stale_after);
+        try std.testing.expect(std.mem.indexOfScalar(u64, stale_after, busy_id) != null);
+    }
+}
+
+test "GoalPoset: deinit releases every binding container" {
+    // `BindingList` holds a heap list per goal, so this is the guard against
+    // an orphaned per-goal container in a daemon that never exits. Every
+    // shape the index can reach is built here: many goals, a single goal
+    // with a large list, one emptied by a forget sweep, and one emptied by
+    // `unbindMemcell`.
+    var poset = GoalPoset.init(std.testing.allocator);
+    var next: std.atomic.Value(u64) = .init(1);
+
+    var goal_ids: [8]u64 = undefined;
+    for (&goal_ids, 0..) |*slot, gi| {
+        slot.* = try poset.create("goal", "d", null, 5, null, 0, &next);
+        var cell: u64 = 0;
+        while (cell < @as(u64, gi) * 32 + 1) : (cell += 1) {
+            try poset.bindMemcell(slot.*, cell + @as(u64, gi) * 1_000);
+        }
+    }
+    try poset.unbindCellsEverywhere(&[_]u64{ 0, 1_000 });
+    try poset.unbindMemcell(goal_ids[0], 2);
+
+    // A goal with no bindings must not leave an empty container behind
+    // either, and the `put` in `bindMemcell` must not leak its own value.
+    const sparse_id = try poset.create("sparse", "d", null, 5, null, 0, &next);
+    try poset.bindMemcell(sparse_id, 77);
+    try poset.unbindMemcell(sparse_id, 77);
+
+    poset.deinit();
+}
+
+test "GoalPoset: bindMemcell surfaces a goal the poset does not hold" {
+    var poset = GoalPoset.init(std.testing.allocator);
+    defer poset.deinit();
+
+    // Binding must not silently create a reverse-index entry for a goal
+    // that does not exist -- that entry would count towards invariant (c).
+    try std.testing.expectError(errors.Error.GoalNotFound, poset.bindMemcell(4_242, 1));
+    try std.testing.expect(poset.memcell_index.count() == 0);
 }

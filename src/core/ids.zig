@@ -42,7 +42,7 @@ pub fn IdSource(comptime label: []const u8) type {
                 if (cur >= want) return;
                 if (self.next.cmpxchgWeak(cur, want, .monotonic, .monotonic)) |_| {
                     return;
-                } else |_| {}
+                } else {}
             }
         }
     };

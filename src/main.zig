@@ -110,6 +110,40 @@ comptime {
     // `?[]const u8` payload survived — the tests that would have caught it
     // were never run.
     _ = @import("utils/serializer.zig");
+
+    // Everything below was reachable from the library and therefore looked
+    // tested. It was not: 87 `test` blocks across these 19 files were
+    // compiled by nothing and run by nobody. `src/lib.zig` re-exports most
+    // of them, which is the trap — a `pub const` re-export pulls a file
+    // into the *build* but never registers its tests with the runner.
+    //
+    // This is not hypothetical. `ghw/goal_tree.zig` carried the tests for
+    // the goal-poset invariants, including the 7-day unrealized rule and
+    // the duplicate-bind guarantee, and none of them had ever run.
+    //
+    // Naming them is the only thing that works. The probe that proves it:
+    // rename a method call inside one of these tests to something that does
+    // not exist and confirm `zig build test` goes red. It stays green only
+    // for files that are not listed here.
+    _ = @import("core/types.zig");
+    _ = @import("core/memcell.zig");
+    _ = @import("core/ids.zig");
+    _ = @import("core/config.zig");
+    _ = @import("ghw/goal_tree.zig");
+    _ = @import("ghw/world_model.zig");
+    _ = @import("ghw/harness_registry.zig");
+    _ = @import("ghw/ghw_io.zig");
+    _ = @import("hypermem/engine.zig");
+    _ = @import("memory/tri_source_manager.zig");
+    _ = @import("memory/consolidator.zig");
+    _ = @import("memory/coherence.zig");
+    _ = @import("retrieval/hnsw.zig");
+    _ = @import("retrieval/embedder.zig");
+    _ = @import("retrieval/hybrid_retriever.zig");
+    _ = @import("utils/hashing.zig");
+    _ = @import("utils/time.zig");
+    _ = @import("utils/jsonl.zig");
+    _ = @import("utils/logger.zig");
 }
 
 const log = std.log.scoped(.mem3_main);
