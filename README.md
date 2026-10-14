@@ -6,7 +6,8 @@ mem3 is a memory store for AI agents, compiled into a single binary with no
 external dependencies. You give it short pieces of text; it tags each one with
 where it came from, writes it to an append-only log on disk, and keeps a search
 index in memory. It ships as one file that runs offline, on an edge box, or
-inside an embedded device.
+inside an embedded device — on macOS or Linux; see
+[Supported platforms](#supported-platforms).
 
 ```
 git clone <this repo> && cd mem3
@@ -43,9 +44,10 @@ zig build            # binaries land in zig-out/bin/
 ```
 
 `zig build` produces `mem3` (the CLI + daemon), `mem3-bench`, `mem3-longrun`,
-`notebook`, and `loadtest`. The default Debug build of `mem3` is **3,484,744
-bytes** and links only `libSystem` (both measured on this tree; optimised builds
-are considerably smaller).
+`mem3-hnsw-recall`, `mem3-forgetting-eval`, `notebook`, and `loadtest`. The
+default Debug build of `mem3` is **4,030,824 bytes** and `-Doptimize=ReleaseFast`
+is **798,904 bytes**; both link only `libSystem` (all measured on this tree,
+Apple M1 Pro / arm64).
 
 Artifacts:
 
@@ -54,8 +56,34 @@ Artifacts:
 | `zig-out/bin/mem3` | CLI and HTTP daemon |
 | `zig-out/bin/mem3-bench` | benchmark harness (see [Performance](#performance)) |
 | `zig-out/bin/mem3-longrun` | long-run lifecycle baseline (see [Long-run baseline](#long-run-baseline)) |
+| `zig-out/bin/mem3-hnsw-recall` | HNSW recall@10 vs exhaustive scan, per `ef` |
+| `zig-out/bin/mem3-forgetting-eval` | forgetting-sweep evaluation harness |
 | `zig-out/bin/notebook` | `zig build example-notebook` |
 | `zig-out/bin/loadtest` | `zig build example-loadtest` |
+
+### Supported platforms
+
+**macOS and Linux only.** Both `x86_64-linux-gnu` and `aarch64-linux-gnu`
+cross-compile the whole project clean — binary, library, examples and benchmarks.
+
+**Windows and WASM are refused at compile time**, with the reason named in the
+error rather than surfacing later as an unrelated type error:
+
+```
+src/lib.zig:23:9: error: mem3 supports macOS and Linux only. Windows needs a
+Winsock port of the HTTP daemon (src/server/http_server.zig binds raw POSIX
+sockets); WASM is deferred to v0.3.0.
+```
+
+The reason is the daemon: `src/server/http_server.zig` binds raw POSIX sockets
+(`socket`/`bind`/`listen`/`accept`) and locks a libc `pthread_mutex_t`.
+`std.Thread.Mutex` and `std.Thread.sleep` no longer exist in Zig 0.17, and
+`std.Io.Mutex` needs an `Io` instance the daemon does not carry, so there is no
+zero-port route to Windows. The library, CLI and benchmarks *were* ported and
+their Windows branches are still preserved in `src/platform/` — they are
+unreachable, untested and unmaintained, and their presence is not a
+compatibility guarantee. Full rationale and sync-impact report:
+[`docs/constitution-amendments/2026-10-14-platform-scope.md`](docs/constitution-amendments/2026-10-14-platform-scope.md).
 
 ## Quick start
 
@@ -85,8 +113,8 @@ D=/tmp/mem3-demo && mkdir -p $D
 
 ```
 added memory id=4
-added memory id=5
-{"id":6}
+added memory id=6
+{"id":7}
 ```
 
 `--source` accepts `matter`/`m`/`物`, `form`/`f`/`象`, `spirit`/`s`/`性`.
@@ -109,7 +137,7 @@ Read back what is on disk:
 
 ```
 goals (3):
-  id=1 name=general status=pending priority=5 memcells=0
+  id=1 name=general status=pending priority=5 memcells=2
   id=2 name=research status=pending priority=7 memcells=0
   id=3 name=system status=pending priority=6 memcells=0
 ```
@@ -124,9 +152,9 @@ then re-ranks by goal relevance and importance:
 
 ```
 query: "persistence layer" — 3 results
-  id=4 score=0.8573
-  id=5 score=0.0043
-  id=6 score=-0.2322
+  id=4 score=0.7793
+  id=6 score=0.0046
+  id=7 score=-0.2247
 ```
 
 Link two cells and run the lifecycle passes:
@@ -138,7 +166,7 @@ Link two cells and run the lifecycle passes:
 ```
 
 ```
-hyperedge added: id=7 type=causal nodes=2
+hyperedge added: id=8 type=causal nodes=2
 consolidate: abstracts_created=0
   cells: 3 -> 3
 forget: dry_run=false
@@ -198,13 +226,13 @@ mem3 <subcommand> [flags]
 | `add` | Encode and persist a MemCell | works |
 | `query` | Lexical recall over the live index | works |
 | `goal` | Add / list / status goals (`add`, `list`, `status`) | works; created goals are WAL-journaled |
-| `hyperedge` | Add / traverse hypergraph edges | works |
+| `hyperedge` | Add / list hypergraph edges, `multi-hop` traversal (`add`, `list`, `multi-hop`) | works |
 | `dump` | Export the whole store as JSONL | works |
-| `inspect` | Show a cell and its neighborhood | works, but its JSON is malformed (see limitations) |
+| `inspect` | Show a cell and its neighborhood | works |
 | `consolidate` | Run the consolidation pipeline | works |
 | `forget` | Existence-gain-driven forgetting sweep | works |
 | `serve` | Start the HTTP daemon | works |
-| `bench` | Run benchmarks | **stub — prints "not yet implemented"** |
+| `bench` | In-process smoke suite (see [Performance](#performance)) | works; the release gate is `zig build bench` |
 | `help`, `version` | Help text / version string | works |
 
 `add` flags: `--source`, `--episode` (`--ep`), `--facts`, `--foresight`,
@@ -242,11 +270,12 @@ Four layers, each justified by a decision record in [`docs/adr/`](docs/adr/):
   hyperedges, WAL, snapshot and index, built through one factory from
   `BuildOptions` (data dir, seed goals, embed dim, embedder kind).
 
-> The daemon does **not** use that `Store`. `src/server/http_server.zig` carries
-> its own duplicate `Store` struct so the server can run without the CLI's
-> dependency graph. The two have drifted: only the CLI's copy replays
-> `goal_create` records. This is a known duplication, not a design choice, and
-> it is the direct cause of the `/api/goals` gap under [Status and limitations](#status-and-limitations).
+> The daemon **does** use that `Store`. `src/server/http_server.zig` used to
+> carry its own ~890-line duplicate so the server could run without the CLI's
+> dependency graph; that fork is deleted and the daemon now calls
+> `mem3_store.Store` directly. One implementation, two surfaces. The
+> `/api/goals` gap this duplication caused is closed — see
+> [HTTP API](#http-api).
 
 ## HTTP API
 
@@ -279,46 +308,48 @@ curl http://127.0.0.1:7791/api/memcells
 curl -X POST http://127.0.0.1:7791/api/query -d '{"text":"zig","topk":3}'
 ```
 
-The daemon replays the WAL on startup, so cells added in a prior process are
-visible over HTTP. Goals added by `mem3 goal add` are not — see limitations.
+The daemon replays the WAL on startup, so both cells **and goals** added in a
+prior process are visible over HTTP — a goal created by `mem3 goal add` in one
+process appears in `/api/goals` in the next. (Verified: a goal added to a fresh
+data dir shows up as `{"id":4,"name":"crossproc",...}` after the daemon starts.)
 
 ## Performance
 
 Every figure below was printed by `zig build bench` on the current tree, on an
-Apple M1 Pro (10-core, macOS 26.6.2), `seed=42 cells=1000 queries=400`, built
+Apple M1 Pro (arm64, macOS 26.6.2), `seed=42 cells=1000 queries=400`, built
 `ReleaseFast`. The harness reports min / median / p95 over many repetitions with
 warmup discarded, and writes the raw run to `bench-results.json` (gitignored)
 alongside the params and timestamp.
 
 | Benchmark | median | p95 |
 |---|---|---|
-| `hashing.combine` | 1.0 ns/op | 2.0 ns |
+| `hashing.combine` | 1.0 ns/op | 1.0 ns |
 | `hashing.xxh3_64bits` | 6.0 ns/op | 6.0 ns |
-| `encoder.encode` | 15.0 ns/op | 15.0 ns |
-| `time.formatIso8601` | 26.0 ns/op | 27.0 ns |
-| `serializer.roundtrip` | 32.6 µs | 40.9 µs |
-| `hnsw.insert` | 0.18 ms/op | 0.37 ms |
-| `hnsw.search` | 0.31 ms/op | 0.53 ms |
-| `store.addRaw_memory` | 0.21 ms/op | 0.34 ms |
-| `store.addRaw_durable` | 0.37 ms/op | 0.51 ms |
-| `wal.append_durable` | 1.03 ms/record | 1.16 ms |
+| `encoder.encode` | 30.0 ns/op | 35.0 ns |
+| `time.formatIso8601` | 33.0 ns/op | 35.0 ns |
+| `serializer.roundtrip` | 25.4 µs | 26.7 µs |
+| `store.addRaw_memory` | 485.8 µs | 613.6 µs |
+| `store.addRaw_durable` | 576.6 µs | 658.1 µs |
+| `hnsw.insert` | 1.06 ms/op | 1.29 ms |
+| `hnsw.search` | 890.5 µs/op | 901.6 µs |
+| `wal.append_durable` | 828.0 µs/record | 969.0 µs |
+
+These are single-run figures on one machine, not regression gates. Re-run them
+before quoting.
 
 Run it yourself:
 
 ```bash
 zig build bench
-./zig-out/bin/mem3-bench --cells=20000 --queries=2000 --seed=7
+./zig-out/bin/mem3-bench --cells=1000 --queries=400 --seed=42
 ```
 
-Two of these numbers moved a lot when the `ef` budget bug was fixed, and the
-reasoning is worth stating so the figure is not over-read. The beam search used
-to decrement its `ef` budget only inside the neighbour loop, so `break` left the
-inner loop while the outer loop kept going; the budget could reach zero and
-underflow. It is now gated on candidate-set size, which is what `ef` means and
-cannot underflow. `hnsw.search` is consequently bounded by the `ef` budget
-(`hnsw_ef_search` = 100) rather than by corpus size — though the harness's own
-output still labels it "brute-force TopK", which is now out of date. Treat these
-as order-of-magnitude indicators, not regression gates.
+The `ef` budget bug that used to make beam search sample instead of navigate is
+fixed: the budget is now gated on candidate-set size, which is what `ef` means,
+and cannot underflow. `hnsw.search` is bounded by the `ef` budget
+(`hnsw_ef_search` = 100) rather than by corpus size. The harness labels it
+"top-10 cosine search over the shipped HNSW beam search (greedy descent +
+ef-bounded expansion)" — the older "brute-force TopK" label is gone.
 
 `hashing.combine` was rewritten from an `init`/`update`/`final` streaming chain
 to a one-shot hash over a 16-byte stack buffer. The old streaming path is
@@ -327,8 +358,13 @@ is pinned by a test asserting the exact output bits
 (`0x188e414c9e25e9af` for `(0x1234, 0x5678)`), so the speedup could not have
 changed any chained key or WAL checksum.
 
-One caveat the benchmark states itself: `wal.append_durable` fsyncs on every
-record, which is what sets the write floor.
+Two caveats the benchmark states itself: `wal.append_durable` fsyncs on every
+record, which is what sets the write floor; and `hnsw.search` grows with the
+corpus, so do not quote it as graph-index performance.
+
+`hnsw.insert` at ~1.06 ms/op amortised is the dominant cost in the write path —
+larger than the WAL fsync, and larger than the whole `store.addRaw_durable`
+pipeline it sits inside. See [Known misses](#known-misses).
 
 ## Long-run baseline
 
@@ -393,16 +429,26 @@ extends the file on the next run.
 ## Testing
 
 ```bash
-zig build test                # 95 tests (68 + 27), 0 leaks
-zig build check-constitution  # 11 constitution invariants
+zig build test                # 276 tests (193 + 83), 0 leaks
+zig build check-constitution  # 12 constitution invariants
 zig build bench
 ```
 
 `zig build test` runs two binaries — one rooted at `src/main.zig` (transitively
 collects Store and CLI tests) and one at `tests/main.zig` (unit, integration and
 property tests under `tests/`). The counts above are what the two binaries
-actually report: `All 68 tests passed.` and `All 27 tests passed.`
-`zig build check-constitution` reports `11/11 tests passed`.
+actually report: `All 193 tests passed.` and `All 83 tests passed.`
+`zig build check-constitution` is a separate root, `tests/constitution/main.zig`,
+and reports `All 12 tests passed.`
+
+Because `zig build test` re-runs are served from the build cache and report green
+without re-executing, drive the roots directly when you need a real count:
+
+```bash
+zig test --dep mem3 -Mroot=src/main.zig  -Mmem3=src/lib.zig   # -> All 193 tests passed.
+zig test --dep mem3 -Mroot=tests/main.zig -Mmem3=src/lib.zig   # -> All 83 tests passed.
+zig test --dep mem3 -Mroot=tests/constitution/main.zig -Mmem3=src/lib.zig  # -> All 12 tests passed.
+```
 
 ### Test-suite rules
 
@@ -432,30 +478,72 @@ Known and measured, not discovered after the fact:
   unimplemented.
 - **Switching embedders invalidates a persisted index.** Vectors are not
   persisted, only ids and graph topology — see [Retrieval](#retrieval).
-- **`GET /api/goals` does not see goals from another process.** The endpoint is
-  fixed and walks the live poset, but the daemon's duplicated `Store` only
-  replays `memcell_insert` records. A goal added by `mem3 goal add` shows up in
-  `mem3 goal list` but not over HTTP until it is recreated in-process.
-- **`mem3 inspect` emits invalid JSON.** It closes the cell object and then
-  appends `,"neighborhood":[…]` without reopening a brace, so the output will
-  not parse. `dump` is the reliable way to read a cell back.
-- **`--foresight` does not survive the WAL round-trip.** A cell added with only
-  `--foresight` comes back from `dump` with `"foresight":[]` and a placeholder
-  goal id of `0`, so its spirit dimension is lost on restart.
-- **HNSW is not yet a real graph index.** The layered structure is built and
-  navigated, but search is a bounded beam over neighbour lists, not the layered
-  descent a production HNSW uses. A 400-node regression test guards the `ef`
-  budget, and the corpus used for the benchmark above is 1000 vectors — say
-  nothing about a large index.
-- **The WAL fsyncs on every record**, costing ~1.03 ms per durable append. There
+- **`--foresight` is accepted and discarded.** The cell is written without it;
+  the CLI now says so at encode time (`warning: --foresight is not yet stored;
+  it is absent from the WAL record and from the committed cell.`), and `dump`
+  returns `"foresight":[]` with a placeholder goal id of `0`, so a
+  foresight-only cell loses its spirit dimension.
+- **HNSW is a real graph index, but a shallow one.** The layered structure is
+  built and searched by greedy descent with `ef`-bounded expansion, not
+  sampled. Measured recall@10 against an exhaustive scan on a 400-node corpus
+  (`mem3-hnsw-recall`): **0.566 @ ef=10, 0.758 @ ef=100, 0.772 @ ef=400**, with
+  `max_level=2`. The layers are populated (level 0: 400 nodes avg degree 28.47;
+  level 1: 34 nodes; level 2: 4 nodes), so the hierarchy is real but two levels
+  deep, and recall has not saturated at the default `ef`. Say nothing about a
+  large index.
+- **The WAL fsyncs on every record**, costing ~828 µs per durable append. There
   is no group commit.
+- **The daemon's HTTP stack is POSIX-only.** Raw `socket`/`bind`/`listen`/
+  `accept` and a libc `pthread_mutex_t`; this is the stated reason Windows is
+  not a supported target. See [Supported platforms](#supported-platforms).
+- **The daemon is silent by default.** `mem3 serve` prints an 8-line startup
+  banner to stderr and then logs nothing per cycle unless a maintenance pass or
+  forgetting sweep actually transitions something. This is deliberate: a
+  launchd-managed daemon writing per-cycle lines costs ~1.5 GB/day of logs.
 - **Consolidation is not demonstrated to reach steady state.** The harness is
   built to measure it and reports a first-decile-vs-last-decile verdict, but no
-  long run has been recorded here, so no convergence claim is made.
-- **`mem3 bench` is a stub** and prints "not yet implemented". The real
-  benchmark is `zig build bench`.
+  long run is recorded here, so no convergence claim is made.
+- **`mem3 bench` is a fast in-process smoke suite, not the gate.** It is
+  implemented (600 cells, 200 hyperedges, in-memory, finishes in ~0.6 s
+  optimised). The release-blocking constitutional gates are `zig build bench`.
 - **No published benchmarks, no external users, no stability guarantee.**
   Version is `0.1.0-alpha`; treat the on-disk format as unstable.
+
+### Known misses
+
+Two constitutional targets are not met. They are stated here because a document
+that hides them is worse than one that publishes them.
+
+**Write throughput is ~5× short of target.** The release target is 10,000
+cells/sec. Measured `memcell_write_throughput` on a 600-cell in-memory corpus:
+**192.1 cells/sec** in the default Debug build, **1,810.5 cells/sec**
+`ReleaseFast`. The cause is **HNSW insert, not fsync**: `hnsw.insert` costs
+~1.06 ms/op amortised, which is larger than the ~828 µs WAL fsync and larger than
+the whole `store.addRaw_durable` pipeline. Group commit would not move this
+number; a cheaper insert path would.
+
+**LongMemEval is 0.646 core / 0.000 padded, and the embedder is the ceiling.**
+Run `./zig-out/bin/mem3-bench longmemeval`. This is an **offline
+re-implementation of the LongMemEval protocol, not the official benchmark** — a
+locally generated case set, a deterministic surface reader, no LLM judge, no
+network. The output says so in a `disclaimer` field every run. Against the
+constitutional ≥80% target it reports `met_target: false`.
+
+| Configuration | Cells | combined accuracy (answerable) | retrieval hit rate |
+|---|---|---|---|
+| core, no distractor padding | 144 | **0.6458** | 0.8542 |
+| quarter padding | 1,144 | **0.0000** | 0.0000 |
+| full padding | 4,144 | **0.0000** | 0.0000 |
+
+`exhaustive_nn_hit_rate` is **0.6042 and identical across all four
+configurations**, including the hypergraph-disabled control. That control is
+index-independent: it scores whether the gold cell is the exact cosine nearest
+neighbour over every indexed vector. It does not move when the index changes, so
+the failure is upstream of HNSW — **`lexical_hash` never placed the question and
+its answer in the same neighbourhood.** The retrieval layer is not the
+bottleneck here; the embedder is. Swapping the embedder is the only change that
+moves this number, and no semantic embedder ships yet (`.onnx_external` is
+reserved and panics).
 
 ## License
 
@@ -468,7 +556,9 @@ you need to use mem3, open an issue asking which license to apply.
 | Document | Contents |
 |---|---|
 | [`AGENTS.md`](AGENTS.md) | Project status, conventions, file map, roadmap |
+| [`docs/roadmap.md`](docs/roadmap.md) | What is deferred, why, and what it would cost |
 | [`docs/adr/`](docs/adr/) | Four decision records: ontology, GHW mapping, HNSW, WAL |
+| [`docs/constitution-amendments/2026-10-14-platform-scope.md`](docs/constitution-amendments/2026-10-14-platform-scope.md) | Why Windows and WASM are refused at compile time |
 | [`docs/releases/v0.1.0-alpha.md`](docs/releases/v0.1.0-alpha.md) | Original release notes — **their performance claims are unmeasured and contradicted by `zig build bench`; ignore the numbers there** |
 | [`bench/main.zig`](bench/main.zig) | The benchmark harness and its honesty rules |
 | [`examples/longrun.zig`](examples/longrun.zig) | The long-run lifecycle baseline harness |

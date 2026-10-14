@@ -14,16 +14,20 @@
 | Build | `zig build` → one binary, < 10MB, zero external runtime deps |
 | Theory | 三源合恰论 (物/象/性) + GHW 范式 (Goal/Harness/World) |
 | Spec-kit | Initialized; spec at `specs/001-trisource-everos-mvp/` |
-| Status | **v0.2.0** (CLI + persistence + 78 tests, cold-tree verified). All 7 constitutional principles active. |
+| Platforms | **macOS and Linux only** — Windows and WASM refused at compile time (see [Platforms](#platforms)) |
+| Status | **v0.1.0-alpha** (CLI + persistence + 276 tests + 12 constitution invariants, all measured). All 7 constitutional principles active. |
 
 ## Read Order for New Agents
 
 1. **This file** (you are here)
 2. `README.md` — what the project is in 1 minute
-3. `dev.md` — engineering blueprint, Zig 0.17 idioms, 12-week roadmap
-4. `ghw_memory_system.agent.final.md` — formal theory paper
-5. `三源合恰论.docx` (reference) — foundational ontology
-6. `.specify/memory/constitution.md` — **the 7 principles (law)**
+3. `docs/roadmap.md` — what is deferred, why, and what it would cost
+4. `dev.md` — engineering blueprint and the 12-week plan. **It is a design
+   document, not a status report**: its forward-looking sections describe
+   intended architecture and have not been re-audited against the current
+   source. Verify anything you rely on against `src/`.
+5. `ghw_memory_system.agent.final.md` — formal theory paper
+6. `.specify/memory/constitution.md` — **the 7 principles (law), v1.1.0**
 7. `specs/001-trisource-everos-mvp/spec.md` — what we're building
 8. `specs/001-trisource-everos-mvp/plan.md` — how we're building it
 9. `specs/001-trisource-everos-mvp/data-model.md` — type definitions
@@ -38,9 +42,9 @@ The 7 principles (in order of importance):
 1. **三源完整性 (Tri-Source Integrity)** — every memory MUST have a 物/象/性 source tag. No untyped memories. Reject at encoding time.
 2. **GHW 三层耦合 (Goal-Harness-World)** — three layers, no cross-layer shortcuts. Each module declares its layer in file-level doc-comment.
 3. **存在增益驱动 (Existence-Gain-Driven Lifecycle)** — encoding/consolidation/retrieval/forgetting all driven by the existence-gain metric, not by capacity/TTL.
-4. **零依赖 + Zig 0.17 (Zero-Dependency Native)** — no FAISS, no Neo4j, no Redis, no SQLite, no libc wrappers, no external async runtime. Single binary, cross-compile.
+4. **零依赖 + Zig 0.17 (Zero-Dependency Native)** — no FAISS, no Neo4j, no Redis, no SQLite, no libc wrappers, no external async runtime. Single binary, cross-compiled to macOS and Linux. Windows and WASM are refused at compile time with a stated reason.
 5. **零拷贝 + 编译时零开销 (Zero-Copy + Comptime Zero-Overhead)** — comptime-generated serialization, explicit allocator injection, no runtime reflection.
-6. **测试优先 + 形式化保证 (Test-First + Formal Guarantees)** — tests written BEFORE implementation. Three constitution invariants tested on every PR.
+6. **测试优先 + 形式化保证 (Test-First + Formal Guarantees)** — tests written BEFORE implementation. The constitution invariants (now 12) are tested on every PR as a separate gate.
 7. **可观测性 + 单二进制调试 (Observability + Single-Binary Debugging)** — structured logs, /metrics endpoint, dump/inspect commands, silent-by-default for long-running modes.
 
 **Read `.specify/memory/constitution.md` for the full text.**
@@ -54,7 +58,7 @@ The 7 principles (in order of importance):
 - **No allocator state in globals**. Pass `Io` runtime explicitly to async functions.
 - **Comments**: explain WHY, not WHAT. Code is read more than written.
 
-## File Map (v0.2.0 actual)
+## File Map (v0.1.0-alpha actual)
 
 ```
 src/
@@ -71,50 +75,58 @@ src/
 ├── server/                   # HTTP daemon: http_server, routes, handlers/, middleware,
 │                             #   web_index.html
 ├── utils/                    # Cross-cutting: serializer, allocator, time, logger, jsonl,
-│                             #   hashing, hashing, mod
+│                             #   hashing, mod
+├── platform/                 # The compile-time portability layer: fs, clock, stdio, env.
+│                             #   Refuses windows/wasi/freestanding at compile time.
 ├── store/                    # SHARED Store abstraction: CLI + HTTP server both call this.
 │                             #   Owns WAL + snapshot + HNSW + HyMem + GoalPoset + lifecycle.
-│                             #   One implementation, two surfaces.
+│                             #   One implementation, two surfaces. (The daemon's ~890-line
+│                             #   fork is deleted; it calls mem3_store.Store directly.)
 └── cli_commands/             # CLI subcommand implementations (one .zig per subcommand)
     ├── cli_common.zig        # POSIX-write helpers (println/eprintln/fatal/appendFmt)
     ├── add.zig               # Encode + WAL-append a MemCell
     ├── query.zig             # Three-way recall with GHW-prioritized ranking
-    ├── goal.zig              # Manage the Goal Poset (add/list/delete)
-    ├── hyperedge.zig         # Manage hypergraph edges
+    ├── goal.zig              # Manage the Goal Poset (add/list)
+    ├── hyperedge.zig         # Manage hypergraph edges (add/list/multi-hop)
     ├── dump.zig              # Export the full store as JSONL
     ├── inspect.zig           # Show a MemCell + its hypergraph neighborhood
     ├── consolidate.zig       # Run the consolidation pipeline
-    └── forget.zig            # Run the existence-gain-driven forgetting sweep
+    ├── forget.zig            # Run the existence-gain-driven forgetting sweep
+    ├── serve.zig             # Start the HTTP daemon
+    └── bench.zig             # Fast in-process smoke suite (NOT the release gate)
 
-tests/                        # v0.2.0 added these three test trees
+tests/
 ├── main.zig                  # Master test runner (comptime-imports everything)
-├── unit/                     # Algorithm-level unit tests (coherence, consolidator, hnsw)
-├── integration/              # End-to-end through Store + HTTP server
-│   ├── store_persistence_e2e.zig   # 5 tests: insert5, goal, snapshot+replay,
-│   │                              #   forget+restart, in-memory isolation
-│   └── http_server_e2e.zig         # 3 tests: /healthz, POST/GET /api/memcells,
-│                                  #   server restart preservation (POSIX fork+exec)
-└── property/                 # Randomized round-trip coverage
-    └── serializer_roundtrip.zig    # 32-iter random Fact slice, primitives, array of struct
+├── unit/                     # cli, coherence, consolidator, hnsw
+├── integration/
+│   ├── store_persistence_e2e.zig   # insert, goal, snapshot+replay, forget+restart, isolation
+│   └── http_server_e2e.zig         # /healthz, POST+GET /api/memcells, restart preservation
+├── property/                 # Randomized round-trip coverage
+│   ├── serializer_roundtrip.zig    # Fact slice, primitives, array of struct
+│   └── adjoint.zig                 # every encoded record decodes back; replay is idempotent
+└── constitution/             # Separate gate, run via `zig build check-constitution`
+    ├── main.zig, source_tag.zig, spirit_dim.zig, goal_coverage.zig
 ```
 
-## v0.2.0 — What Works
+## v0.1.0-alpha — What Works
 
 | Surface | Status | Notes |
 |---|---|---|
 | `mem3 add` | ✅ | Encode + WAL-append a MemCell (validated by constitution tests) |
 | `mem3 query` | ✅ | Three-way recall with GHW-prioritized ranking |
-| `mem3 goal` | ✅ | Add/list/delete goals; default seeds (general/research/system) |
-| `mem3 hyperedge` | ✅ | Add/inspect hypergraph edges |
+| `mem3 goal` | ✅ | Add/list goals; default seeds (general/research/system); created goals are WAL-journaled |
+| `mem3 hyperedge` | ✅ | `add` / `list` / `multi-hop` |
 | `mem3 dump` | ✅ | JSONL export of the full store |
-| `mem3 inspect` | ✅ | MemCell + hypergraph neighborhood |
+| `mem3 inspect` | ✅ | MemCell + hypergraph neighborhood; emits valid JSON |
 | `mem3 consolidate` | ✅ | HAC clustering, abstract generation, PCR preserved |
 | `mem3 forget` | ✅ | Existence-gain-driven forgetting sweep |
+| `mem3 bench` | ✅ | Fast in-process smoke suite; the release gate is `zig build bench` |
 | `mem3 serve` | ✅ | HTTP daemon with /healthz /metrics /api/sync /api/memcells /api/memcells/:id |
 | Persistence | ✅ | WAL-first + snapshot. WAL truncated on sync. |
-| Tests | ✅ | 78 total: 52 (`src/main.zig`-rooted, which already includes the 11 constitution tests) + 26 (`tests/main.zig`-rooted), 0 leaks |
-| Binary | ✅ | 3.3 MB stripped, only links libSystem |
-| Toolchain | ✅ | Pinned via `.zigversion` (Zig 0.17.0). Tested on a cold tree: `zig build`, `zig build test`, `zig build check-constitution` all exit 0 |
+| Tests | ✅ | 276: 193 (`src/main.zig`-rooted) + 83 (`tests/main.zig`-rooted), plus 12 constitution invariants as a separate gate, 0 leaks |
+| Binary | ✅ | 798,904 bytes `ReleaseFast` / 4,030,824 bytes Debug, only links libSystem |
+| Toolchain | ✅ | Pinned via `.zigversion` (Zig 0.17.0) |
+| Platforms | ✅ | macOS + Linux (x86_64 and aarch64). Windows/WASM refused at compile time — see [Platforms](#platforms) |
 
 **Test-suite rules (learned the hard way — do not regress these):**
 1. **A library must never write to stderr.** `zig build test` runs each test binary with `--listen=-`; any stderr write from inside a test desynchronises the runner↔build protocol and the binary dies with `failed command`. `src/main.zig` and `tests/main.zig` therefore set `std_options.log_level = .err`, and all persistence logging goes through `std.log`, never `std.debug.print`.
@@ -122,33 +134,47 @@ tests/                        # v0.2.0 added these three test trees
 3. **The test step depends on the install artifact**, because the e2e tests exec `zig-out/bin/mem3`.
 4. **Tests must not write inside the repo.** All scratch paths live under `/tmp`.
 5. **Verify the gate actually fails.** Inject a deliberately failing test and confirm `zig build test` exits non-zero — a green gate that cannot go red is worse than no gate.
+6. **A new test root must be reachable from `src/main.zig` or `tests/main.zig`.** `src/utils/serializer.zig` sat outside the gate for a long time: its tests had never run, and a `sizeOf` defect that silently dropped every `?[]const u8` payload survived because of it. A test that is not imported by a root is not a test.
 
 **Known limitations tracked for v0.2.1:**
-- Goal create doesn't write to WAL — only default seed goals survive restart (TODO in `src/storage/snapshot.zig:collectGoals`).
-- Goal create path's "personal" example test was adjusted to assert seed goals only; user-created goals are WAL-only.
-- `parseInsertPayload`'s `source` field defaults to "matter" — by design (encoder rejects spirit-dim-missing at constitution test, but the raw parser is permissive).
+- `--foresight` is accepted and discarded. The CLI warns at encode time; the
+  cell is written without it, so a foresight-only cell loses its spirit
+  dimension across a restart.
+- Write throughput is ~5× short of the 10,000 cells/sec release target: 192
+  cells/sec Debug, 1,810 cells/sec ReleaseFast on a 600-cell in-memory corpus.
+  The cause is `hnsw.insert` (~1.06 ms/op amortised), not the WAL fsync
+  (~828 µs/record).
+- LongMemEval offline reimplementation: 0.646 on the core set, 0.000 padded,
+  against a ≥80% target. `exhaustive_nn_hit_rate` is 0.604 and invariant across
+  configurations, so `lexical_hash` — not the HNSW retrieval layer — is the
+  ceiling.
 
 ## Development Workflow
 
 1. **Read the task** in `specs/001-trisource-everos-mvp/tasks.md`. Each task has an ID (T001, T002, ...) and a [Story] label.
 2. **Write the test first** (TDD, Constitution VI). Run it, verify it fails.
 3. **Write the minimum implementation** to make the test pass.
-4. **Run `zig build test`** to verify no regressions. The three constitution tests MUST stay green.
+4. **Run `zig build test` and `zig build check-constitution`** to verify no regressions. All 12 constitution invariants MUST stay green.
 5. **Commit** with `type(scope): subject` format. Examples:
    - `feat(hypermem): implement multi-hop traversal with confidence threshold`
    - `fix(serializer): correct nested slice handling for HyperEdge.source_weights`
    - `test(constitution): add spirit-dim invariant test`
 6. **Run `zig build bench`** if your change touches the hot path (HNSW, HybridRetriever, LSMStore, HTTP server). Compare against the Constitution §Performance Standards.
-7. **Open a PR**. The CI step will:
-   - Run `zig build test` (must be green)
-   - Run `zig build bench` (must meet gates; aspirational gates may be deferred)
-   - Check `ldd zig-out/bin/mem3` for new shared library deps (Constitution IV violation = blocked)
-   - Grep for forbidden patterns: `linkSystemLibrary`, `std.ArrayList(T).init(...)` with global allocator, `std.json.Parse` (use our `comptime` JSON instead)
+7. **Open a PR**. CI (`.github/workflows/ci.yml`, `ubuntu-latest`) will:
+   - Run `zig build`, `zig build test`, `zig build check-constitution` (must be green)
+   - Run `zig build bench` as a **smoke step only** — machine-dependent, `continue-on-error`, never a gate
+   - Assert the working tree is clean after tests (catches tests writing into the repo)
+   - Inject a failing test and assert `zig build test` goes non-zero — the permanent guard against a gate that cannot fail
+   - Check `ldd zig-out/bin/mem3` on Linux / `otool -L` on macOS for new shared library deps (Constitution IV violation = blocked)
 
 ## Common Pitfalls (from project history)
 
 1. **Don't pull in FAISS / HNSWlib / Neo4j / Redis / SQLite** — zero-dep Constitution IV violation. Implement HNSW, hypergraph, KV, WAL in-tree.
-2. **Don't use `std.Thread.Mutex` in Zig 0.17** — it doesn't exist. Use `std.Io.Mutex` and pass `io` explicitly.
+2. **Don't use `std.Thread.Mutex` in Zig 0.17 — it doesn't exist.** Neither
+   does `std.Thread.sleep`. `std.Io.Mutex` is the replacement, but it requires
+   an `Io` instance; the daemon doesn't carry one, so `src/server/http_server.zig`
+   locks a libc `std.c.pthread_mutex_t` instead. Pick per call site, and don't
+   assume the std path is available.
 3. **Don't log to stdout in long-running modes** — per dev.md lessons-learned: silent by default, `--log-every N` for periodic summaries, log rotation external.
 4. **Don't introduce a new external dependency without a Constitution amendment** — raise it in the PR, do not silently add.
 5. **Don't return `null` for fallible operations** — use tagged error unions. `null` is for absence-of-value, not for errors.
@@ -157,16 +183,49 @@ tests/                        # v0.2.0 added these three test trees
 
 ## Performance Gates (release-blocking)
 
-| Metric | Target |
-|---|---|
-| MemCell write throughput | ≥ 1K/sec MVP / 10K/sec release |
-| Top-10 query P95 | < 50ms MVP / < 10ms release (100K corpus) |
-| HNSW build 100K vectors | < 30s |
-| 3-hop traversal | < 5ms (1K seeds) |
-| Cold-start | < 200ms |
-| RSS at 100K cells | < 500MB |
-| Binary size | < 10MB stripped |
-| External deps (ldd) | 0 |
+Measured figures are from `mem3 bench` (ReleaseFast, 600-cell in-memory corpus)
+and `mem3-bench longmemeval` on an Apple M1 Pro. Anything marked **MISS** is a
+real gap, not a rounding error.
+
+| Metric | Target | Measured | |
+|---|---|---|---|
+| MemCell write throughput | ≥ 1K/sec MVP / 10K/sec release | 192/sec Debug, 1,810/sec ReleaseFast | **MISS** |
+| Top-10 query P95 | < 50ms MVP / < 10ms release (100K corpus) | 0.624 ms p95 (600-cell corpus) | not comparable — wrong corpus size |
+| HNSW build 100K vectors | < 30s | not measured at 100K | **UNVERIFIED** |
+| 3-hop traversal | < 5ms (1K seeds) | 0.000 ms/seed | pass |
+| Cold-start | < 200ms | 0.077 ms | pass |
+| RSS at 100K cells | < 500MB | not measured at 100K | **UNVERIFIED** |
+| Binary size | < 10MB stripped | 798,904 bytes ReleaseFast | pass |
+| External deps (ldd) | 0 | `otool -L` lists only `libSystem` | pass |
+| LongMemEval accuracy | ≥ 80% | 0.646 core / 0.000 padded (offline reimplementation) | **MISS** |
+
+The write-throughput miss is **HNSW insert**, not fsync: `hnsw.insert` is
+~1.06 ms/op amortised, above the ~828 µs WAL fsync and above the whole
+`store.addRaw_durable` pipeline. Group commit would not move it.
+
+The LongMemEval miss is **`lexical_hash`**, not retrieval:
+`exhaustive_nn_hit_rate` is 0.604 and identical across the core, quarter-padded,
+full-padded and hypergraph-disabled runs, and that control is index-independent.
+
+## Platforms
+
+**macOS and Linux only.** `x86_64-linux-gnu` and `aarch64-linux-gnu` both
+cross-compile the whole project clean. Windows and WASM are refused at compile
+time by `src/lib.zig` and `src/platform/fs.zig`, each naming the reason:
+
+- **Windows** — `src/server/http_server.zig` binds raw POSIX sockets
+  (`socket`/`bind`/`listen`/`accept`) and locks a libc `pthread_mutex_t`.
+  Windows needs Winsock (`ws2_32`), a different mutex and a different clock
+  story. The library, CLI and benchmarks *were* ported; their Windows branches
+  remain in `src/platform/` as unreachable, untested, unmaintained code — a
+  record of completed work and a one-line re-enable, **not** a compatibility
+  guarantee.
+- **WASM** — deferred to v0.3.0 by the existing scope boundary. WASI's open
+  flags do not match the POSIX `ACCMODE` layout the platform layer assumes, and
+  wasm32's 64-bit atomics need the threads feature.
+
+Rationale and the full sync-impact report:
+[`docs/constitution-amendments/2026-10-14-platform-scope.md`](docs/constitution-amendments/2026-10-14-platform-scope.md).
 
 ## Reference Architecture Decision Records
 
@@ -187,7 +246,8 @@ This project uses GitHub's spec-kit workflow. Key commands (via `specify` CLI or
 - `/speckit-implement` — execute the tasks
 
 The current spec-kit artifacts:
-- `.specify/memory/constitution.md` (v1.0.0)
+- `.specify/memory/constitution.md` (**v1.1.0** — platform scope; see
+  [`docs/constitution-amendments/2026-10-14-platform-scope.md`](docs/constitution-amendments/2026-10-14-platform-scope.md))
 - `specs/001-trisource-everos-mvp/spec.md` (DRAFT)
 - `specs/001-trisource-everos-mvp/plan.md` (ready for implementation)
 - `specs/001-trisource-everos-mvp/data-model.md` (ready for implementation)
@@ -198,19 +258,29 @@ The current spec-kit artifacts:
 ## Testing
 
 ```bash
-# All tests (89 total: 52 main + 11 constitution + 26 e2e/unit/property)
+# All tests: 276 (193 src/main.zig-rooted + 83 tests/main.zig-rooted)
 zig build test
 
-# Just the constitution invariants
-zig build test --test-filter constitution
+# Just the constitution invariants (12, separate root)
+zig build check-constitution
 
 # Just one layer
 zig build test --test-filter unit
 zig build test --test-filter integration
 zig build test --test-filter property
 
-# Benchmarks
+# Benchmarks (the release gate)
 zig build bench
+```
+
+`zig build test` re-runs are served from the build cache and **report green
+without re-executing**. When you need a count you can trust, drive the roots
+directly:
+
+```bash
+zig test --dep mem3 -Mroot=src/main.zig  -Mmem3=src/lib.zig   # All 193 tests passed.
+zig test --dep mem3 -Mroot=tests/main.zig -Mmem3=src/lib.zig   # All 83 tests passed.
+zig test --dep mem3 -Mroot=tests/constitution/main.zig -Mmem3=src/lib.zig  # All 12 tests passed.
 ```
 
 Test files live under `tests/{unit,integration,property}/` (one test file

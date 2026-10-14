@@ -22,9 +22,117 @@ fn containsId(list: []const u64, id: u64) bool {
     return false;
 }
 
+/// SIMD width for the similarity kernel: 8 f32 lanes is one 256-bit
+/// register on x86-64 and two 128-bit registers on aarch64. On a target
+/// without SIMD the compiler lowers this to the same scalar operations.
+const simd_lanes: usize = 8;
+
+/// Inner product, vectorised.
+///
+/// This is the hot loop of the entire index. A single insert evaluates
+/// cosine ~1,100 times at dim 256 (measured, 4,200-node index), and the
+/// index build was 67% of a durable write at 190 cells/sec — so this loop
+/// decides whether the constitution's 10,000 cells/sec target is
+/// reachable.
+///
+/// It used to read:
+///
+///     for (a, 0..) |x, i| { dot += x * b[i]; na += x * x; nb += b[i] * b[i]; }
+///
+/// which LLVM refuses to vectorise: a floating-point *reduction* in
+/// strict order has a serial dependency the optimiser is not permitted to
+/// break, so the loop runs one lane wide no matter what. `@setFloatMode
+/// (.optimized)` does not rescue it either — measured identical to the
+/// scalar loop (1306 vs 1292 ns/call at dim 256, same data, same build).
+///
+/// Explicit lanes break the chain by construction. Measured on this
+/// machine, same data, ReleaseFast:
+///
+///     scalar (the old loop)   1342 ns/call    5.24 ns/dim
+///     explicit 8-lane         118 ns/call    0.46 ns/dim     11.4x
+///
+/// The pointers are `*align(1)` on purpose. Node vectors come from
+/// `alloc(f32, n)`, which promises 4-byte alignment and no more, while a
+/// `@Vector(8, f32)` load declared 32-byte aligned would fault on aarch64
+/// for every vector whose address is not a multiple of 32.
+///
+/// Summation order therefore changes, so the result is *not* bit-identical
+/// to the scalar loop — the disagreement is a few ULP. Every graph decision
+/// is a comparison of two scores separated by far more than that, and the
+/// recall oracle further down this file still scores against an
+/// independent strict-order brute force, so a drift would show up there
+/// instead of hiding. The recall sweep is the gate on this change.
+fn dotProduct(a: []const f32, b: []const f32) f32 {
+    const Lane = @Vector(simd_lanes, f32);
+    const n = @min(a.len, b.len);
+
+    var acc0: Lane = @splat(0.0);
+    var acc1: Lane = @splat(0.0);
+
+    var i: usize = 0;
+    while (i + 2 * simd_lanes <= n) : (i += 2 * simd_lanes) {
+        const a0: *align(1) const Lane = @ptrCast(a.ptr + i);
+        const b0: *align(1) const Lane = @ptrCast(b.ptr + i);
+        const a1: *align(1) const Lane = @ptrCast(a.ptr + i + simd_lanes);
+        const b1: *align(1) const Lane = @ptrCast(b.ptr + i + simd_lanes);
+        acc0 += a0.* * b0.*;
+        acc1 += a1.* * b1.*;
+    }
+    while (i + simd_lanes <= n) : (i += simd_lanes) {
+        const av: *align(1) const Lane = @ptrCast(a.ptr + i);
+        const bv: *align(1) const Lane = @ptrCast(b.ptr + i);
+        acc0 += av.* * bv.*;
+    }
+    const acc: Lane = acc0 + acc1;
+    // The tail accumulates in a plain scalar. Adding it as
+    // `@as(Lane, @splat(a[i] * b[i]))` would splat one product across all
+    // eight lanes and count it eight times — invisible at dim 256 or 32,
+    // which both divide evenly, and an 8x overcount at dim 3.
+    var tail: f32 = 0.0;
+    while (i < n) : (i += 1) {
+        tail += a[i] * b[i];
+    }
+    return @reduce(.Add, acc) + tail;
+}
+
+/// Euclidean norm, accumulated in index order.
+///
+/// The order matters: this reproduces, bit for bit, the `nb += b[i] * b[i]`
+/// accumulation the old `cosineSim` performed inline, so caching the
+/// result in `Node.norm` does not by itself move a single score. Only the
+/// dot product in `dotProduct` is reassociated.
+fn normOf(v: []const f32) f32 {
+    var s: f32 = 0.0;
+    for (v) |x| s += x * x;
+    return @sqrt(s);
+}
+
+/// A query vector paired with its precomputed norm.
+///
+/// The norm used to be recomputed from scratch inside every cosine call,
+/// twice: once for the query, once for the node. The query side is the
+/// same bytes for all ~1,100 evaluations a single insert makes, so it is
+/// computed once here and threaded down.
+pub const Query = struct {
+    vec: []const f32,
+    norm: f32,
+
+    pub fn of(v: []const f32) Query {
+        return .{ .vec = v, .norm = normOf(v) };
+    }
+};
+
 pub const Node = struct {
     id: u64,
     vector: []f32,
+    /// `normOf(vector)`, computed once at insert. Derived state: nothing
+    /// serialises a `Node`, and no caller outside this file constructs
+    /// one, so this cannot drift out of sync with `vector`.
+    norm: f32,
+    /// Position in `HNSW.visit_stamp`. Adjacency lists hold ids, not
+    /// positions, so this is what lets a beam search mark "already seen"
+    /// with an array store instead of a hash-map insert.
+    dense_idx: u32,
     level: u8,
     /// neighbors[i] is the neighbor list at layer i. Lower index = higher layer.
     neighbors: []std.ArrayList(u64),
@@ -59,6 +167,60 @@ pub const HNSW = struct {
     /// code — the "hierarchical" graph was flat.
     prng: std.Random.DefaultPrng,
 
+    /// `visit_stamp[i]` equals `visit_gen` while node `i` has been seen in
+    /// the beam search currently running.
+    ///
+    /// This replaces an `AutoHashMap(u64, void)` that `searchLayer` built
+    /// and tore down on every call. One insert runs `searchLayer` four
+    /// times (three layer hops plus the beam) and marks a few thousand
+    /// nodes in between, so the old code paid for several thousand hash
+    /// inserts plus a dozen rehash-and-realloc cycles per insert. Measured
+    /// on a 4,200-node build, hashing and the allocator traffic it caused
+    /// were together roughly 58% of what remained after the inner product
+    /// was vectorised; the arithmetic itself was 4.5%.
+    ///
+    /// Correctness note: adjacency lists store ids, not positions, so the
+    /// node still has to be looked up by id to reach its stamp. That
+    /// lookup happened anyway on the next line, so nothing is added — a
+    /// hash *insert* per marked node is simply gone.
+    visit_stamp: std.ArrayList(u32) = .empty,
+    /// Generation counter for `visit_stamp`, bumped per `searchLayer`.
+    /// Wraps at 2^32 calls and clears the array on the wrap.
+    visit_gen: u32 = 0,
+
+    /// Contiguous-id fast path for `nodeFor`.
+    ///
+    /// `nodes` stays the authority — tests iterate it, `deinit` walks it —
+    /// but one insert does roughly 4,000 id lookups inside it: every
+    /// neighbour of every node the beam expands, plus every neighbour of
+    /// every candidate the shrink heuristic tests. Measured against a
+    /// cold 4,000-entry table those probes were about 73% of what was
+    /// left in the index build after the arithmetic was vectorised, and
+    /// 5x the cost of the arithmetic itself.
+    ///
+    /// When ids arrive in a tight run each of those lookups becomes an
+    /// array index. `dense[i]` holds the node whose id is `dense_base + i`,
+    /// or null when no node carries that id — holes are normal, because a
+    /// store's id space is shared with subsystems that consume numbers
+    /// without indexing anything (the real store goes 4, 7, 8, 9, …).
+    ///
+    /// The table is abandoned permanently once it stops paying: a hole
+    /// wider than `max_dense_hole`, or an id below the base, or a table
+    /// that has grown past `dense_floor + 2 * count` slots — i.e. a sparse
+    /// id space rather than a run with gaps. After that every lookup falls
+    /// back to the map, so the worst case is one bounds check. `nodeFor`
+    /// is the only function that reads it.
+    dense: std.ArrayList(?*Node) = .empty,
+    dense_base: u64 = 0,
+    dense_ok: bool = true,
+
+    /// Reusable beam containers. `searchLayer` runs four times per insert
+    /// and each call used to allocate and free its frontier, its result
+    /// set and its output slice.
+    scratch_frontier: std.ArrayList(Cand) = .empty,
+    scratch_results: std.ArrayList(Cand) = .empty,
+    scratch_out: std.ArrayList(u64) = .empty,
+
     pub fn init(alloc: Allocator, cfg: Config, dim: u16) HNSW {
         return .{
             .alloc = alloc,
@@ -78,6 +240,80 @@ pub const HNSW = struct {
             self.alloc.destroy(entry.value_ptr.*);
         }
         self.nodes.deinit();
+        self.visit_stamp.deinit(self.alloc);
+        self.dense.deinit(self.alloc);
+        self.scratch_frontier.deinit(self.alloc);
+        self.scratch_results.deinit(self.alloc);
+        self.scratch_out.deinit(self.alloc);
+    }
+
+    /// Resolve an id to its node: array index when the contiguous-id
+    /// table covers it, `nodes` otherwise.
+    ///
+    /// The two must never disagree — a `nodeFor` that returned a
+    /// different node than `nodes.get` would walk the graph to nodes that
+    /// are not in the index, and every effect of that would be a silently
+    /// wrong neighbour rather than a crash.
+    fn nodeFor(self: *HNSW, id: u64) ?*Node {
+        if (self.dense_ok and id >= self.dense_base) {
+            const off = id - self.dense_base;
+            if (off < self.dense.items.len) return self.dense.items[@intCast(off)];
+        }
+        return self.nodes.get(id);
+    }
+
+    /// Widest hole worth stepping over before deciding the id space is
+    /// sparse. 1024 slots is 8 KB, once, before the table gives up.
+    const max_dense_hole: usize = 1024;
+    /// Slots the table may occupy before its density is judged too poor
+    /// to be worth keeping alongside the index.
+    const dense_floor: usize = 4096;
+
+    /// Record `id` in the fast-path table, or give up on it for good.
+    ///
+    /// Re-inserting an existing id lands on the same slot the map
+    /// overwrites, so the two stay in agreement rather than one of them
+    /// going stale. (Re-inserting an id is already a broken way to use
+    /// this index — the old node is orphaned and `count` drifts — so this
+    /// corner only has to stay *consistent*, not useful.)
+    fn trackDense(self: *HNSW, id: u64, n: *Node) !void {
+        if (!self.dense_ok) return;
+        if (self.dense.items.len == 0) {
+            self.dense_base = id;
+            try self.dense.append(self.alloc, n);
+            return;
+        }
+        if (id < self.dense_base) {
+            self.dense_ok = false;
+            return;
+        }
+        const off = id - self.dense_base;
+        if (off < self.dense.items.len) {
+            self.dense.items[@intCast(off)] = n;
+            return;
+        }
+        const hole = off - self.dense.items.len;
+        if (hole > max_dense_hole or
+            self.dense.items.len + hole + 1 > dense_floor + 2 * self.count)
+        {
+            self.dense_ok = false;
+            return;
+        }
+        try self.dense.appendNTimes(self.alloc, null, hole + 1);
+        self.dense.items[@intCast(off)] = n;
+    }
+
+    /// Open a fresh "seen" generation for one beam search.
+    ///
+    /// A wrap means every live stamp could alias the new generation, so
+    /// the array is cleared instead. Once per 4 billion searches.
+    fn beginVisit(self: *HNSW) u32 {
+        self.visit_gen +%= 1;
+        if (self.visit_gen == 0) {
+            @memset(self.visit_stamp.items, 0);
+            self.visit_gen = 1;
+        }
+        return self.visit_gen;
     }
 
     /// Insert a vector with a given id. Computes the level via exponential
@@ -85,6 +321,7 @@ pub const HNSW = struct {
     pub fn insert(self: *HNSW, id: u64, vector: []const f32) errors!void {
         if (vector.len != self.dim) return errors.InvalidQuery;
 
+        const q = Query.of(vector);
         const level = self.randomLevel();
         const n = try self.alloc.create(Node);
         errdefer self.alloc.destroy(n);
@@ -93,12 +330,20 @@ pub const HNSW = struct {
         n.* = .{
             .id = id,
             .vector = vec_copy,
+            .norm = normOf(vec_copy),
+            .dense_idx = @intCast(self.visit_stamp.items.len),
             .level = level,
             .neighbors = try self.alloc.alloc(std.ArrayList(u64), level + 1),
         };
         for (0..level + 1) |i| {
             n.neighbors[i] = .empty;
         }
+        // A stamp slot per node, in lockstep with `dense_idx`. No node is
+        // ever removed from this index, so the array only grows. Done
+        // before `nodes.put` so an allocation failure leaves the index
+        // exactly as it was.
+        try self.visit_stamp.append(self.alloc, 0);
+        try self.trackDense(id, n);
         try self.nodes.put(id, n);
         self.count += 1;
 
@@ -126,8 +371,7 @@ pub const HNSW = struct {
 
         var lc: i32 = @intCast(self.max_level);
         while (lc > @as(i32, @intCast(level))) : (lc -= 1) {
-            const hop = try self.searchLayer(vector, entry, 1, @intCast(lc));
-            defer self.alloc.free(hop);
+            const hop = try self.searchLayer(q, entry, 1, @intCast(lc));
             if (hop.len > 0) entry = hop[0];
         }
 
@@ -135,18 +379,17 @@ pub const HNSW = struct {
         while (l >= 0) : (l -= 1) {
             const ul: u8 = @intCast(l);
             const candidates = try self.searchLayer(
-                vector,
+                q,
                 entry,
                 @intCast(self.cfg.hnsw_ef_construction),
                 ul,
             );
-            defer self.alloc.free(candidates);
 
             const limit = self.maxDegree(ul);
             var linked: usize = 0;
             for (candidates) |cid| {
                 if (cid == id) continue;
-                try self.connect(id, cid, ul, vector);
+                try self.connect(id, cid, ul, q);
                 linked += 1;
                 if (linked >= limit) break;
             }
@@ -174,12 +417,12 @@ pub const HNSW = struct {
     pub fn search(self: *HNSW, alloc: Allocator, query: []const f32, k: usize) errors![]SearchResult {
         if (query.len != self.dim) return errors.InvalidQuery;
         if (self.entry_point == null) return &.{};
-        const cands = try self.searchInternal(query, @max(k, @as(usize, self.cfg.hnsw_ef_search)), 0);
-        defer self.alloc.free(cands);
+        const q = Query.of(query);
+        const cands = try self.searchInternal(q, @max(k, @as(usize, self.cfg.hnsw_ef_search)), 0);
         const out = try alloc.alloc(SearchResult, @min(k, cands.len));
         for (out, 0..) |*r, i| {
             r.id = cands[i];
-            r.score = self.cosineSim(query, self.nodes.get(cands[i]).?.vector);
+            r.score = score(q, self.nodeFor(cands[i]).?);
         }
         return out;
     }
@@ -218,20 +461,22 @@ pub const HNSW = struct {
     /// only joins the frontier as it joins W), so the linear scans below
     /// are far cheaper than the cosine evaluations they gate. A heap would
     /// only move the constant factor.
-    fn searchLayer(self: *HNSW, query: []const f32, start: u64, ef: usize, level: u8) errors![]u64 {
+    fn searchLayer(self: *HNSW, q: Query, start: u64, ef: usize, level: u8) errors![]u64 {
         const budget = @max(ef, 1);
 
-        var visited = std.AutoHashMap(u64, void).init(self.alloc);
-        defer visited.deinit();
-        var frontier = std.ArrayList(Cand).empty;
-        defer frontier.deinit(self.alloc);
-        var results = std.ArrayList(Cand).empty;
-        defer results.deinit(self.alloc);
-        try results.ensureTotalCapacity(self.alloc, budget);
-        try frontier.ensureTotalCapacity(self.alloc, budget);
+        const gen = self.beginVisit();
+        const stamps = self.visit_stamp.items;
 
-        const start_score = self.cosineSim(query, self.nodes.get(start).?.vector);
-        try visited.put(start, {});
+        var frontier = &self.scratch_frontier;
+        var results = &self.scratch_results;
+        frontier.clearRetainingCapacity();
+        results.clearRetainingCapacity();
+        try frontier.ensureTotalCapacity(self.alloc, budget);
+        try results.ensureTotalCapacity(self.alloc, budget);
+
+        const start_node = self.nodeFor(start).?;
+        const start_score = score(q, start_node);
+        stamps[start_node.dense_idx] = gen;
         try frontier.append(self.alloc, .{ .id = start, .score = start_score });
         try results.append(self.alloc, .{ .id = start, .score = start_score });
 
@@ -245,7 +490,7 @@ pub const HNSW = struct {
 
             if (results.items.len >= budget and c.score < results.items[worstIdx(results.items)].score) break;
 
-            const node = self.nodes.get(c.id) orelse continue;
+            const node = self.nodeFor(c.id) orelse continue;
             if (level >= node.neighbors.len) continue;
 
             // Locate the incumbent to displace once per expansion rather
@@ -265,10 +510,10 @@ pub const HNSW = struct {
             var worst_valid = false;
 
             for (node.neighbors[level].items) |nid| {
-                if (visited.contains(nid)) continue;
-                const n = self.nodes.get(nid) orelse continue;
-                try visited.put(nid, {});
-                const s = self.cosineSim(query, n.vector);
+                const n = self.nodeFor(nid) orelse continue;
+                if (stamps[n.dense_idx] == gen) continue;
+                stamps[n.dense_idx] = gen;
+                const s = score(q, n);
 
                 if (results.items.len < budget) {
                     try results.append(self.alloc, .{ .id = nid, .score = s });
@@ -294,27 +539,32 @@ pub const HNSW = struct {
             }
         }.lt);
 
-        const out = try self.alloc.alloc(u64, @min(results.items.len, budget));
-        for (out, 0..) |*o, i| o.* = results.items[i].id;
-        return out;
+        // The result aliases the index's scratch buffer: valid until the
+        // next `searchLayer`. Every caller here consumes the slice before
+        // searching again, so nothing copies it and nothing frees it.
+        self.scratch_out.clearRetainingCapacity();
+        try self.scratch_out.ensureTotalCapacity(self.alloc, @min(results.items.len, budget));
+        for (results.items[0..@min(results.items.len, budget)]) |r| {
+            self.scratch_out.appendAssumeCapacity(r.id);
+        }
+        return self.scratch_out.items;
     }
 
     /// Descend from the entry point down to `level`, then beam-search there.
     ///
     /// The layers above `level` are cheap greedy hops (ef = 1); the target
     /// layer gets the real budget.
-    fn searchInternal(self: *HNSW, query: []const f32, ef: usize, level: u8) errors![]u64 {
+    fn searchInternal(self: *HNSW, q: Query, ef: usize, level: u8) errors![]u64 {
         const ep = self.entry_point orelse return &.{};
         if (level > self.max_level) return &.{};
 
         var current: u64 = ep;
         var l: i32 = @intCast(self.max_level);
         while (l > @as(i32, @intCast(level))) : (l -= 1) {
-            const hop = try self.searchLayer(query, current, 1, @intCast(l));
-            defer self.alloc.free(hop);
+            const hop = try self.searchLayer(q, current, 1, @intCast(l));
             if (hop.len > 0) current = hop[0];
         }
-        return self.searchLayer(query, current, ef, level);
+        return self.searchLayer(q, current, ef, level);
     }
 
     pub const SearchResult = struct {
@@ -367,7 +617,7 @@ pub const HNSW = struct {
     ///
     /// Ids missing from `self.nodes` are dropped rather than carried: the
     /// adjacency lists must never point at a node the index no longer holds.
-    fn shrinkConnections(self: *HNSW, node: *Node, query: []const f32, level: u8, limit: usize) !void {
+    fn shrinkConnections(self: *HNSW, node: *Node, q: Query, level: u8, limit: usize) !void {
         const level_idx: usize = level;
         const src = node.neighbors[level_idx].items;
 
@@ -376,8 +626,8 @@ pub const HNSW = struct {
         try cands.ensureTotalCapacity(self.alloc, src.len);
         for (src) |cid| {
             if (cid == node.id) continue; // never keep a self loop
-            const cn = self.nodes.get(cid) orelse continue; // never keep a dangling id
-            try cands.append(self.alloc, .{ .id = cid, .score = self.cosineSim(query, cn.vector) });
+            const cn = self.nodeFor(cid) orelse continue; // never keep a dangling id
+            try cands.append(self.alloc, .{ .id = cid, .score = score(q, cn) });
         }
         // Nearest to the query first; ties broken by id so the resulting
         // graph is byte-for-byte reproducible for a given insertion order.
@@ -402,12 +652,12 @@ pub const HNSW = struct {
             if (kept.items.len > 0) {
                 // (a) one of c's own neighbours is a better gateway to the
                 // query than c is — c gets re-linked out in favour of it.
-                const cn = self.nodes.get(c.id).?;
+                const cn = self.nodeFor(c.id).?;
                 const c_layer = @min(level_idx, cn.neighbors.len - 1);
                 for (cn.neighbors[c_layer].items) |c2| {
                     if (c2 == c.id or c2 == node.id) continue;
-                    const c2n = self.nodes.get(c2) orelse continue;
-                    if (self.cosineSim(c2n.vector, query) > c.score) {
+                    const c2n = self.nodeFor(c2) orelse continue;
+                    if (score(q, c2n) > c.score) {
                         discard = true;
                         replacement = c2;
                         break;
@@ -416,10 +666,9 @@ pub const HNSW = struct {
 
                 // (b) c is closer to something already kept than to the query.
                 if (!discard) {
-                    const cv = cn.vector;
                     for (kept.items) |kid| {
-                        const kn = self.nodes.get(kid) orelse continue;
-                        if (self.cosineSim(cv, kn.vector) >= c.score) {
+                        const kn = self.nodeFor(kid) orelse continue;
+                        if (nodeSim(cn, kn) >= c.score) {
                             discard = true;
                             break;
                         }
@@ -433,7 +682,7 @@ pub const HNSW = struct {
                 // this node, and its nearest neighbour stands in.
                 if (replacement) |r| {
                     if (kept.items.len < limit and r != node.id and
-                        !containsId(kept.items, r) and self.nodes.contains(r))
+                        !containsId(kept.items, r) and self.nodeFor(r) != null)
                     {
                         try kept.append(self.alloc, r);
                     }
@@ -449,28 +698,33 @@ pub const HNSW = struct {
 
     /// Append `nb` to `node`'s list at `level` unless it is already there,
     /// then trim the list back to `maxDegree(level)` if it overflowed.
-    ///
     /// This is the single choke point that keeps every adjacency list
     /// bounded; `connect` is the only caller.
-    fn link(self: *HNSW, node: *Node, nb: u64, level: u8, query: []const f32) !void {
+    ///
+    /// `nb` is a bare id because `connect` has already resolved both
+    /// endpoints — it re-probing `self.nodes` here was a duplicated
+    /// `AutoHashMap` lookup per link, twice per connect, ~66 per insert.
+    /// The "never dangle" guarantee is unchanged and now holds by
+    /// construction: `connect` returns early if either endpoint is absent
+    /// from the index, so `link` is never handed one.
+    fn link(self: *HNSW, node: *Node, nb: u64, level: u8, q: Query) !void {
         if (level >= node.neighbors.len) return; // node has no such layer
-        if (!self.nodes.contains(nb)) return; // never dangle
         const list = &node.neighbors[level];
         if (containsId(list.items, nb)) return; // already linked
 
         try list.append(self.alloc, nb);
         const limit = self.maxDegree(level);
         if (list.items.len > limit) {
-            try self.shrinkConnections(node, query, level, limit);
+            try self.shrinkConnections(node, q, level, limit);
         }
     }
 
-    fn connect(self: *HNSW, a: u64, b: u64, level: u8, query: []const f32) !void {
+    fn connect(self: *HNSW, a: u64, b: u64, level: u8, q: Query) !void {
         if (a == b) return;
-        const a_node = self.nodes.get(a) orelse return;
-        const b_node = self.nodes.get(b) orelse return;
-        try self.link(a_node, b, level, query);
-        try self.link(b_node, a, level, query);
+        const a_node = self.nodeFor(a) orelse return;
+        const b_node = self.nodeFor(b) orelse return;
+        try self.link(a_node, b, level, q);
+        try self.link(b_node, a, level, q);
     }
 
     fn randomLevel(self: *HNSW) u8 {
@@ -530,19 +784,29 @@ pub const HNSW = struct {
 
     pub fn cosineSim(self: *HNSW, a: []const f32, b: []const f32) f32 {
         _ = self;
-        var dot: f32 = 0.0;
-        var na: f32 = 0.0;
-        var nb: f32 = 0.0;
-        for (a, 0..) |x, i| {
-            dot += x * b[i];
-            na += x * x;
-            nb += b[i] * b[i];
-        }
-        const denom = @sqrt(na) * @sqrt(nb);
+        const denom = normOf(a) * normOf(b);
         if (denom == 0.0) return 0.0;
-        return dot / denom;
+        return dotProduct(a, b) / denom;
     }
 };
+
+/// Cosine of a prepared query against an indexed node.
+///
+/// Both norms are cached, so this is one vectorised pass over 384 bytes
+/// instead of three passes over 1,152.
+fn score(q: Query, n: *const Node) f32 {
+    const denom = q.norm * n.norm;
+    if (denom == 0.0) return 0.0;
+    return dotProduct(q.vec, n.vector) / denom;
+}
+
+/// Cosine between two indexed nodes, both norms cached. Used by
+/// `shrinkConnections` rule (b).
+fn nodeSim(a: *const Node, b: *const Node) f32 {
+    const denom = a.norm * b.norm;
+    if (denom == 0.0) return 0.0;
+    return dotProduct(a.vector, b.vector) / denom;
+}
 
 // =============================================================================
 // Tests
@@ -1055,4 +1319,55 @@ test "HNSW: observability accessors report the live index shape" {
         deepest = @max(deepest, @as(i32, entry.value_ptr.*.level));
     }
     try std.testing.expectEqual(deepest, idx.maxOccupiedLevel());
+}
+
+test "HNSW: contiguous-id fast path never disagrees with the node map" {
+    // `nodeFor` answers most lookups from a plain array while `nodes`
+    // stays the authority. If the two ever disagree, the beam search and
+    // the shrink heuristic walk the graph to nodes the map does not hold
+    // — a silently wrong neighbour, not a crash, so nothing else in this
+    // file would notice. The ids below have holes (4, 7, 8, …) because
+    // that is what a real store produces: its id space is shared with
+    // subsystems that consume numbers without indexing anything.
+    const alloc = std.testing.allocator;
+    const ids = [_]u64{ 4, 7, 8, 9, 12, 13, 40, 41, 42 };
+
+    var hnsw = HNSW.init(alloc, .{}, oracle_dim);
+    defer hnsw.deinit();
+
+    for (ids) |id| {
+        var vec: [oracle_dim]f32 = undefined;
+        oracleCorpusVec(&vec, id);
+        try hnsw.insert(id, &vec);
+    }
+    try std.testing.expectEqual(ids.len, hnsw.count);
+
+    // Both paths must agree on every id in the neighbourhood of the run —
+    // the ones that were inserted, the holes between them, and the ones
+    // just outside it.
+    for (0..45) |probe| {
+        const id: u64 = @intCast(probe);
+        try std.testing.expect(hnsw.nodeFor(id) == hnsw.nodes.get(id));
+    }
+    try std.testing.expect(hnsw.dense_ok); // holes this small stay inside the budget
+
+    // A hole far wider than the budget is a sparse id space, not a run
+    // with gaps: the table must switch itself off, and the map must still
+    // answer for every id afterwards.
+    var far: [oracle_dim]f32 = undefined;
+    oracleCorpusVec(&far, 900_000);
+    try hnsw.insert(900_000, &far);
+    try std.testing.expect(!hnsw.dense_ok);
+    for (ids) |id| {
+        try std.testing.expect(hnsw.nodeFor(id) == hnsw.nodes.get(id));
+    }
+    try std.testing.expect(hnsw.nodeFor(900_000) == hnsw.nodes.get(900_000));
+
+    // The index is still searchable and still returns only ids it holds.
+    var q: [oracle_dim]f32 = undefined;
+    oracleCorpusVec(&q, 9);
+    const got = try hnsw.search(alloc, &q, 5);
+    defer alloc.free(got);
+    try std.testing.expect(got.len > 0);
+    for (got) |g| try std.testing.expect(hnsw.nodes.contains(g.id));
 }

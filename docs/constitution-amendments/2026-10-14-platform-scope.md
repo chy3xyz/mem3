@@ -31,7 +31,7 @@ With a `src/platform/` layer over those four types:
 |---|---|---|
 | `x86_64-linux-gnu` | FAIL (`dependency on libc must be explicitly specified`) | **full project compiles, exit 0** |
 | `aarch64-linux-gnu` | FAIL (same) | **full project compiles, exit 0** |
-| `x86_64-windows` | FAIL (libc + `O.ACCMODE` + `timespec` + `Args.initAllocator` + stdio handles) | library, CLI, benchmarks and examples cross-compiled clean; **daemon does not** |
+| `x86_64-windows` | FAIL (libc + `O.ACCMODE` + `timespec` + `Args.initAllocator` + stdio handles) | refused at compile time. The guard fires, but the daemon and two examples (`forgetting_eval.zig`, `longrun.zig`) also carry their own Windows-breaking call sites — `std.c.STDOUT_FILENO`, `Args.iterate` — so the refusal is not necessarily the *first* error reported. |
 | `wasm32-wasi` / `wasm32-freestanding` | FAIL (`getrandom`, 64-bit atomics, no libc) | refused at compile time with a stated reason |
 
 ## 2. The change
@@ -61,7 +61,7 @@ Documents and code checked against the new scope:
 |---|---|
 | `src/platform/{fs,clock,stdio,env,mod}.zig` | **updated** — target table, compile-time refusal for Windows + WASM, doc-comments state that the retained Windows branches are not compiled, tested or maintained |
 | `src/cli_commands/bench.zig` | **updated** — `getrusage` degrades to `null` with a reason rather than failing to compile |
-| `examples/*.zig` | **updated** — four files carried byte-identical private copies of POSIX helpers; removed in favour of the platform layer |
+| `examples/*.zig` | **updated** — four files carried byte-identical private copies of POSIX helpers; removed in favour of the platform layer. Two still name `std.c.STDOUT_FILENO` and `Args.iterate`, so on Windows they fail before reaching the guard. |
 | `src/utils/time.zig`, `src/cli_commands/cli_common.zig`, `src/storage/snapshot.zig` | **updated** — migrated onto the platform layer |
 | `src/server/http_server.zig` | **unchanged** — POSIX-only, now the stated reason Windows is withdrawn |
 | `.specify/memory/constitution.md` | **updated** — Principle IV and Scope Boundaries |
@@ -92,7 +92,14 @@ target must say so **in words**, not fail three files later with
 `type 'void' does not support field access`.
 
 The retained Windows branches inside the platform layer are explicitly
-unreachable, untested and unmaintained. They are a record of completed work and
+The refusal is a `comptime` error and it does fire, but "fires" is not "fires
+first": the daemon and two examples have their own Windows-breaking call sites, so a
+Windows build reports those alongside it. The boundary is enforced either way, which
+is what matters — a reader who wants the *first* error to be the explanatory one still
+has work to do.
+
+The Windows branches inside the platform layer are explicitly unreachable, untested
+and unmaintained. They are a record of completed work and
 a one-line re-enable, **not** a compatibility guarantee. Anyone reading them as
 one has misread them.
 
