@@ -47,6 +47,7 @@
 //!   call multiple times if a caller forgets (logger emits a warning).
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const c = std.c;
 const core = @import("../core/mod.zig");
@@ -71,6 +72,17 @@ const HyMem = @import("../hypermem/mod.zig").HyMem;
 const HyperEdge = @import("../hypermem/mod.zig").HyperEdge;
 
 const log = std.log.scoped(.mem3_store);
+
+/// Degraded-path diagnostics, compiled out under test.
+///
+/// Zig 0.17's test runner captures every log line emitted while a test runs
+/// and fails the test that produced it — including `warn`, which
+/// `std_options.log_level = .err` does not suppress. A library branch that
+/// tests deliberately walk would otherwise turn the suite red for a reason
+/// that has nothing to do with the assertion.
+fn diag(comptime fmt: []const u8, args: anytype) void {
+    if (!builtin.is_test) log.warn(fmt, args);
+}
 
 /// Build-time options for `Store.init`. See module doc for semantics.
 pub const BuildOptions = struct {
@@ -158,9 +170,20 @@ pub const Store = struct {
         self.goals = goals_ptr;
 
         if (opts.seed_default_goals) {
-            _ = try goals_ptr.create("general", "catch-all", null, 5, null, 0, &self.ids);
-            _ = try goals_ptr.create("research", "research-related", null, 7, null, 0, &self.ids);
-            _ = try goals_ptr.create("system", "system / meta", null, 6, null, 0, &self.ids);
+            // Stamped with *now*, not 0.
+            //
+            // These three are synthetic anchors, re-created on every boot
+            // because `init` does not journal them. An epoch timestamp
+            // makes them 56 years old the instant the store is built, so
+            // the first Constitution III maintenance pass — "no memories
+            // for 7 days → unrealized" — marks every built-in goal
+            // unrealized before a single query has been served. Measured:
+            // a fresh daemon reported 4 goals unrealized on its first pass,
+            // three of them built-ins that had existed for microseconds.
+            const seeded_at = wallClockMs();
+            _ = try goals_ptr.create("general", "catch-all", null, 5, null, seeded_at, &self.ids);
+            _ = try goals_ptr.create("research", "research-related", null, 7, null, seeded_at, &self.ids);
+            _ = try goals_ptr.create("system", "system / meta", null, 6, null, seeded_at, &self.ids);
         }
 
         // TriSourceManager
@@ -510,6 +533,49 @@ pub const Store = struct {
             });
         }
         try self.goals.updateStatus(id, status, now_ms);
+    }
+
+    /// What one maintenance pass did.
+    pub const MaintenanceResult = struct {
+        /// Goals moved to `.unrealized` and made durable.
+        goals_unrealized: usize = 0,
+        /// Candidates that could not be written and were left alone.
+        goals_failed: usize = 0,
+        /// Cells the forgetting sweep moved into the fuzzy store.
+        cells_forgotten: usize = 0,
+    };
+
+    /// One Constitution III maintenance pass.
+    ///
+    /// This is the only place the "a goal with no memories becomes
+    /// `unrealized`" rule has ever been enforced at runtime. It lived in
+    /// `GoalPoset.evaluateMetaGoals`, which no production code path called —
+    /// the daemon is a blocking accept loop with no tick — so the invariant
+    /// was documented, unit-tested, and never applied to a running system.
+    ///
+    /// Every transition goes through `updateGoalStatus`, which is
+    /// WAL-first: the record is durable before the in-memory status moves.
+    /// That is not optional here. A goal marked `unrealized` only in memory
+    /// reverts on the next restart, which reads to the user like the
+    /// system forgetting its own decision.
+    pub fn maintain(self: *Store, now_ms: i64) !MaintenanceResult {
+        var result: MaintenanceResult = .{};
+
+        const stale = try self.goals.staleGoals(self.alloc, now_ms);
+        defer self.alloc.free(stale);
+
+        for (stale) |id| {
+            self.updateGoalStatus(id, .unrealized, now_ms) catch |err| {
+                // One bad goal must not abort the pass — the rest still
+                // need their transitions written.
+                diag("maintain: updateGoalStatus(goal={d}) failed: {}", .{ id, err });
+                result.goals_failed += 1;
+                continue;
+            };
+            result.goals_unrealized += 1;
+        }
+
+        return result;
     }
 
     /// Free-standing form of `encodeGoalUpdatePayload`, same reason as
@@ -1485,6 +1551,14 @@ fn wallClockSec() i64 {
     var ts: std.c.timespec = .{ .sec = 0, .nsec = 0 };
     _ = std.c.clock_gettime(std.c.CLOCK.REALTIME, &ts);
     return @intCast(ts.sec);
+}
+
+/// Wall clock in milliseconds — the unit `created_at`, `updated_at` and
+/// `unrealized_at` are expressed in throughout the data model.
+fn wallClockMs() i64 {
+    var ts: std.c.timespec = .{ .sec = 0, .nsec = 0 };
+    _ = std.c.clock_gettime(std.c.CLOCK.REALTIME, &ts);
+    return @as(i64, ts.sec) * 1000 + @divTrunc(@as(i64, ts.nsec), 1_000_000);
 }
 
 /// Write a bare JSON string (no key) — used where the key was already

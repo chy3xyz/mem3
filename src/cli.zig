@@ -40,6 +40,10 @@ pub const Parsed = struct {
     data_dir: []const u8 = "data",
     bind: []const u8 = "127.0.0.1",
     port: u16 = 7777,
+    /// Seconds between daemon maintenance passes. 0 disables the thread
+    /// entirely, which is what the test suite and `--maint-interval=0`
+    /// want — a background thread racing assertions is a flaky test.
+    maint_interval_sec: u32 = 60,
     dry_run: bool = false,
     help: bool = false,
     version: bool = false,
@@ -102,6 +106,8 @@ pub fn parse(alloc: Allocator, iter: *ArgIterator) !Parsed {
         }
         if (std.mem.startsWith(u8, arg, "--port=")) {
             p.port = std.fmt.parseInt(u16, arg["--port=".len..], 10) catch 7777;
+        } else if (std.mem.startsWith(u8, arg, "--maint-interval=")) {
+            p.maint_interval_sec = std.fmt.parseInt(u32, arg["--maint-interval=".len..], 10) catch 60;
             continue;
         }
         if (std.mem.eql(u8, arg, "--port")) {

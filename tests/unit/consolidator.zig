@@ -17,6 +17,8 @@ fn buildStore(alloc: std.mem.Allocator) !struct {
     mgr: *TriSourceManager,
     cons: Consolidator,
     alloc: std.mem.Allocator,
+    /// Heap-allocated because `TriSourceManager` keeps a pointer to it.
+    ids: *std.atomic.Value(u64),
 
     fn deinit(self: *@This()) void {
         // CoherenceCalculator has no heap state, so no deinit.
@@ -24,13 +26,29 @@ fn buildStore(alloc: std.mem.Allocator) !struct {
         self.cons.mgr.deinit();
         self.alloc.destroy(self.cons.fuzzy);
         self.alloc.destroy(self.cons.mgr);
+        self.alloc.destroy(self.ids);
     }
 } {
-    var ids: std.atomic.Value(u64) = .init(1);
-    _ = &ids; // pointer escapes into TriSourceManager
+    // HEAP, not stack.
+    //
+    // This was `var ids: std.atomic.Value(u64) = .init(1);` — a local whose
+    // address escaped into `TriSourceManager.next_id` and then went out of
+    // scope when `buildStore` returned. `next_id` was left pointing at a
+    // reused stack slot, so `fetchAdd` read and wrote whatever landed
+    // there. It usually worked by accident: the slot kept a plausible
+    // value from an earlier call.
+    //
+    // It stopped working the moment the code size of `consolidate` changed
+    // enough to move the stack layout — an unrelated consolidation
+    // refactor made abstracts come out as `id=1` against three existing
+    // cells, and the tests failed with `error.DuplicateId`. A test whose
+    // id counter is a dangling pointer is a landmine: the next innocent
+    // edit anywhere sets it off again.
+    const ids = try alloc.create(std.atomic.Value(u64));
+    ids.* = .init(1);
 
     const mgr_ptr = try alloc.create(TriSourceManager);
-    mgr_ptr.* = TriSourceManager.init(alloc, &ids);
+    mgr_ptr.* = TriSourceManager.init(alloc, ids);
 
     const fuzzy_ptr = try alloc.create(FuzzyStore);
     fuzzy_ptr.* = FuzzyStore.init(alloc);
@@ -41,7 +59,7 @@ fn buildStore(alloc: std.mem.Allocator) !struct {
         fuzzy_ptr,
         mgr_ptr,
     );
-    return .{ .mgr = mgr_ptr, .cons = cons, .alloc = alloc };
+    return .{ .mgr = mgr_ptr, .cons = cons, .alloc = alloc, .ids = ids };
 }
 
 fn addCell(mgr: *TriSourceManager, episode: []const u8, source: mem3.MemorySource, goal_id: u64) !void {

@@ -43,6 +43,14 @@ pub fn run(alloc: std.mem.Allocator, p: cli.Parsed) !void {
     };
     defer srv.deinit();
     try srv.listen();
+
+    // Periodic Constitution III maintenance: goals that have sat for 7 days
+    // with no memories get marked `unrealized`, WAL-first, so the change
+    // survives a restart. This is what makes the invariant real rather than
+    // merely unit-tested — before this the rule existed only in
+    // `GoalPoset.evaluateMetaGoals`, which nothing called.
+    try srv.startMaintenance(p.maint_interval_sec);
+
     std.debug.print("mem3 v0.1.0-alpha listening on http://{s}:{d}\n", .{ p.bind, p.port });
     std.debug.print("  data dir:  {s}\n", .{if (in_memory) "(none — in-memory, MEM3_NO_PERSIST=1)" else p.data_dir});
     std.debug.print("  web UI:    http://{s}:{d}/\n", .{ p.bind, p.port });

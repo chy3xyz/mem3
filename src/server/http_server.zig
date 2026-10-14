@@ -92,6 +92,8 @@ const Metrics = struct {
     queries_total: std.atomic.Value(u64) = .init(0),
     inserts_total: std.atomic.Value(u64) = .init(0),
     last_query_us: std.atomic.Value(u64) = .init(0),
+    /// Bumped by the maintenance thread on each completed pass.
+    maintenance_passes: std.atomic.Value(u64) = .init(0),
 
     fn render(self: *const Metrics, alloc: Allocator, boot_time_ns: u128) ![]u8 {
         const uptime_s = @divTrunc(nowNs() - boot_time_ns, std.time.ns_per_s);
@@ -107,13 +109,64 @@ const Metrics = struct {
             \\mem3_inserts_total {d}
             \\# HELP mem3_last_query_us Last query latency microseconds
             \\mem3_last_query_us {d}
+            \\# HELP mem3_maintenance_passes_total Completed maintenance passes
+            \\mem3_maintenance_passes_total {d}
         , .{
             uptime_s,
             self.requests_total.load(.monotonic),
             self.queries_total.load(.monotonic),
             self.inserts_total.load(.monotonic),
             self.last_query_us.load(.monotonic),
+            self.maintenance_passes.load(.monotonic),
         });
+    }
+};
+
+/// Sleep for `ms` milliseconds.
+///
+/// Zig 0.17 removed `std.Thread.sleep`, and `std.c` does not re-export
+/// `nanosleep`, so libc is declared directly — same convention as the
+/// `getenv` fwd-decl in `cli_commands/serve.zig`. `EINTR` retries rather
+/// than returning early: a signal must not silently shorten the interval.
+fn sleepMs(ms: u32) void {
+    const nanosleep = struct {
+        extern "c" fn nanosleep(req: *const std.c.timespec, rem: ?*std.c.timespec) c_int;
+    }.nanosleep;
+
+    var req: std.c.timespec = .{
+        .sec = @intCast(ms / 1000),
+        .nsec = @intCast((ms % 1000) * std.time.ns_per_ms),
+    };
+    while (true) {
+        const rc = nanosleep(&req, null);
+        if (rc == 0) break;
+        if (std.c.errno(rc) != .INTR) break;
+    }
+}
+
+/// Wall clock in milliseconds — the unit every `created_at` /
+/// `updated_at` / `unrealized_at` field in the system is expressed in.
+fn nowMs() i64 {
+    var ts: std.c.timespec = .{ .sec = 0, .nsec = 0 };
+    _ = std.c.clock_gettime(std.c.CLOCK.REALTIME, &ts);
+    return @as(i64, ts.sec) * 1000 + @divTrunc(@as(i64, ts.nsec), 1_000_000);
+}
+
+/// Plain pthread mutex.
+///
+/// `std.Thread.Mutex` no longer exists in Zig 0.17, and `std.Io.Mutex`
+/// demands an `Io` instance — which would mean standing up a
+/// `std.Io.Threaded` event loop for the sake of one lock, in a daemon that
+/// reaches the network through raw `std.c` sockets and never constructs an
+/// `Io`. libc's mutex is the honest fit.
+const Mutex = struct {
+    m: std.c.pthread_mutex_t = std.c.PTHREAD_MUTEX_INITIALIZER,
+
+    pub fn lock(self: *Mutex) void {
+        _ = std.c.pthread_mutex_lock(&self.m);
+    }
+    pub fn unlock(self: *Mutex) void {
+        _ = std.c.pthread_mutex_unlock(&self.m);
     }
 };
 
@@ -126,6 +179,25 @@ pub const Server = struct {
     store: *Store,
     boot_time_ns: u128,
     metrics: Metrics,
+
+    /// Guards every `store` mutation and every read of `store` state.
+    ///
+    /// The accept loop was single-threaded for the daemon's whole life,
+    /// which is why it never needed one. A maintenance thread breaks that
+    /// assumption immediately: it would be rewriting goal statuses while
+    /// `GET /api/goals` walks the same poset, and `GoalPoset.nodes` is an
+    /// `AutoHashMap` whose iterators do not survive a rehash. This is not
+    /// theoretical lock-hygiene — it is the difference between a daemon and
+    /// a crash.
+    store_mutex: Mutex = .{},
+
+    /// Maintenance thread, if one was started.
+    maint_thread: ?std.Thread = null,
+    /// Cleared by `deinit` to ask the thread to stop. Release/acquire: the
+    /// thread may be parked in a sleep and must observe the flip promptly.
+    maint_running: std.atomic.Value(bool) = .init(false),
+    /// Seconds between maintenance passes.
+    maint_interval_sec: u32 = 60,
 
     /// `data_dir` is `null` for an in-memory server: no WAL, no snapshot,
     /// nothing written to disk. Tests that are not about persistence must
@@ -151,10 +223,90 @@ pub const Server = struct {
     }
 
     pub fn deinit(self: *Server) void {
+        // Stop and JOIN the maintenance thread before touching anything it
+        // can reach. `store.deinit()` under a running thread is a
+        // use-after-free that happens to work until it doesn't.
+        self.stopMaintenance();
         if (self.fd >= 0) _ = std.c.close(self.fd);
         self.store.deinit();
         self.alloc.free(self.bind);
         self.alloc.destroy(self);
+    }
+
+    /// Start the periodic maintenance thread.
+    ///
+    /// `interval_sec == 0` disables it, which is what the tests use: a
+    /// background thread racing a test's assertions is a flaky test waiting
+    /// to be written.
+    pub fn startMaintenance(self: *Server, interval_sec: u32) !void {
+        if (interval_sec == 0) return;
+        if (self.maint_thread != null) return; // already running
+        self.maint_interval_sec = interval_sec;
+        self.maint_running.store(true, .release);
+        // If the spawn fails, do not leave the flag set: `stopMaintenance`
+        // would then be clearing a "running" state with no thread behind it.
+        errdefer self.maint_running.store(false, .release);
+        self.maint_thread = try std.Thread.spawn(.{}, maintenanceLoop, .{self});
+    }
+
+    fn stopMaintenance(self: *Server) void {
+        self.maint_running.store(false, .release);
+        if (self.maint_thread) |t| {
+            t.join();
+            self.maint_thread = null;
+        }
+    }
+
+    fn maintenanceLoop(srv: *Server) void {
+        // Sleep in short slices rather than one long sleep, so `deinit` is
+        // not held hostage to a 60-second interval. A daemon that takes a
+        // minute to shut down is a daemon that gets SIGKILLed instead.
+        const slice_ms: u32 = 100;
+        // u64 arithmetic: `interval_sec * 1000` overflows u32 above ~4.29e6
+        // seconds, which is a typo away from a nonsense slice count.
+        const slices: u64 = @max(@as(u64, srv.maint_interval_sec) * 1000 / slice_ms, 1);
+
+        while (srv.maint_running.load(.acquire)) {
+            var waited: u64 = 0;
+            while (waited < slices and srv.maint_running.load(.acquire)) : (waited += 1) {
+                sleepMs(slice_ms);
+            }
+            if (!srv.maint_running.load(.acquire)) break;
+
+            // Silent unless something actually changed. A per-pass log line
+            // is how a long-lived daemon fills a disk: launchd/systemd
+            // capture stdout, and one line a minute is 500MB a year for a
+            // daemon that has nothing to say.
+            srv.store_mutex.lock();
+            const res = srv.store.maintain(nowMs()) catch |err| blk: {
+                srv.store_mutex.unlock();
+                if (!builtin.is_test) log.warn("maintenance pass failed: {}", .{err});
+                break :blk null;
+            };
+            srv.store_mutex.unlock();
+
+            if (res) |r| {
+                // Bump the metric that /metrics actually publishes.
+                // `std.atomic.Value` is a plain struct wrapping a u64, so
+                // copying one into another copies the value, not a shared
+                // cell — a second counter field would have read 0 forever.
+                _ = srv.metrics.maintenance_passes.fetchAdd(1, .monotonic);
+                if (r.goals_unrealized > 0 or r.goals_failed > 0) {
+                    // Transitions are rare by construction (7-day rule), so
+                    // logging them unconditionally is safe and useful.
+                    if (!builtin.is_test) log.info("maintenance: {d} goal(s) unrealized, {d} failed", .{ r.goals_unrealized, r.goals_failed });
+                }
+            }
+        }
+    }
+
+    /// Run one maintenance pass synchronously. Used by the tests and by
+    /// `POST /api/sync`, so the behaviour is reachable without waiting out
+    /// an interval.
+    pub fn runMaintenanceNow(self: *Server) !Store.MaintenanceResult {
+        self.store_mutex.lock();
+        defer self.store_mutex.unlock();
+        return self.store.maintain(nowMs());
     }
 
     pub fn listen(self: *Server) !void {
@@ -215,7 +367,25 @@ pub const Server = struct {
 
         const path = if (std.mem.findScalar(u8, path_with_query, '?')) |q| path_with_query[0..q] else path_with_query;
 
-        const response = try self.route(method, path, req);
+        // One lock for the whole request, taken here rather than inside
+        // each handler.
+        //
+        // The alternative is a `lock()` in every handler that touches the
+        // store, and that shape fails open: the next handler someone adds
+        // simply forgets, and the bug only appears once maintenance is
+        // actually running. One coarse lock around the dispatch point
+        // cannot be forgotten, and request latency here is microseconds —
+        // there is no throughput argument for finer granularity.
+        //
+        // `handleConn` is the right altitude, not `route`: `route` is
+        // called directly by the tests, and locking there would deadlock
+        // against `runMaintenanceNow`.
+        self.store_mutex.lock();
+        const response = self.route(method, path, req) catch |err| {
+            self.store_mutex.unlock();
+            return err;
+        };
+        self.store_mutex.unlock();
         defer self.alloc.free(response.body);
 
         var header_buf: [512]u8 = undefined;
@@ -1193,3 +1363,162 @@ fn parseInsertPayloadFromId(alloc: Allocator, payload: []const u8, id: u64) Pars
 }
 
 const ParseError = error{ ParseFailed, OutOfMemory };
+
+// =============================================================================
+// Maintenance thread
+// =============================================================================
+
+test "Server: maintain marks an aged childless goal unrealized" {
+    const alloc = std.testing.allocator;
+    var srv = try Server.init(alloc, "127.0.0.1", 0, null);
+    defer srv.deinit();
+
+    const now = nowMs();
+    const gid = srv.store.goals.create("orphan", "no memories", null, 5, null, now - 30 * 86_400_000, &srv.store.ids) catch |err| {
+        std.log.warn("goal create failed: {s}", .{@errorName(err)});
+        return err;
+    };
+
+    const res = try srv.runMaintenanceNow();
+    try std.testing.expectEqual(@as(usize, 1), res.goals_unrealized);
+    try std.testing.expectEqual(@as(usize, 0), res.goals_failed);
+    try std.testing.expectEqual(core.GoalStatus.unrealized, srv.store.goals.get(gid).?.status);
+
+    // Idempotent: a second pass has nothing left to do.
+    const again = try srv.runMaintenanceNow();
+    try std.testing.expectEqual(@as(usize, 0), again.goals_unrealized);
+}
+
+test "Server: maintain leaves a goal that has memories alone" {
+    const alloc = std.testing.allocator;
+    var srv = try Server.init(alloc, "127.0.0.1", 0, null);
+    defer srv.deinit();
+
+    const now = nowMs();
+    const gid = srv.store.goals.create("attached", "has a memory", null, 5, null, now - 30 * 86_400_000, &srv.store.ids) catch |err| {
+        std.log.warn("goal create failed: {s}", .{@errorName(err)});
+        return err;
+    };
+    try srv.store.goals.bindMemcell(gid, 4242);
+
+    const res = try srv.runMaintenanceNow();
+    try std.testing.expectEqual(@as(usize, 0), res.goals_unrealized);
+    try std.testing.expectEqual(core.GoalStatus.pending, srv.store.goals.get(gid).?.status);
+}
+
+test "Server: a maintain pass is silent when nothing changed" {
+    // A per-pass log line is how a long-lived daemon fills a disk:
+    // launchd and systemd capture stdout, so "one line a minute" is
+    // ~500MB/year from a daemon with nothing to say. The pass only logs
+    // when a transition actually happened, so this asserts the quiet path
+    // exists and leaves no output behind.
+    const alloc = std.testing.allocator;
+    var srv = try Server.init(alloc, "127.0.0.1", 0, null);
+    defer srv.deinit();
+
+    _ = srv.store.goals.create("young", "not stale yet", null, 5, null, nowMs(), &srv.store.ids) catch |err| {
+        std.log.warn("goal create failed: {s}", .{@errorName(err)});
+        return err;
+    };
+    // If this emitted a log line, the Zig 0.17 test runner would fail the
+    // test outright — which is the assertion.
+    const res = try srv.runMaintenanceNow();
+    try std.testing.expectEqual(@as(usize, 0), res.goals_unrealized);
+}
+
+test "Server: maintenance thread starts, ticks, and stops cleanly" {
+    const alloc = std.testing.allocator;
+    var srv = try Server.init(alloc, "127.0.0.1", 0, null);
+
+    // 1-second interval, and we wait long enough for at least one pass.
+    try srv.startMaintenance(1);
+    var waited: u32 = 0;
+    while (waited < 2500 and srv.metrics.maintenance_passes.load(.monotonic) == 0) : (waited += 10) {
+        sleepMs(10);
+    }
+    try std.testing.expect(srv.metrics.maintenance_passes.load(.monotonic) >= 1);
+
+    // `deinit` must join the thread before freeing the store. If it did
+    // not, this is where a use-after-free would land — and under the
+    // testing allocator a leak or a double free fails the test.
+    srv.deinit();
+}
+
+test "Server: concurrent inserts and maintenance passes keep the store coherent" {
+    // Both threads take the same mutex the accept loop and the real
+    // maintenance thread take. That mirrors production exactly.
+    //
+    // Note what this does and does not prove: it shows the store stays
+    // coherent under contention and that `deinit` joins cleanly. It does
+    // NOT prove the absence of a data race — races are not observable by a
+    // passing test. The discipline that actually protects `GoalPoset.nodes`
+    // (an AutoHashMap whose iterators do not survive a rehash) is that
+    // there is exactly ONE lock acquisition point for requests,
+    // `handleConn`, so no handler can be added that forgets.
+    const alloc = std.testing.allocator;
+    var srv = try Server.init(alloc, "127.0.0.1", 0, null);
+    defer srv.deinit();
+
+    const Writer = struct {
+        fn run(s: *Server, n: usize) void {
+            var i: usize = 0;
+            while (i < n) : (i += 1) {
+                var buf: [64]u8 = undefined;
+                const text = std.fmt.bufPrint(&buf, "concurrent insert {d}", .{i}) catch "concurrent";
+                s.store_mutex.lock();
+                defer s.store_mutex.unlock();
+                _ = s.store.addRaw(.matter, text, "", 0, 0.0) catch {};
+            }
+        }
+    };
+
+    const Maint = struct {
+        fn run(s: *Server, rounds: usize) void {
+            var r: usize = 0;
+            while (r < rounds) : (r += 1) {
+                s.store_mutex.lock();
+                defer s.store_mutex.unlock();
+                _ = s.store.maintain(nowMs()) catch {};
+            }
+        }
+    };
+
+    var t1 = try std.Thread.spawn(.{}, Writer.run, .{ srv, 200 });
+    var t2 = try std.Thread.spawn(.{}, Writer.run, .{ srv, 200 });
+    var t3 = try std.Thread.spawn(.{}, Maint.run, .{ srv, 200 });
+
+    t1.join();
+    t2.join();
+    t3.join();
+
+    // Both writers' work landed, and the store is still coherent.
+    try std.testing.expectEqual(@as(usize, 400), srv.store.cellCount());
+}
+
+test "Server: a fresh daemon does not mark its own built-in goals unrealized" {
+    // Regression guard. The three seeded goals were created with
+    // `created_at = 0`, which under Constitution III's "no memories for 7
+    // days" rule makes them 56 years old the moment the store is built.
+    // The first maintenance pass therefore marked all three unrealized —
+    // before a single query had been served. Measured: a fresh daemon
+    // reported 4 goals unrealized, three of them built-ins that had
+    // existed for microseconds.
+    const alloc = std.testing.allocator;
+    var srv = try Server.init(alloc, "127.0.0.1", 0, null);
+    defer srv.deinit();
+
+    const res = try srv.runMaintenanceNow();
+    try std.testing.expectEqual(@as(usize, 0), res.goals_unrealized);
+    const seeded = [_][]const u8{ "general", "research", "system" };
+    for (seeded) |name| {
+        var found = false;
+        var it = srv.store.goals.nodes.iterator();
+        while (it.next()) |e| {
+            if (std.mem.eql(u8, e.value_ptr.*.name, name)) {
+                found = true;
+                try std.testing.expectEqual(core.GoalStatus.pending, e.value_ptr.*.status);
+            }
+        }
+        try std.testing.expect(found);
+    }
+}

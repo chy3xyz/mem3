@@ -299,43 +299,63 @@ pub const GoalPoset = struct {
         };
     }
 
-    /// Meta-goal evaluation: run periodically, mark goals with no associated
-    /// MemCells for > 7 days as .unrealized.
-    pub fn evaluateMetaGoals(self: *GoalPoset, now_ms: i64) !usize {
-        var unrealized_count: usize = 0;
-        // Collect ids first to avoid iterator invalidation. Zig 0.17's
-        // AutoHashMap may rehash on internal compaction; holding a
-        // value_ptr from iterator.next() across updateStatus() can lead
-        // to stale pointers and silent failures. We snapshot ids into
-        // a stack-allocated array (bounded by a sane upper limit) and
-        // re-fetch each GoalNode by id after updateStatus.
-        var ids: [256]u64 = undefined;
-        var n_ids: usize = 0;
+    /// Which goals Constitution III says are unrealizable as of `now_ms`:
+    /// no associated MemCells and older than the 7-day grace period.
+    ///
+    /// **Pure query — mutates nothing.** The policy decision belongs here;
+    /// applying it (and making it durable) belongs to the caller. That
+    /// split is what lets `Store.maintain` journal each transition to the
+    /// WAL: the previous shape, where `evaluateMetaGoals` called
+    /// `updateStatus` internally, produced changes that no WAL record could
+    /// ever describe, so a restart silently reverted them.
+    ///
+    /// Caller owns the returned slice.
+    pub fn staleGoals(self: *GoalPoset, alloc: Allocator, now_ms: i64) ![]u64 {
+        // Snapshot ids before mutating anything. Zig 0.17's AutoHashMap may
+        // rehash on internal compaction, so holding a `value_ptr` from
+        // `iterator.next()` across an insert is a stale-pointer bug waiting
+        // to happen.
+        //
+        // The old version snapshotted into a fixed `[256]u64` and `break`
+        //ed when full — past 256 goals it silently stopped evaluating and
+        // reported a count that looked complete. Allocator-backed, so the
+        //bound is memory, not a magic number.
+        var ids = std.ArrayList(u64).empty;
+        defer ids.deinit(alloc);
         {
             var it = self.nodes.iterator();
-            while (it.next()) |entry| {
-                if (n_ids >= ids.len) break;
-                ids[n_ids] = entry.key_ptr.*;
-                n_ids += 1;
-            }
+            while (it.next()) |entry| try ids.append(alloc, entry.key_ptr.*);
         }
-        for (ids[0..n_ids]) |id| {
-            const node_ptr = self.nodes.getPtr(id) orelse continue;
-            const node = node_ptr.*;
+
+        var out = std.ArrayList(u64).empty;
+        errdefer out.deinit(alloc);
+
+        for (ids.items) |id| {
+            const node = self.nodes.get(id) orelse continue;
             if (node.id == ROOT_GOAL_ID or node.id == TOP_GOAL_ID) continue;
             if (node.status == .tombstoned or node.status == .unrealized) continue;
+            if (self.memcellsFor(id).len != 0) continue;
+            if (now_ms - node.created_at <= 7 * 86_400_000) continue;
+            try out.append(alloc, id);
+        }
+        return out.toOwnedSlice(alloc);
+    }
 
-            const mcs = self.memcellsFor(node.id);
-            if (mcs.len == 0) {
-                const age_ms = now_ms - node.created_at;
-                if (age_ms > 7 * 86_400_000) {
-                    self.updateStatus(node.id, .unrealized, now_ms) catch |err| {
-                        diag("evaluateMetaGoals: updateStatus failed for goal {d}: {}", .{ node.id, err });
-                        continue;
-                    };
-                    unrealized_count += 1;
-                }
-            }
+    /// Apply `staleGoals` in place. Returns how many were marked.
+    ///
+    /// Kept for callers that deliberately do not want durability (the
+    /// unit tests). Anything that must survive a restart wants
+    /// `staleGoals` + `Store.updateGoalStatus` instead.
+    pub fn evaluateMetaGoals(self: *GoalPoset, now_ms: i64) !usize {
+        const ids = try self.staleGoals(self.alloc, now_ms);
+        defer self.alloc.free(ids);
+        var unrealized_count: usize = 0;
+        for (ids) |id| {
+            self.updateStatus(id, .unrealized, now_ms) catch |err| {
+                diag("evaluateMetaGoals: updateStatus failed for goal {d}: {}", .{ id, err });
+                continue;
+            };
+            unrealized_count += 1;
         }
         return unrealized_count;
     }

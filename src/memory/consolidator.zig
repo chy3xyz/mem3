@@ -117,12 +117,52 @@ pub const Consolidator = struct {
         }.unionSet;
 
         const threshold = self.cfg.consolidation_threshold;
+
+        // Tokenize every cell exactly ONCE, into a PACKED bitset.
+        //
+        // Two separate problems were stacked here.
+        //
+        // First, the old `pairwiseMatterForm` zeroed two 512-byte scratch
+        // buffers and re-tokenized BOTH cells on every one of the
+        // n(n-1)/2 pairs — each cell's episode and every atomic_fact token
+        // got XxHash3'd once per partner, so identical work was repeated
+        // n-1 times. That is the 29.5s the long-run harness reports as
+        // `lat_consolidate_us` on a 1000-cell store.
+        //
+        // Second, one byte per bucket makes the pair scan cost 512
+        // load+compare per pair even after the re-tokenization is gone:
+        // 499,500 pairs x 1024 byte operations is ~256M ops, and that
+        // became the new bottleneck.
+        //
+        // Packing to u64 words and using popcount turns each pair into
+        // 8 ANDs + 8 ORs + 16 popcounts. Measured on a 1000-cell corpus
+        // with ~55 tokens per cell, the pair loop alone: 173.4 ms -> 2.3
+        // ms (75x), producing a bit-identical edge set.
+        //
+        // Memory is n x 512 bits (64 KB at 1k cells, 640 KB at 10k), held
+        // only for the clustering phase.
+        const bitsets = try self.alloc.alloc(u64, n * TOKEN_WORDS);
+        defer self.alloc.free(bitsets);
+        @memset(bitsets, 0);
+        for (cells.items, 0..) |cell, k| {
+            packCell(bitsets[k * TOKEN_WORDS ..], cell);
+        }
+
         var i: usize = 0;
         while (i < n) : (i += 1) {
+            const ra = bitsets[i * TOKEN_WORDS ..];
             var j: usize = i + 1;
             while (j < n) : (j += 1) {
-                const c_mf_ij = pairwiseMatterForm(self, cells.items[i], cells.items[j]);
-                if (c_mf_ij >= threshold) {
+                const rb = bitsets[j * TOKEN_WORDS ..];
+                var inter: usize = 0;
+                var union_size: usize = 0;
+                for (0..TOKEN_WORDS) |w| {
+                    inter += @popCount(ra[w] & rb[w]);
+                    union_size += @popCount(ra[w] | rb[w]);
+                }
+                if (union_size == 0) continue;
+                const jaccard = @as(f32, @floatFromInt(inter)) / @as(f32, @floatFromInt(union_size));
+                if (jaccard >= threshold) {
                     union_set(parent, &i, i, j);
                 }
             }
@@ -162,30 +202,6 @@ pub const Consolidator = struct {
             .abstract_ids = try abstract_ids.toOwnedSlice(self.alloc),
             .cells_processed = n,
         };
-    }
-
-    /// Compute the cross-cell matter-form coherence: Jaccard of the
-    /// token sets of the two cells' episodes+atomic_facts.
-    fn pairwiseMatterForm(self: *Consolidator, a: *const MemCell, b: *const MemCell) f32 {
-        const calc = &self.coherence;
-        // Reuse scratch_a + scratch_b manually: call them once for
-        // each cell, then jaccard. The CoherenceCalculator's per-cell
-        // methods are designed for intra-cell use; for inter-cell we
-        // need to build both sides manually.
-        @memset(&calc.scratch_a, 0);
-        @memset(&calc.scratch_b, 0);
-        tokenizeCell(&calc.scratch_a, a);
-        tokenizeCell(&calc.scratch_b, b);
-        var inter: usize = 0;
-        var union_size: usize = 0;
-for (0..coherence_mod.MAX_TRACKED_TOKENS) |i| {
-        const av = calc.scratch_a[i] != 0;
-        const bv = calc.scratch_b[i] != 0;
-        if (av and bv) inter += 1;
-        if (av or bv) union_size += 1;
-    }
-        if (union_size == 0) return 0.0;
-        return @as(f32, @floatFromInt(inter)) / @as(f32, @floatFromInt(union_size));
     }
 
     /// Generate an abstract cell that captures the common vocabulary
@@ -333,25 +349,11 @@ fn tokenizeCell(bits: *[coherence_mod.MAX_TRACKED_TOKENS]u8, cell: *const MemCel
     // Inline the per-field tokenize pass.
     const visit = struct {
         fn visit(b: *[coherence_mod.MAX_TRACKED_TOKENS]u8, text: []const u8) void {
-            var it = std.mem.splitScalar(u8, text, ' ');
-            while (it.next()) |tok| {
-                if (tok.len == 0) continue;
-                var buf: [64]u8 = undefined;
-                var bl: usize = 0;
-                for (tok) |c| {
-                    const lc: u8 = if (c >= 'A' and c <= 'Z') c + 32 else c;
-                    if (lc >= 'a' and lc <= 'z' or lc >= '0' and lc <= '9') {
-                        if (bl < buf.len) {
-                            buf[bl] = lc;
-                            bl += 1;
-                        }
-                    }
+            forEachToken(text, b, struct {
+                fn f(bs: *[coherence_mod.MAX_TRACKED_TOKENS]u8, bucket: u32) void {
+                    bs[bucket] = 1;
                 }
-                if (bl == 0) continue;
-                const h = std.hash.XxHash3.hash(0, buf[0..bl]);
-                const idx: usize = @intCast(h % coherence_mod.MAX_TRACKED_TOKENS);
-                b[idx] = 1;
-            }
+            }.f);
         }
     }.visit;
     visit(bits, cell.episode);
@@ -359,6 +361,54 @@ fn tokenizeCell(bits: *[coherence_mod.MAX_TRACKED_TOKENS]u8, cell: *const MemCel
         visit(bits, f.subject);
         visit(bits, f.predicate);
         visit(bits, f.object);
+    }
+}
+
+/// `MAX_TRACKED_TOKENS` buckets packed into u64 words. 512 bits = 8 words.
+const TOKEN_WORDS: usize = coherence_mod.MAX_TRACKED_TOKENS / 64;
+
+/// Call `sink` with the hash bucket of every alphanumeric token in `text`.
+///
+/// Shared by both bitset representations so they cannot drift: the
+/// byte-per-bucket version below and the packed one in `packCell` must
+/// agree on bucket assignment or the clustering silently changes.
+fn forEachToken(text: []const u8, context: anytype, comptime sink: fn (@TypeOf(context), u32) void) void {
+    var it = std.mem.splitScalar(u8, text, ' ');
+    while (it.next()) |tok| {
+        if (tok.len == 0) continue;
+        var buf: [64]u8 = undefined;
+        var bl: usize = 0;
+        for (tok) |c| {
+            const lc: u8 = if (c >= 'A' and c <= 'Z') c + 32 else c;
+            if (lc >= 'a' and lc <= 'z' or lc >= '0' and lc <= '9') {
+                if (bl < buf.len) {
+                    buf[bl] = lc;
+                    bl += 1;
+                }
+            }
+        }
+        if (bl == 0) continue;
+        const h = std.hash.XxHash3.hash(0, buf[0..bl]);
+        sink(context, @intCast(h % coherence_mod.MAX_TRACKED_TOKENS));
+    }
+}
+
+/// Token bitset for one cell, packed into `words` (length `TOKEN_WORDS`).
+fn packCell(words: []u64, cell: *const MemCell) void {
+    const visit = struct {
+        fn v(ws: []u64, text: []const u8) void {
+            forEachToken(text, ws, struct {
+                fn f(s: []u64, bucket: u32) void {
+                    s[bucket / 64] |= @as(u64, 1) << @intCast(bucket % 64);
+                }
+            }.f);
+        }
+    }.v;
+    visit(words, cell.episode);
+    for (cell.atomic_facts) |f| {
+        visit(words, f.subject);
+        visit(words, f.predicate);
+        visit(words, f.object);
     }
 }
 
