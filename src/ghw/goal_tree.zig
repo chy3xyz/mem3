@@ -46,14 +46,38 @@ pub const ROOT_GOAL_ID: u64 = 0;
 /// Synthetic top goal id (⊤). Never returned to the user.
 pub const TOP_GOAL_ID: u64 = std.math.maxInt(u64) - 1;
 
+/// The memories bound to one goal, in insertion order.
+///
+/// `ids` is the single source of truth and is handed out verbatim by
+/// `memcellsFor`, which snapshot, serialization and
+/// `memcellsFor(gid)[0]` all depend on — so it is never reordered and
+/// never deduplicated behind the caller's back.
+///
+/// `high_water` exists only to answer "could this id possibly already be
+/// here?" in O(1). It is an **upper bound hint**, never read for its
+/// value: `bindMemcell` compares a candidate against it and skips the
+/// duplicate scan when the candidate is strictly above it. Removal never
+/// lowers it, because a stale-high value can only cost one extra scan —
+/// it can never let a duplicate through. That asymmetry is what makes a
+/// single hint safe here where a second index (and the invariant that it
+/// cannot drift from `ids`) would not be.
+pub const BindingList = struct {
+    ids: std.ArrayList(u64) = .empty,
+    high_water: u64 = 0,
+
+    fn deinit(self: *BindingList, alloc: Allocator) void {
+        self.ids.deinit(alloc);
+    }
+};
+
 pub const GoalPoset = struct {
     alloc: Allocator,
     /// Backing store: id -> node.
     nodes: std.AutoHashMap(u64, *GoalNode),
     /// Adjacency: parent_id -> list of child ids. Used for descendants().
     children: std.AutoHashMap(u64, std.ArrayList(u64)),
-    /// Reverse index: goal_id -> list of associated MemCell ids.
-    memcell_index: std.AutoHashMap(u64, std.ArrayList(u64)),
+    /// Reverse index: goal_id -> memories bound to it, insertion order.
+    memcell_index: std.AutoHashMap(u64, BindingList),
 
     /// Build a synthetic (root/top) node. Returns null when the allocator
     /// could not satisfy the request -- `error.OutOfMemory` is genuinely
@@ -103,7 +127,7 @@ pub const GoalPoset = struct {
             .alloc = alloc,
             .nodes = std.AutoHashMap(u64, *GoalNode).init(alloc),
             .children = std.AutoHashMap(u64, std.ArrayList(u64)).init(alloc),
-            .memcell_index = std.AutoHashMap(u64, std.ArrayList(u64)).init(alloc),
+            .memcell_index = std.AutoHashMap(u64, BindingList).init(alloc),
         };
         // `Allocator.create` and `HashMap.put` return `error.OutOfMemory`,
         // which is genuinely reachable under memory pressure -- it is NOT
@@ -150,7 +174,7 @@ pub const GoalPoset = struct {
 
         var mit = self.memcell_index.iterator();
         while (mit.next()) |entry| {
-            entry.value_ptr.*.deinit(self.alloc);
+            entry.value_ptr.deinit(self.alloc);
         }
         self.memcell_index.deinit();
     }
@@ -235,34 +259,93 @@ pub const GoalPoset = struct {
     /// Bind a MemCell to a goal. Maintains the reverse index.
     /// Constitution III: the bind call also marks the goal as "having
     /// memcells", preventing it from being marked .unrealized.
+    ///
+    /// Binding the same cell twice is a no-op. That guarantee used to
+    /// cost O(k) per insert (k = memories already on the goal), which
+    /// made filling one goal's corpus quadratic. It is now O(1) on the
+    /// production path: `Store.encodeAcrossLayers` passes a freshly
+    /// minted, strictly increasing id, so the id is above the goal's
+    /// high-water mark and provably absent. The scan below still runs in
+    /// full for any id at or below the mark, so the no-op guarantee is
+    /// unchanged — only the cost of proving it moved.
     pub fn bindMemcell(self: *GoalPoset, goal_id: u64, memcell_id: u64) errors.Error!void {
         if (!self.nodes.contains(goal_id)) return errors.Error.GoalNotFound;
-        const list = self.memcell_index.getPtr(goal_id) orelse blk: {
-            const new_list = std.ArrayList(u64).empty;
-            try self.memcell_index.put(goal_id, new_list);
+        const slot = self.memcell_index.getPtr(goal_id) orelse blk: {
+            try self.memcell_index.put(goal_id, .{});
             break :blk self.memcell_index.getPtr(goal_id).?;
         };
-        // Avoid duplicates.
-        for (list.items) |id| if (id == memcell_id) return;
-        try list.append(self.alloc, memcell_id);
+
+        if (memcell_id > slot.high_water) {
+            // Strictly above everything ever bound here: cannot be a
+            // duplicate, so the scan is provably unnecessary.
+            try slot.ids.append(self.alloc, memcell_id);
+            slot.high_water = memcell_id;
+            return;
+        }
+
+        // At or below the mark: prove absence the hard way.
+        for (slot.ids.items) |id| if (id == memcell_id) return;
+        try slot.ids.append(self.alloc, memcell_id);
+        // `high_water` is deliberately not updated here — the branch is
+        // only reached when `memcell_id <= high_water`, so it is already
+        // at least as large as the id just appended.
     }
 
     /// Unbind a MemCell from a goal. (Used by forgetting; PCR-mandated
     /// preservation is for facts, not for goal bindings.)
+    ///
+    /// `high_water` is left alone; see `BindingList`.
     pub fn unbindMemcell(self: *GoalPoset, goal_id: u64, memcell_id: u64) errors.Error!void {
-        const list = self.memcell_index.getPtr(goal_id) orelse return errors.Error.GoalNotFound;
-        for (list.items, 0..) |id, i| {
+        const slot = self.memcell_index.getPtr(goal_id) orelse return errors.Error.GoalNotFound;
+        for (slot.ids.items, 0..) |id, i| {
             if (id == memcell_id) {
-                _ = list.orderedRemove(i);
+                _ = slot.ids.orderedRemove(i);
                 return;
             }
         }
     }
 
-    /// List MemCell ids associated with a goal.
+    /// Drop `memcell_ids` from **every** goal's bindings, in one pass.
+    ///
+    /// The forget sweep knows which cells died but not which goals they
+    /// were bound to, and there is deliberately no `cell_id -> goal_id`
+    /// index to consult: `GoalSnapshot` carries no binding ids, so every
+    /// binding in the process is reconstructed by WAL replay through
+    /// `bindMemcell`. A second index would have to be reconstructed and
+    /// kept in lockstep across replay, restore and snapshot rotation, and
+    /// a drift between the two would silently resurrect exactly the bug
+    /// this function removes.
+    ///
+    /// Cost is O(forgotten + total bindings) using a throwaway set of the
+    /// forgotten ids, which is the same order as the O(cells) id diff
+    /// `Store.forget` already performs around the sweep. Iteration is
+    /// backwards so `orderedRemove` indices stay valid as the list
+    /// shrinks, and surviving bindings keep their relative order.
+    pub fn unbindCellsEverywhere(self: *GoalPoset, memcell_ids: []const u64) errors.Error!void {
+        if (memcell_ids.len == 0) return;
+
+        // `AutoHashMap(u64, void)` as a set: this toolchain's std has no
+        // `std.AutoHashSet`.
+        var doomed = std.AutoHashMap(u64, void).init(self.alloc);
+        defer doomed.deinit();
+        for (memcell_ids) |id| try doomed.put(id, {});
+
+        var it = self.memcell_index.iterator();
+        while (it.next()) |entry| {
+            const bound = &entry.value_ptr.ids;
+            var i = bound.items.len;
+            while (i > 0) {
+                i -= 1;
+                if (doomed.contains(bound.items[i])) _ = bound.orderedRemove(i);
+            }
+        }
+    }
+
+    /// List MemCell ids associated with a goal, in the order they were
+    /// bound.
     pub fn memcellsFor(self: *const GoalPoset, goal_id: u64) []const u64 {
-        const list = self.memcell_index.getPtr(goal_id) orelse return &.{};
-        return list.items;
+        const slot = self.memcell_index.getPtr(goal_id) orelse return &.{};
+        return slot.ids.items;
     }
 
     /// Direct children of a goal (one step down the lattice).
@@ -506,4 +589,8 @@ test "GoalPoset: init survives OOM at every allocation site" {
         var poset = GoalPoset.init(failing.allocator());
         poset.deinit();
     }
+}
+
+test "ZZMARKER goal_tree collection probe" {
+    try std.testing.expect(true);
 }

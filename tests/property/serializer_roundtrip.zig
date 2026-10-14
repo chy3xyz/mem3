@@ -37,6 +37,19 @@ test "serializer: random Fact slice round-trips" {
     const alloc = testing.allocator;
     var state = lcgSeed();
 
+    // The strings `facts[i]` points at must stay alive until `serialize` has
+    // read them. They used to be released by `defer` *inside* the per-index
+    // generation loop, which fires at the end of every iteration — so by the
+    // time `serialize` ran, every field was a dangling pointer. The test
+    // never caught it because it never compiled, and once it did compile it
+    // segfaulted inside `sizeOf`. Ownership is therefore collected here and
+    // released once the whole run is done.
+    var owned = std.ArrayList([]u8).empty;
+    defer {
+        for (owned.items) |b| alloc.free(b);
+        owned.deinit(alloc);
+    }
+
     var run: usize = 0;
     while (run < 32) : (run += 1) {
         const n = @as(usize, lcgNext(&state) % 5) + 1;
@@ -49,13 +62,13 @@ test "serializer: random Fact slice round-trips" {
             const obj_len = @as(usize, lcgNext(&state) % 10) + 1;
             const src_len = @as(usize, lcgNext(&state) % 4) + 1;
             const subj = try randomBytes(alloc, subj_len, &state);
-            defer alloc.free(subj);
+            try owned.append(alloc, subj);
             const pred = try randomBytes(alloc, pred_len, &state);
-            defer alloc.free(pred);
+            try owned.append(alloc, pred);
             const obj = try randomBytes(alloc, obj_len, &state);
-            defer alloc.free(obj);
+            try owned.append(alloc, obj);
             const src = try randomBytes(alloc, src_len, &state);
-            defer alloc.free(src);
+            try owned.append(alloc, src);
             f.* = .{
                 .subject = subj,
                 .predicate = pred,
@@ -86,6 +99,12 @@ test "serializer: random Fact slice round-trips" {
             try testing.expectEqualStrings(a.source, b.source);
             try testing.expect(a.confidence == b.confidence);
         }
+
+        // Release this run's strings now that `out` has been compared.
+        // Clearing at the top of the next iteration instead would drop the
+        // previous run's buffers on the floor and leak all of them.
+        for (owned.items) |b| alloc.free(b);
+        owned.clearRetainingCapacity();
     }
 }
 

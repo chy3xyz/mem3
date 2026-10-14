@@ -26,6 +26,17 @@
 //! — readers either see the old or the new file, never a partial
 //! write. On crash mid-write, the previous snapshot is still
 //! available; the half-written temp file is unlinked at startup.
+//!
+//! ## Format versioning
+//!
+//! `SNAPSHOT_VERSION` is written in the header and read back before
+//! any section is parsed, so a section can change shape without
+//! making the rest of the file unreadable. v2 extended the goal row
+//! with the four timestamp slots it had no room for in v1; see
+//! `SNAPSHOT_VERSION` for the layout, what a v1 file does now, and
+//! what it could not carry. The file is parsed from untrusted bytes,
+//! so every read is bounds-checked and every enum discriminant is
+//! range-checked — a corrupt snapshot is an error, never a panic.
 
 const std = @import("std");
 const platform_fs = @import("../platform/fs.zig");
@@ -46,9 +57,72 @@ const hashing = @import("../utils/hashing.zig");
 /// incompatible format changes makes the loader refuse to read
 /// older snapshots, surfacing the migration need loudly.
 pub const SNAPSHOT_MAGIC: u32 = 0x4D45_4D53; // "MEMS" in little-endian
-pub const SNAPSHOT_VERSION: u32 = 1;
+
+/// Current on-disk format version.
+///
+/// ## v2 — goal rows carry their timestamps
+///
+/// Appended to the END of every goal row, after `priority`:
+///
+///     has_deadline      u8  [+ deadline        i64]
+///     created_at        i64
+///     updated_at        i64
+///     has_unrealized_at u8  [+ unrealized_at   i64]
+///
+/// The v1 prefix of a row (id, name, description, has_parent,
+/// parent_id, status, priority) is byte-for-byte what v1 wrote, and
+/// the version word is read *before* the goal section, so a v2 reader
+/// loads a v1 file by not reading the suffix. Nothing else in the file
+/// changed — header, counter, cell rows and fuzzy rows are identical
+/// across the two versions — so the version branch lives in exactly one
+/// place, and an older file's tail needs no re-interpretation.
+///
+/// **Existing v1 files still load.** A v2 file does NOT load on a v1
+/// build: the v1 reader rejects it as `SnapshotBadVersion`, which
+/// `Store.loadSnapshot` already treats as "no valid snapshot" and falls
+/// back to a WAL replay — and `takeSnapshot` re-journals the whole
+/// poset into the fresh WAL immediately after every snapshot, so that
+/// fallback costs nothing but the timestamps the v1 record had no room
+/// for. Upgrading the binary is still the right answer; downgrading
+/// loses goal ages, not goals.
+///
+/// ## Why the version had to move
+///
+/// `GoalSnapshot` (v1) had no slot for `created_at`, so
+/// `Store.restoreGoalRow` stamped every restored goal with the *restore
+/// time*. `GoalPoset.staleGoals` marks a goal unrealized on
+/// `now - created_at > 7 days`, so a goal recovered from a snapshot
+/// could never go stale: the maintenance thread's unrealization rule
+/// silently did not apply to it, while a WAL-replayed store aged its
+/// goals correctly. Same store, two restore paths, two behaviours,
+/// decided by whether a snapshot happened to exist.
+pub const SNAPSHOT_VERSION: u32 = 2;
+
+/// The original format: a goal row ended at `priority`.
+pub const SNAPSHOT_VERSION_LEGACY: u32 = 1;
+
+/// Oldest version `read` still accepts. v1 predates the goal
+/// timestamps; anything older is refused rather than guessed at.
+pub const SNAPSHOT_MIN_VERSION: u32 = SNAPSHOT_VERSION_LEGACY;
 
 /// Per-goal snapshot row.
+///
+/// ## The four timestamp slots, and why they are `?i64` and not `i64`
+///
+/// v1 carried none of them. A reader therefore has to be able to say
+/// "this file does not know when this goal was created" *distinctly*
+/// from "this goal was created at 0", because the two produce opposite
+/// behaviour downstream: `staleGoals` computes `now - created_at`, so a
+/// real 0 would make every goal restored from a v1 file instantly
+/// stale — the snapshot path manufacturing the very data loss the
+/// snapshot exists to prevent. `null` means "not carried"; the
+/// restore path stamps the restore time for `null`, exactly as v1
+/// did. v2 rows always carry all four, so `null` here means the file
+/// is a v1 file and nothing else.
+///
+/// `deadline` and `unrealized_at` are nullable in the model anyway;
+/// `created_at` and `updated_at` are not, which is why their
+/// nullability here is a *format* fact rather than a model fact.
 pub const GoalSnapshot = struct {
     id: u64,
     name: []const u8,
@@ -56,6 +130,16 @@ pub const GoalSnapshot = struct {
     parent_id: ?u64,
     status: GoalStatus,
     priority: u8,
+    /// v2 only; `null` for a v1 row.
+    deadline: ?i64 = null,
+    /// v2 only; `null` for a v1 row. See the note above before
+    /// substituting 0.
+    created_at: ?i64 = null,
+    /// v2 only; `null` for a v1 row.
+    updated_at: ?i64 = null,
+    /// v2 only; `null` for a v1 row *and* for a goal that has never
+    /// been unrealized.
+    unrealized_at: ?i64 = null,
 };
 
 /// Per-cell snapshot row. Owned (heap-allocated strings). Free via
@@ -174,6 +258,20 @@ pub const SnapshotWriter = struct {
             if (g.parent_id) |pid| try w.writeU64(pid);
             try w.writeU8(@intFromEnum(g.status));
             try w.writeU8(g.priority);
+            // v2 suffix. Appended after `priority` so the v1 prefix of a
+            // row is unchanged and a v1 file is still readable by
+            // skipping exactly this block. `collectGoals` fills all
+            // four from the live node, so `orelse 0` is unreachable —
+            // but an uninitialised 0 written as a *timestamp* would age
+            // a goal by 56 years, so the fallback is written explicitly
+            // rather than left to `undefined` reading as whatever was
+            // in the buffer.
+            try w.writeBool(g.deadline != null);
+            if (g.deadline) |d| try w.writeI64(d);
+            try w.writeI64(g.created_at orelse 0);
+            try w.writeI64(g.updated_at orelse g.created_at orelse 0);
+            try w.writeBool(g.unrealized_at != null);
+            if (g.unrealized_at) |ua| try w.writeI64(ua);
         }
 
         // Cells (live, from mgr)
@@ -276,6 +374,13 @@ pub const SnapshotWriter = struct {
                     .parent_id = parent_id,
                     .status = node.status,
                     .priority = node.priority,
+                    // The whole point of the v2 row: without these the
+                    // restore path has nothing but the clock to stamp,
+                    // and a restored goal never ages out.
+                    .deadline = node.deadline,
+                    .created_at = node.created_at,
+                    .updated_at = node.updated_at,
+                    .unrealized_at = node.unrealized_at,
                 });
                 try queue.append(self.alloc, child_id);
             }
@@ -399,7 +504,14 @@ pub fn read(alloc: Allocator, path: []const u8) !SnapshotData {
     const magic = try r.readU32();
     if (magic != SNAPSHOT_MAGIC) return error.SnapshotBadMagic;
     const version = try r.readU32();
-    if (version != SNAPSHOT_VERSION) return error.SnapshotBadVersion;
+    // Read *before* the goal section, which is what makes the versioned
+    // goal row affordable: a v1 file is simply a v2 file with the
+    // per-row timestamp suffix missing, and nothing after the goal
+    // section differs between the two versions.
+    if (version < SNAPSHOT_MIN_VERSION or version > SNAPSHOT_VERSION) {
+        return error.SnapshotBadVersion;
+    }
+    const has_goal_timestamps = version >= 2;
 
     const counter = try r.readU64();
 
@@ -410,28 +522,68 @@ pub fn read(alloc: Allocator, path: []const u8) !SnapshotData {
     // row unconditionally). Without this errdefer a truncated snapshot
     // leaked the whole goal array — unreachable while `collectGoals`
     // was a stub that emitted nothing, live the moment it emits.
+    //
+    // Two counters, because a row owns its strings *progressively*:
+    // `goals_named` counts rows whose `name` exists (the row is then
+    // part-built — its `description` is not allocated yet, so
+    // `freeCellSnapshot`-style unconditional freeing would free
+    // `undefined` bytes), and `goals_filled` counts rows that are
+    // complete. One counter cannot express both, and the row currently
+    // being parsed is the one that differs.
+    var goals_named: usize = 0;
     var goals_filled: usize = 0;
     errdefer {
         for (goals[0..goals_filled]) |*g| {
             alloc.free(@constCast(g.name));
             alloc.free(@constCast(g.description));
         }
+        // At most one row is part-built: the one in flight.
+        if (goals_named > goals_filled) {
+            alloc.free(@constCast(goals[goals_filled].name));
+        }
         alloc.free(goals);
     }
     for (goals) |*g| {
         g.id = try r.readU64();
         g.name = try r.readStringAlloc(alloc);
+        // Counted here, not at the end of the row: a file truncated
+        // between the name and the description fails *after* this point
+        // and the name still has to be freed. Counting at the end of the
+        // row leaked exactly what the reader was supposed to reject
+        // cleanly — one allocation per corrupt snapshot, on a path a
+        // hostile file can drive as often as it likes.
+        goals_named += 1;
         g.description = try r.readStringAlloc(alloc);
-        // Counted the moment the two owning strings exist, not at the
-        // end of the row: a corrupt discriminant or a truncated tail
-        // fails *after* this point, and those strings still have to be
-        // freed. Counting at the end leaked exactly what the reader was
-        // supposed to reject cleanly.
         goals_filled += 1;
         const has_parent = try r.readBool();
         g.parent_id = if (has_parent) try r.readU64() else null;
         g.status = try readEnumByte(GoalStatus, &r);
         g.priority = try r.readU8();
+        if (has_goal_timestamps) {
+            // Every read below is width-checked by `readExact`, and the
+            // two optional i64s are gated by a flag byte that is itself
+            // a checked read — so a truncated tail lands on
+            // `SnapshotTruncated` rather than on `undefined` bytes.
+            // Note the ordering: the strings for this row were counted
+            // into `goals_filled` above, so failing here still frees
+            // them.
+            const has_deadline = try r.readBool();
+            g.deadline = if (has_deadline) try r.readI64() else null;
+            g.created_at = try r.readI64();
+            g.updated_at = try r.readI64();
+            const has_unrealized = try r.readBool();
+            g.unrealized_at = if (has_unrealized) try r.readI64() else null;
+        } else {
+            // v1: the file genuinely does not know. Leave every slot
+            // null rather than inventing a value — `null` is the one
+            // encoding the restore path can distinguish from a real
+            // timestamp, and it is what keeps a v1 file loading with
+            // exactly the behaviour it had before this field existed.
+            g.deadline = null;
+            g.created_at = null;
+            g.updated_at = null;
+            g.unrealized_at = null;
+        }
     }
 
     const cells_count = try r.readU64();
@@ -481,22 +633,31 @@ fn readCellSnapshot(alloc: Allocator, r: *BufferedReader, cell: *CellSnapshot) !
     errdefer alloc.free(@constCast(cs.episode));
     const facts_len = try r.readU64();
     cs.facts = try alloc.alloc(core.Fact, facts_len);
-    errdefer alloc.free(@constCast(cs.facts));
-    for (cs.facts) |*f| {
-        f.subject = try r.readStringAlloc(alloc);
-        f.predicate = try r.readStringAlloc(alloc);
-        f.object = try r.readStringAlloc(alloc);
-        f.confidence = try r.readF32();
-        f.source = try r.readStringAlloc(alloc);
+    // Each element is built by a helper that owns its own cleanup, and
+    // the count of *completed* elements is what the errdefer may walk:
+    // a file truncated inside a fact otherwise leaves an array whose
+    // tail is `undefined`, and freeing that tail frees garbage. This
+    // loop used to inline the four string reads and leak every string
+    // before the cut.
+    var facts_read: usize = 0;
+    errdefer {
+        freeFactStrings(alloc, cs.facts[0..facts_read]);
+        // Not `freeFacts(cs.facts[0..facts_read])`: a zero-length slice
+        // frees nothing at all, and the array is what was allocated.
+        alloc.free(@constCast(cs.facts));
+    }
+    while (facts_read < cs.facts.len) : (facts_read += 1) {
+        cs.facts[facts_read] = try readFact(alloc, r);
     }
     const foresight_len = try r.readU64();
     cs.foresight = try alloc.alloc(core.Foresight, foresight_len);
-    errdefer alloc.free(@constCast(cs.foresight));
-    for (cs.foresight) |*f| {
-        f.description = try r.readStringAlloc(alloc);
-        f.valid_from = try r.readI64();
-        f.valid_until = try r.readI64();
-        f.confidence = try r.readF32();
+    var foresight_read: usize = 0;
+    errdefer {
+        for (cs.foresight[0..foresight_read]) |f| alloc.free(@constCast(f.description));
+        alloc.free(@constCast(cs.foresight));
+    }
+    while (foresight_read < cs.foresight.len) : (foresight_read += 1) {
+        cs.foresight[foresight_read] = try readForesight(alloc, r);
     }
     const goals_len = try r.readU64();
     cs.goal_associations = try alloc.alloc(core.GoalAssociation, goals_len);
@@ -511,7 +672,14 @@ fn readCellSnapshot(alloc: Allocator, r: *BufferedReader, cell: *CellSnapshot) !
     cs.metadata.source_confidence = try r.readF32();
     cs.metadata.emotional_valence = try r.readF32();
     const has_loc = try r.readBool();
-    cs.metadata.location = if (has_loc) try r.readStringAlloc(alloc) else null;
+    // Held in a local until the row is complete: everything after it is
+    // a fixed-width read that a truncated file can still fail on, and
+    // the string would then be reachable only from a `CellSnapshot`
+    // the caller never receives.
+    const location = if (has_loc) try r.readStringAlloc(alloc) else null;
+    errdefer {
+        if (location) |loc| alloc.free(@constCast(loc));
+    }
     cs.metadata.access_count = try r.readU64();
     cs.metadata.last_accessed_at = try r.readI64();
     cs.metadata.coherence_score = try r.readF32();
@@ -522,6 +690,40 @@ fn readCellSnapshot(alloc: Allocator, r: *BufferedReader, cell: *CellSnapshot) !
     cs.metadata.superseded_at = if (has_sup) try r.readI64() else null;
     const has_fuzz = try r.readBool();
     cs.metadata.fuzzed_at = if (has_fuzz) try r.readI64() else null;
+    // Nothing below can fail, so ownership transfers cleanly.
+    cs.metadata.location = location;
+}
+
+/// One fact, or nothing at all: the four strings are freed on any
+/// failure, so a truncated file cannot strand them inside a
+/// half-initialised array element.
+fn readFact(alloc: Allocator, r: *BufferedReader) !core.Fact {
+    var f: core.Fact = undefined;
+    f.subject = try r.readStringAlloc(alloc);
+    errdefer alloc.free(@constCast(f.subject));
+    f.predicate = try r.readStringAlloc(alloc);
+    errdefer alloc.free(@constCast(f.predicate));
+    f.object = try r.readStringAlloc(alloc);
+    errdefer alloc.free(@constCast(f.object));
+    // Wire order is subject, predicate, object, confidence, source —
+    // `confidence` is a fixed-width read that precedes `source`, and
+    // reading them the other way round desynchronises the whole stream
+    // behind it rather than failing here.
+    f.confidence = try r.readF32();
+    f.source = try r.readStringAlloc(alloc);
+    errdefer alloc.free(@constCast(f.source));
+    return f;
+}
+
+/// One foresight entry, or nothing. Same shape as `readFact`.
+fn readForesight(alloc: Allocator, r: *BufferedReader) !core.Foresight {
+    var f: core.Foresight = undefined;
+    f.description = try r.readStringAlloc(alloc);
+    errdefer alloc.free(@constCast(f.description));
+    f.valid_from = try r.readI64();
+    f.valid_until = try r.readI64();
+    f.confidence = try r.readF32();
+    return f;
 }
 
 /// Read one byte as an enum discriminant, rejecting out-of-range values.
@@ -541,17 +743,30 @@ fn readEnumByte(comptime T: type, r: *BufferedReader) !T {
 fn freeCellSnapshot(alloc: Allocator, cell: *CellSnapshot) void {
     const cs = cell;
     alloc.free(@constCast(cs.episode));
-    for (cs.facts) |f| {
+    freeFacts(alloc, cs.facts);
+    for (cs.foresight) |f| alloc.free(@constCast(f.description));
+    alloc.free(@constCast(cs.foresight));
+    alloc.free(@constCast(cs.goal_associations));
+    if (cs.metadata.location) |loc| alloc.free(@constCast(loc));
+}
+
+/// Free `facts` and every string in it.
+fn freeFacts(alloc: Allocator, facts: []core.Fact) void {
+    freeFactStrings(alloc, facts);
+    alloc.free(@constCast(facts));
+}
+
+/// Free every string in `facts`, but not the array. Takes a slice rather
+/// than a pointer so a caller holding a part-read array can pass the
+/// part that was actually built — its tail is `undefined`, and freeing
+/// that tail frees garbage.
+fn freeFactStrings(alloc: Allocator, facts: []const core.Fact) void {
+    for (facts) |f| {
         alloc.free(@constCast(f.subject));
         alloc.free(@constCast(f.predicate));
         alloc.free(@constCast(f.object));
         alloc.free(@constCast(f.source));
     }
-    alloc.free(@constCast(cs.facts));
-    for (cs.foresight) |f| alloc.free(@constCast(f.description));
-    alloc.free(@constCast(cs.foresight));
-    alloc.free(@constCast(cs.goal_associations));
-    if (cs.metadata.location) |loc| alloc.free(@constCast(loc));
 }
 
 // =============================================================================
@@ -916,4 +1131,566 @@ test "Snapshot: a corrupt goal status byte is rejected, not panicked on" {
     // reader has to reject it itself, or a single corrupt byte takes
     // the whole process down instead of failing this one load.
     try std.testing.expectError(error.SnapshotCorruptField, read(alloc, path));
+}
+
+// =============================================================================
+// Goal timestamps (format v2)
+//
+// v1 had no slot for a goal's timestamps, so `Store.restoreGoalRow` had
+// nothing to restore and stamped every goal with the wall clock at
+// restore time. `GoalPoset.staleGoals` marks a goal unrealized on
+// `now - created_at > 7 days`, so a goal recovered from a snapshot
+// could never go stale, while a WAL-replayed store aged its goals
+// correctly — the same store behaving differently depending on whether
+// a snapshot happened to exist. Everything below is the format end of
+// that fix: the four values have to survive write -> read, and a poset
+// rebuilt from the rows has to be indistinguishable from the one that
+// was written.
+// =============================================================================
+
+/// Read a whole file. Caller frees. Test-only.
+fn readRawFile(alloc: Allocator, path: []const u8) ![]u8 {
+    var zb: [platform_fs.max_path_bytes + 1]u8 = undefined;
+    const z = std.fmt.bufPrint(&zb, "{s}\x00", .{path}) catch return error.SnapshotPathTooLong;
+    const zpath = z[0 .. z.len - 1 :0];
+    const fd = try platform_fs.open(zpath, .{ .access = .read_only });
+    defer platform_fs.close(fd);
+    const size: usize = @intCast(try platform_fs.sizeOf(fd));
+    const raw = try alloc.alloc(u8, size);
+    errdefer alloc.free(raw);
+    // `readFull` reports a short read as success-with-fewer-bytes, so
+    // the count has to be checked here rather than assumed.
+    const got = try platform_fs.readFull(fd, raw);
+    if (got != size) {
+        alloc.free(raw);
+        return error.SnapshotTruncated;
+    }
+    return raw;
+}
+
+/// Overwrite `path` with `bytes`. Test-only.
+fn writeRawFile(path: []const u8, bytes: []const u8) !void {
+    var zb: [platform_fs.max_path_bytes + 1]u8 = undefined;
+    const z = std.fmt.bufPrint(&zb, "{s}\x00", .{path}) catch return error.SnapshotPathTooLong;
+    const zpath = z[0 .. z.len - 1 :0];
+    const fd = try platform_fs.open(zpath, .{ .access = .write_only, .create = .truncate });
+    defer platform_fs.close(fd);
+    try platform_fs.writeAll(fd, bytes);
+}
+
+/// Offset one past the last byte of goal row `upto - 1` under the **v1**
+/// layout — i.e. right after that row's `priority`, which is exactly
+/// where v2 starts appending. Derived from the layout the writer
+/// documents rather than hard-coded, so a layout change moves this and
+/// the cross-check below with it.
+fn v1GoalRowEndOffset(rows: []const GoalSnapshot, upto: usize) usize {
+    // magic u32 | version u32 | counter u64 | goals_count u64
+    var off: usize = 4 + 4 + 8 + 8;
+    for (rows[0..upto]) |r| {
+        off += 8; // id
+        off += 8 + r.name.len; // name_len + name
+        off += 8 + r.description.len; // description_len + description
+        off += 1; // has_parent
+        if (r.parent_id != null) off += 8; // parent_id
+        off += 1; // status
+        off += 1; // priority  <- v1 row ends here
+    }
+    return off;
+}
+
+/// The bytes v2 appends after row `r`'s `priority`, encoded independently
+/// of the writer so the layout is pinned by a second implementation of
+/// the spec rather than by the code under test agreeing with itself.
+/// Caller frees.
+fn expectedV2GoalSuffix(alloc: Allocator, r: GoalSnapshot) ![]u8 {
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(alloc);
+    var b8: [8]u8 = undefined;
+    try out.append(alloc, if (r.deadline != null) 1 else 0);
+    if (r.deadline) |d| {
+        std.mem.writeInt(i64, &b8, d, .little);
+        try out.appendSlice(alloc, &b8);
+    }
+    std.mem.writeInt(i64, &b8, r.created_at orelse 0, .little);
+    try out.appendSlice(alloc, &b8);
+    std.mem.writeInt(i64, &b8, r.updated_at orelse 0, .little);
+    try out.appendSlice(alloc, &b8);
+    try out.append(alloc, if (r.unrealized_at != null) 1 else 0);
+    if (r.unrealized_at) |ua| {
+        std.mem.writeInt(i64, &b8, ua, .little);
+        try out.appendSlice(alloc, &b8);
+    }
+    return out.toOwnedSlice(alloc);
+}
+
+/// Rebuild a poset from rows, passing the carried timestamps through
+/// instead of stamping the clock.
+///
+/// This is `Store.restoreGoalRow` with the one behaviour change the v2
+/// record enables, written out here so the *format* can be held
+/// responsible for what it is supposed to carry. `store.zig` owns the
+/// production copy; if the two ever disagree, this test keeps failing
+/// rather than quietly agreeing with a wrong one.
+fn posetFromRows(alloc: Allocator, rows: []const GoalSnapshot) !GoalPoset {
+    var poset = GoalPoset.init(alloc);
+    errdefer poset.deinit();
+    for (rows) |row| {
+        if (row.id == ROOT_GOAL_ID or row.id == TOP_GOAL_ID) continue;
+        // `created_at` is carried by every v2 row. `null` here means the
+        // file predates the field, and the point of the test is that the
+        // v2 path never lands in that branch.
+        const created_at = row.created_at orelse return error.TestUnexpectedResult;
+        var slot: std.atomic.Value(u64) = .init(row.id);
+        const minted = try poset.create(
+            row.name,
+            row.description,
+            row.parent_id,
+            row.priority,
+            row.deadline,
+            created_at,
+            &slot,
+        );
+        if (minted != row.id) return error.TestUnexpectedResult;
+        if (row.status != .pending) {
+            poset.updateStatus(row.id, row.status, row.updated_at orelse created_at) catch {
+                // Same fallback as `Store.restoreGoalRow`: the recorded
+                // status wins over a state-machine refusal.
+                const node = @constCast(poset.get(row.id).?);
+                node.status = row.status;
+                node.updated_at = row.updated_at orelse created_at;
+            };
+        }
+        // `updateStatus` sets `unrealized_at` to the status time, which
+        // is only right when the goal is *currently* unrealized. A goal
+        // that went unrealized and was revived carries the older mark,
+        // and the row has to keep it — it is what the ≥7-day
+        // tombstoning rule reads.
+        if (row.unrealized_at) |ua| {
+            @constCast(poset.get(row.id).?).unrealized_at = ua;
+        }
+    }
+    return poset;
+}
+
+/// Every field the two posets have in common, in both directions.
+fn expectPosetsIdentical(left: *const GoalPoset, right: *const GoalPoset) !void {
+    try std.testing.expectEqual(left.count(), right.count());
+    var it = left.nodes.iterator();
+    while (it.next()) |entry| {
+        const a = entry.value_ptr.*;
+        if (a.id == ROOT_GOAL_ID or a.id == TOP_GOAL_ID) continue;
+        const b = right.get(a.id) orelse return error.TestExpectedEqual;
+        try std.testing.expectEqualStrings(a.name, b.name);
+        try std.testing.expectEqualStrings(a.description, b.description);
+        try std.testing.expectEqual(a.parent_id, b.parent_id);
+        try std.testing.expectEqual(a.status, b.status);
+        try std.testing.expectEqual(a.priority, b.priority);
+        try std.testing.expectEqual(a.deadline, b.deadline);
+        try std.testing.expectEqual(a.created_at, b.created_at);
+        try std.testing.expectEqual(a.updated_at, b.updated_at);
+        try std.testing.expectEqual(a.unrealized_at, b.unrealized_at);
+    }
+}
+
+fn containsId(ids: []const u64, id: u64) bool {
+    for (ids) |v| {
+        if (v == id) return true;
+    }
+    return false;
+}
+
+/// The poset every test below snapshots: two top-level goals and one
+/// child, one goal carrying a deadline and an `unrealized` mark that a
+/// later status change has moved past, one carrying neither. Returns the
+/// ids through `out` so a caller can name them.
+fn buildTimestampFixture(alloc: Allocator, ids: *std.atomic.Value(u64), out: *[3]u64) !GoalPoset {
+    const created: i64 = 1_700_000_000_000;
+    const deadline: i64 = 1_700_003_000_000;
+    const went_unrealized: i64 = 1_700_000_500_000;
+    const revived: i64 = 1_700_000_600_000;
+
+    var goals = GoalPoset.init(alloc);
+    errdefer goals.deinit();
+    const aged = try goals.create("aged", "has a deadline and a history", null, 5, deadline, created, ids);
+    const plain = try goals.create("plain", "carries neither", null, 3, null, created + 1, ids);
+    const child = try goals.create("child", "hangs off aged", aged, 2, created + 2, created + 2, ids);
+    // Unrealized, then revived: `unrealized_at` (T1) and `updated_at`
+    // (T2) now differ, so a reader that conflates the two is caught.
+    try goals.updateStatus(aged, .unrealized, went_unrealized);
+    try goals.updateStatus(aged, .in_progress, revived);
+    out[0] = aged;
+    out[1] = plain;
+    out[2] = child;
+    return goals;
+}
+
+test "Snapshot: goal timestamps come back as the exact values that were written" {
+    const alloc = std.testing.allocator;
+    var path_buf: [128]u8 = undefined;
+    const path = goalTestPath(&path_buf, "ts_exact");
+    unlinkIfPresent(path);
+    defer unlinkIfPresent(path);
+
+    var ids: std.atomic.Value(u64) = .init(1);
+    var mgr = TriSourceManager.init(alloc, &ids);
+    defer mgr.deinit();
+    var fuzzy = FuzzyStore.init(alloc);
+    defer fuzzy.deinit();
+    var fixture: [3]u64 = undefined;
+    var goals = try buildTimestampFixture(alloc, &ids, &fixture);
+    defer goals.deinit();
+
+    var w = SnapshotWriter.init(alloc, path);
+    _ = try w.write(11, &goals, &mgr, &fuzzy);
+
+    var data = try read(alloc, path);
+    defer data.deinit();
+
+    // Exact equality, not "non-zero": the restore-time stamp this format
+    // change exists to remove was a perfectly non-zero number.
+    //
+    // Compared as the optional it is, never unwrapped with `.?`: a
+    // reader that stopped carrying the timestamps must fail this as an
+    // assertion, not as a null-dereference panic that aborts the test
+    // binary and takes every later test with it.
+    const aged = rowFor(data.goals, fixture[0]).?;
+    try std.testing.expectEqual(@as(?i64, 1_700_000_000_000), aged.created_at);
+    try std.testing.expectEqual(@as(?i64, 1_700_000_600_000), aged.updated_at);
+    try std.testing.expectEqual(@as(?i64, 1_700_003_000_000), aged.deadline);
+    try std.testing.expectEqual(@as(?i64, 1_700_000_500_000), aged.unrealized_at);
+
+    const plain = rowFor(data.goals, fixture[1]).?;
+    try std.testing.expectEqual(@as(?i64, 1_700_000_000_001), plain.created_at);
+    try std.testing.expectEqual(@as(?i64, 1_700_000_000_001), plain.updated_at);
+    try std.testing.expectEqual(@as(?i64, null), plain.deadline);
+    try std.testing.expectEqual(@as(?i64, null), plain.unrealized_at);
+
+    const child = rowFor(data.goals, fixture[2]).?;
+    try std.testing.expectEqual(fixture[0], child.parent_id.?);
+    try std.testing.expectEqual(@as(?i64, 1_700_000_000_002), child.created_at);
+}
+
+test "Snapshot: a poset rebuilt from the rows equals the one written, field for field" {
+    const alloc = std.testing.allocator;
+    var path_buf: [128]u8 = undefined;
+    const path = goalTestPath(&path_buf, "ts_poset");
+    unlinkIfPresent(path);
+    defer unlinkIfPresent(path);
+
+    var ids: std.atomic.Value(u64) = .init(1);
+    var mgr = TriSourceManager.init(alloc, &ids);
+    defer mgr.deinit();
+    var fuzzy = FuzzyStore.init(alloc);
+    defer fuzzy.deinit();
+    var fixture: [3]u64 = undefined;
+    var goals = try buildTimestampFixture(alloc, &ids, &fixture);
+    defer goals.deinit();
+
+    var w = SnapshotWriter.init(alloc, path);
+    _ = try w.write(11, &goals, &mgr, &fuzzy);
+
+    var data = try read(alloc, path);
+    defer data.deinit();
+
+    var rebuilt = try posetFromRows(alloc, data.goals);
+    defer rebuilt.deinit();
+    try expectPosetsIdentical(&goals, &rebuilt);
+
+    // The synthetic nodes are rebuilt by `GoalPoset.init`, not restored.
+    try std.testing.expect(rebuilt.get(ROOT_GOAL_ID) != null);
+    try std.testing.expect(rebuilt.get(TOP_GOAL_ID) != null);
+}
+
+test "Snapshot: a goal that ages across a snapshot round trip still goes stale" {
+    const alloc = std.testing.allocator;
+    var path_buf: [128]u8 = undefined;
+    const path = goalTestPath(&path_buf, "ts_stale");
+    unlinkIfPresent(path);
+    defer unlinkIfPresent(path);
+
+    const now: i64 = 1_700_100_000_000;
+    const day: i64 = 86_400_000;
+
+    var ids: std.atomic.Value(u64) = .init(1);
+    var mgr = TriSourceManager.init(alloc, &ids);
+    defer mgr.deinit();
+    var fuzzy = FuzzyStore.init(alloc);
+    defer fuzzy.deinit();
+
+    var goals = GoalPoset.init(alloc);
+    defer goals.deinit();
+    const old_id = try goals.create("old", "eight days old, no memcells", null, 5, null, now - 8 * day, &ids);
+    const young_id = try goals.create("young", "one day old, no memcells", null, 5, null, now - day, &ids);
+
+    var w = SnapshotWriter.init(alloc, path);
+    _ = try w.write(3, &goals, &mgr, &fuzzy);
+
+    var data = try read(alloc, path);
+    defer data.deinit();
+    var rebuilt = try posetFromRows(alloc, data.goals);
+    defer rebuilt.deinit();
+
+    // The rule that silently stopped applying to snapshot-restored
+    // goals. `staleGoals` reads `now - created_at`, so a restored goal
+    // stamped with the restore time is always 0 ms old and never fires.
+    const stale = try rebuilt.staleGoals(alloc, now);
+    defer alloc.free(stale);
+    try std.testing.expect(containsId(stale, old_id));
+    try std.testing.expect(!containsId(stale, young_id));
+
+    // Seven days is the threshold, not "any age at all": one
+    // millisecond short of it the same goal is still not stale.
+    const early = try rebuilt.staleGoals(alloc, now - 8 * day + 7 * day - 1);
+    defer alloc.free(early);
+    try std.testing.expect(!containsId(early, old_id));
+
+    // And the pre-snapshot poset agrees, so the round trip did not
+    // change the verdict in either direction.
+    const stale_before = try goals.staleGoals(alloc, now);
+    defer alloc.free(stale_before);
+    try std.testing.expectEqual(stale_before.len, stale.len);
+    try std.testing.expect(containsId(stale_before, old_id));
+}
+
+test "Snapshot: a v1 file from the previous version still loads, with the timestamps marked absent" {
+    const alloc = std.testing.allocator;
+    // Two buffers, not one: `goalTestPath` formats into the buffer it
+    // is handed, so a shared one would have the second path overwrite
+    // the first's bytes while both slices stay live.
+    var v2_buf: [128]u8 = undefined;
+    var v1_buf: [128]u8 = undefined;
+    const v2_path = goalTestPath(&v2_buf, "v2src");
+    const v1_path = goalTestPath(&v1_buf, "v1gold");
+    unlinkIfPresent(v2_path);
+    unlinkIfPresent(v1_path);
+
+    var ids: std.atomic.Value(u64) = .init(1);
+    var mgr = TriSourceManager.init(alloc, &ids);
+    defer mgr.deinit();
+    var fuzzy = FuzzyStore.init(alloc);
+    defer fuzzy.deinit();
+    var fixture: [3]u64 = undefined;
+    var goals = try buildTimestampFixture(alloc, &ids, &fixture);
+    defer goals.deinit();
+
+    // The real writer, at the real version.
+    var w = SnapshotWriter.init(alloc, v2_path);
+    _ = try w.write(11, &goals, &mgr, &fuzzy);
+    var v2_data = try read(alloc, v2_path);
+    defer v2_data.deinit();
+    const rows = v2_data.goals;
+
+    // The same rows re-encoded in the v1 layout: header, counter, goal
+    // count, rows that stop at `priority`, then the (empty) cell
+    // sections. This is byte-for-byte what the previous version wrote —
+    // the cross-check below proves the prefix is identical rather than
+    // merely similar.
+    var zb: [platform_fs.max_path_bytes + 1]u8 = undefined;
+    const z = std.fmt.bufPrint(&zb, "{s}\x00", .{v1_path}) catch return error.SnapshotPathTooLong;
+    const zpath = z[0 .. z.len - 1 :0];
+    const fd = try platform_fs.open(zpath, .{ .access = .write_only, .create = .truncate });
+    var v1w: BufferedWriter = .{ .fd = fd };
+    try v1w.writeU32(SNAPSHOT_MAGIC);
+    try v1w.writeU32(SNAPSHOT_VERSION_LEGACY);
+    try v1w.writeU64(11);
+    try v1w.writeU64(rows.len);
+    for (rows) |r| {
+        try v1w.writeU64(r.id);
+        try v1w.writeString(r.name);
+        try v1w.writeString(r.description);
+        try v1w.writeBool(r.parent_id != null);
+        if (r.parent_id) |pid| try v1w.writeU64(pid);
+        try v1w.writeU8(@intFromEnum(r.status));
+        try v1w.writeU8(r.priority);
+    }
+    try v1w.writeU64(0); // cells
+    try v1w.writeU64(0); // fuzzy cells
+    try v1w.flush();
+    platform_fs.close(fd);
+
+    // Cross-check, walking both files in lockstep: v2 has to be v1 with
+    // a suffix inserted immediately after each row's `priority`, and the
+    // suffix has to be exactly the encoding the reader expects. That is
+    // the whole backwards-compatibility claim stated as bytes — "an old
+    // file still loads" is not a hope about a layout nobody has bytes
+    // for, and a writer that inserted the suffix anywhere else (or
+    // reordered a field) fails here rather than at some operator's
+    // first boot after an upgrade.
+    const v2_raw = try readRawFile(alloc, v2_path);
+    defer alloc.free(v2_raw);
+    const v1_raw = try readRawFile(alloc, v1_path);
+    defer alloc.free(v1_raw);
+
+    // The version word is the one byte range that must differ: it is the
+    // whole announcement.
+    try std.testing.expectEqualSlices(u8, v1_raw[0..4], v2_raw[0..4]); // magic
+    try std.testing.expectEqual(
+        std.mem.readInt(u32, v1_raw[4..8], .little),
+        @as(u32, SNAPSHOT_VERSION_LEGACY),
+    );
+    try std.testing.expectEqual(
+        std.mem.readInt(u32, v2_raw[4..8], .little),
+        @as(u32, SNAPSHOT_VERSION),
+    );
+    // counter and goal count are the same in both.
+    try std.testing.expectEqualSlices(u8, v1_raw[8..24], v2_raw[8..24]);
+
+    var v1_cursor: usize = 24;
+    var v2_cursor: usize = 24;
+    var suffix_total: usize = 0;
+    for (rows, 0..) |r, k| {
+        const v1_end = v1GoalRowEndOffset(rows, k + 1);
+        const row_len = v1_end - v1_cursor;
+        try std.testing.expectEqualSlices(
+            u8,
+            v1_raw[v1_cursor..v1_end],
+            v2_raw[v2_cursor .. v2_cursor + row_len],
+        );
+        v2_cursor += row_len;
+        v1_cursor = v1_end;
+
+        const want = try expectedV2GoalSuffix(alloc, r);
+        defer alloc.free(want);
+        try std.testing.expect(v2_cursor + want.len <= v2_raw.len);
+        try std.testing.expectEqualSlices(u8, want, v2_raw[v2_cursor .. v2_cursor + want.len]);
+        v2_cursor += want.len;
+        suffix_total += want.len;
+    }
+    // Both files end with the two empty section counts.
+    try std.testing.expectEqual(v1_cursor + 16, v1_raw.len);
+    try std.testing.expectEqual(v2_cursor + 16, v2_raw.len);
+    try std.testing.expectEqual(v1_cursor + suffix_total + 16, v2_raw.len);
+
+    // And the old file loads, with the version it was written at.
+    var data = try read(alloc, v1_path);
+    defer data.deinit();
+    try std.testing.expectEqual(@as(u64, 11), data.counter);
+    try std.testing.expectEqual(rows.len, data.goals.len);
+    try std.testing.expectEqual(@as(usize, 0), data.cells.len);
+    try std.testing.expectEqual(@as(usize, 0), data.fuzzy_cells.len);
+    for (rows) |want| {
+        const got = rowFor(data.goals, want.id) orelse return error.TestExpectedEqual;
+        // Everything v1 carried is intact...
+        try std.testing.expectEqualStrings(want.name, got.name);
+        try std.testing.expectEqualStrings(want.description, got.description);
+        try std.testing.expectEqual(want.parent_id, got.parent_id);
+        try std.testing.expectEqual(want.status, got.status);
+        try std.testing.expectEqual(want.priority, got.priority);
+        // ...and everything it did not is marked absent, not zeroed. A
+        // `0` here would make the restore path read it as "created in
+        // 1970" and mark the goal unrealized on the next tick.
+        try std.testing.expectEqual(@as(?i64, null), got.created_at);
+        try std.testing.expectEqual(@as(?i64, null), got.updated_at);
+        try std.testing.expectEqual(@as(?i64, null), got.deadline);
+        try std.testing.expectEqual(@as(?i64, null), got.unrealized_at);
+    }
+}
+
+test "Snapshot: an unknown version is refused rather than guessed at" {
+    const alloc = std.testing.allocator;
+    var path_buf: [128]u8 = undefined;
+    const path = goalTestPath(&path_buf, "version");
+    unlinkIfPresent(path);
+    defer unlinkIfPresent(path);
+
+    var ids: std.atomic.Value(u64) = .init(1);
+    var mgr = TriSourceManager.init(alloc, &ids);
+    defer mgr.deinit();
+    var fuzzy = FuzzyStore.init(alloc);
+    defer fuzzy.deinit();
+    var goals = GoalPoset.init(alloc);
+    defer goals.deinit();
+    _ = try goals.create("n", "d", null, 5, null, 1_700_000_000_000, &ids);
+
+    var w = SnapshotWriter.init(alloc, path);
+    _ = try w.write(1, &goals, &mgr, &fuzzy);
+    const raw = try readRawFile(alloc, path);
+    defer alloc.free(raw);
+
+    // magic(4) | version(4) | ...
+    try std.testing.expectEqual(@as(u32, SNAPSHOT_VERSION), std.mem.readInt(u32, raw[4..8], .little));
+
+    // A future version must not be parsed as if it were this one: the
+    // goal rows could be any shape at all, and reading them as v2 would
+    // mean trusting a length field from a file whose encoding is
+    // unknown.
+    var patched = try alloc.dupe(u8, raw);
+    defer alloc.free(patched);
+    std.mem.writeInt(u32, patched[4..8], SNAPSHOT_VERSION + 1, .little);
+    try writeRawFile(path, patched);
+    try std.testing.expectError(error.SnapshotBadVersion, read(alloc, path));
+
+    // And a version below the oldest supported one, rather than a
+    // wraparound comparison that would accept it.
+    std.mem.writeInt(u32, patched[4..8], SNAPSHOT_VERSION_LEGACY - 1, .little);
+    try writeRawFile(path, patched);
+    try std.testing.expectError(error.SnapshotBadVersion, read(alloc, path));
+}
+
+test "Snapshot: a v2 goal row truncated at any offset is rejected, never read past" {
+    const alloc = std.testing.allocator;
+    // Two buffers — see the v1 test for why one shared buffer is wrong.
+    var path_buf: [128]u8 = undefined;
+    var cut_buf: [128]u8 = undefined;
+    const path = goalTestPath(&path_buf, "ts_trunc");
+    const cut_path = goalTestPath(&cut_buf, "ts_cut");
+    unlinkIfPresent(path);
+    unlinkIfPresent(cut_path);
+    defer unlinkIfPresent(path);
+    defer unlinkIfPresent(cut_path);
+
+    var ids: std.atomic.Value(u64) = .init(1);
+    var mgr = TriSourceManager.init(alloc, &ids);
+    defer mgr.deinit();
+    var fuzzy = FuzzyStore.init(alloc);
+    defer fuzzy.deinit();
+    var fixture: [3]u64 = undefined;
+    var goals = try buildTimestampFixture(alloc, &ids, &fixture);
+    defer goals.deinit();
+    const cell: MemCell = .{
+        .id = 0,
+        .source = .matter,
+        .episode = "episode",
+        .atomic_facts = &.{
+            .{ .subject = "s", .predicate = "p", .object = "o", .confidence = 1.0, .source = "t" },
+        },
+        .foresight = &.{},
+        .goal_associations = &.{
+            .{ .goal_id = fixture[1], .relevance = 0.5, .priority = 1 },
+        },
+        .metadata = .{ .source_confidence = 0.9, .importance_score = 0.7, .decay_rate = 0.01 },
+    };
+    _ = try mgr.add(cell);
+
+    var w = SnapshotWriter.init(alloc, path);
+    _ = try w.write(11, &goals, &mgr, &fuzzy);
+
+    const raw = try readRawFile(alloc, path);
+    defer alloc.free(raw);
+    // The full file reads, so every failure below is caused by the cut
+    // and not by the fixture.
+    {
+        var ok = try read(alloc, path);
+        ok.deinit();
+    }
+
+    // Every proper prefix of a file the reader consumes exactly is short
+    // of something it needs, so it must error. Sweeping every offset
+    // rather than hand-picking boundaries covers the two optional i64s
+    // as well: a `has_deadline`/`has_unrealized_at` flag that says
+    // "value follows" with the value cut off is the shape that turns a
+    // missing bounds check into a read past the buffer.
+    const first_row_off: usize = 4 + 4 + 8 + 8;
+    try std.testing.expect(first_row_off < raw.len);
+    var cut = first_row_off;
+    while (cut < raw.len) : (cut += 1) {
+        try writeRawFile(cut_path, raw[0..cut]);
+        try std.testing.expectError(error.SnapshotTruncated, read(alloc, cut_path));
+    }
+    // The last byte included is still a cut; the whole file is not.
+    try writeRawFile(cut_path, raw);
+    {
+        var ok = try read(alloc, cut_path);
+        ok.deinit();
+    }
 }

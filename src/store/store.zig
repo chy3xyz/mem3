@@ -406,6 +406,19 @@ pub const Store = struct {
     /// lose the journal entry and resurrect the cell. That is the correct
     /// direction to fail: a resurrected memory is recoverable, a journalled
     /// deletion whose transfer did not happen is a phantom tombstone.
+    ///
+    /// ## Goal bindings are part of "forgotten"
+    ///
+    /// The sweep used to leave `GoalPoset.memcell_index` untouched, which
+    /// inverted a real invariant. `staleGoals` skips any goal whose
+    /// `memcellsFor(id).len != 0`, so a goal whose entire corpus had been
+    /// forgotten read as permanently covered and could never be marked
+    /// `.unrealized` — the 7-day meta-goal rule silently did nothing to
+    /// exactly the goals that had run out of memories. `listGoals` and the
+    /// HTTP `memcell_count` field reported the same fiction. The unbind
+    /// runs *after* the WAL writes above, for the same reason they do: a
+    /// binding that outlives its cell is a phantom, and a binding lost for
+    /// a cell that was resurrected is the recoverable direction.
     pub fn forget(self: *Store, dry_run: bool) !memory.Forgetter.SweepResult {
         if (dry_run) return self.lc.forget(true);
 
@@ -417,8 +430,11 @@ pub const Store = struct {
         const result = try self.lc.forget(false);
 
         // Anything the sweep took out of the manager but left in the index.
+        var forgotten = std.ArrayList(u64).empty;
+        defer forgotten.deinit(self.alloc);
         for (before.items) |id| {
             if (self.mgr.get(id) != null) continue;
+            try forgotten.append(self.alloc, id);
             _ = self.cell_index.remove(id);
 
             if (self.wal) |wal| {
@@ -440,6 +456,9 @@ pub const Store = struct {
                 };
             }
         }
+
+        // One pass, after the journaling, over the cells that actually died.
+        try self.goals.unbindCellsEverywhere(forgotten.items);
 
         return result;
     }
@@ -1055,9 +1074,14 @@ pub const Store = struct {
     /// else about the insert has already succeeded, so this reports and
     /// returns rather than rolling the cell back.
     ///
-    /// Cost per insert is O(1): one `bindMemcell` append, one hash
-    /// lookup, two `updateWithSurprise` calls against an entity that
-    /// already exists. Nothing here scans the corpus.
+    /// Cost per insert is O(1) amortised. `bindMemcell` still guarantees
+    /// that binding the same cell twice is a no-op, but it no longer pays
+    /// O(k) to prove it on this path: the id handed in here is freshly
+    /// minted and strictly increasing, so `bindMemcell` skips the
+    /// duplicate scan outright (see `BindingList.high_water`). The other
+    /// work is genuinely constant — one hash lookup and two
+    /// `updateWithSurprise` calls against an entity that already exists
+    /// — and nothing here scans the corpus.
     fn encodeAcrossLayers(self: *Store, id: u64, cell: *MemCell) !void {
         if (cell.goal_associations.len == 0) return;
         const goal_id = cell.goal_associations[0].goal_id;
@@ -1453,14 +1477,22 @@ pub fn encodeGoalWALPayloadRaw(
     /// same place — `GoalPoset.create` maps `null` to ⊥ itself, so
     /// passing the row's value through unchanged is correct for both.
     ///
-    /// `deadline`, `created_at`, `updated_at` and `unrealized_at` are
-    /// NOT in the snapshot record — see the note in `takeSnapshot`. A
-    /// restored goal is therefore stamped with the restore time rather
-    /// than `0`: `staleGoals` treats "no memcells for 7 days" as
-    /// unrealizable, and a `0` stamp would make every goal restored from
-    /// a snapshot immediately stale, i.e. the snapshot path would
-    /// manufacture the very data loss it was added to prevent.
+    /// `deadline`, `created_at`, `updated_at` and `unrealized_at` have
+    /// been carried by the snapshot since format v2, and this function
+    /// reads them. Before that they were absent, so a restored goal was
+    /// stamped with the restore time — which silently reset every goal's
+    /// age, and with it the 7-day meta-goal rule: a goal that had been
+    /// alive for months came back newborn and had to age out again.
+    ///
+    /// For a **v1** row those four are `null`, and the restore time is
+    /// the only stamp available, so it stays the fallback. `0` is never
+    /// a fallback: `staleGoals` reads "no memcells for 7 days" off
+    /// `created_at`, so a zero stamp would make every v1-restored goal
+    /// instantly unrealizable — the snapshot path manufacturing the very
+    /// data loss it was added to prevent.
     fn restoreGoalRow(self: *Store, gs: GoalSnapshot, now_ms: i64) !void {
+        const created_at = gs.created_at orelse now_ms;
+        const updated_at = gs.updated_at orelse created_at;
         // Same trick as `createGoal` / `applyGoalRecord`: a private
         // counter seeded to the id in the record, so the poset mints
         // exactly that id rather than a fresh one.
@@ -1470,8 +1502,8 @@ pub fn encodeGoalWALPayloadRaw(
             gs.description,
             gs.parent_id,
             gs.priority,
-            null,
-            now_ms,
+            gs.deadline,
+            created_at,
             &slot,
         ) catch |err| return err;
         if (created != gs.id) {
@@ -1479,21 +1511,32 @@ pub fn encodeGoalWALPayloadRaw(
             return error.GoalIdDrift;
         }
         if (gs.status != .pending) {
-            self.goals.updateStatus(gs.id, gs.status, now_ms) catch |err| {
+            self.goals.updateStatus(gs.id, gs.status, updated_at) catch |err| {
                 // `.tombstoned` is refused by the poset's own transition
-                // rule (it requires a ≥7-day `unrealized_at`, which the
-                // snapshot does not carry), and WAL replay loses it the
-                // same way. A snapshot is a point-in-time copy, so the
-                // recorded status wins: silently resurrecting a retired
-                // goal as `pending` is a worse answer than skipping a
-                // state-machine check on data we just read off disk.
+                // rule unless the goal has been `.unrealized` for ≥7 days,
+                // and that clock starts at `unrealized_at` — which for a
+                // v1 row the snapshot does not carry. A snapshot is a
+                // point-in-time copy, so the recorded status wins:
+                // silently resurrecting a retired goal as `pending` is a
+                // worse answer than skipping a state-machine check on
+                // data we just read off disk.
                 diag("snapshot: goal id={d} status {s} refused by the poset ({}), restored verbatim", .{ gs.id, @tagName(gs.status), err });
                 if (self.goals.get(gs.id)) |node_const| {
                     const node = @constCast(node_const);
                     node.status = gs.status;
-                    node.updated_at = now_ms;
+                    node.updated_at = updated_at;
                 }
             };
+        }
+        // `unrealized_at` is the start of the 7-day clock that
+        // `updateStatus` checks before allowing a tombstone. Dropping it
+        // means a goal restored from a snapshot has to age out a second
+        // time before it can be retired, even though it already served
+        // its seven days before the snapshot was taken.
+        if (gs.unrealized_at) |ua| {
+            if (self.goals.get(gs.id)) |node_const| {
+                @constCast(node_const).unrealized_at = ua;
+            }
         }
     }
 
@@ -2110,27 +2153,49 @@ pub fn jsonStringRawBody(alloc: Allocator, out: *std.ArrayList(u8), value: []con
     try out.appendSlice(alloc, full[colon + 1 ..]);
 }
 
+/// Emit `"key":"escaped-value"`.
+///
+/// **On-disk format — the bytes this produces must not change.** `mem3.wal`
+/// is read back by the replay parser and by every snapshot taken from it, so
+/// this is deliberately a pure emit loop with no reformatting.
+///
+/// It used to walk both the key and the value one byte at a time through
+/// `out.append`, which is a capacity check plus a call per byte. The value
+/// scan now finds each escape boundary and copies the ordinary run between
+/// boundaries with a single `appendSlice`, which is a `memcpy`. The output
+/// is byte-for-byte what the per-byte loop produced — the only difference is
+/// how many times `appendSlice` is called.
 pub fn jsonFieldStringRaw(alloc: Allocator, out: *std.ArrayList(u8), key: []const u8, value: []const u8) !void {
     try out.append(alloc, '"');
-    for (key) |kc| try out.append(alloc, kc);
+    try out.appendSlice(alloc, key);
     try out.appendSlice(alloc, "\":\"");
-    for (value) |vc| {
-        switch (vc) {
-            '"' => try out.appendSlice(alloc, "\\\""),
-            '\\' => try out.appendSlice(alloc, "\\\\"),
-            8 => try out.appendSlice(alloc, "\\b"),
-            '\n' => try out.appendSlice(alloc, "\\n"),
-            '\r' => try out.appendSlice(alloc, "\\r"),
-            '\t' => try out.appendSlice(alloc, "\\t"),
-            12 => try out.appendSlice(alloc, "\\f"),
-            0...7, 11, 14...31 => {
-                var buf: [8]u8 = undefined;
-                const s = try std.fmt.bufPrint(&buf, "\\u{x:0>4}", .{vc});
-                try out.appendSlice(alloc, s);
+
+    // `ctrl` is declared out here rather than inside the `0...7` switch prong
+    // so the slice handed to `appendSlice` below points at storage that is
+    // still live when it is read.
+    var ctrl: [8]u8 = undefined;
+    var run_start: usize = 0;
+    for (value, 0..) |vc, i| {
+        const escape: ?[]const u8 = switch (vc) {
+            '"' => "\\\"",
+            '\\' => "\\\\",
+            8 => "\\b",
+            '\n' => "\\n",
+            '\r' => "\\r",
+            '\t' => "\\t",
+            12 => "\\f",
+            0...7, 11, 14...31 => blk: {
+                const s = try std.fmt.bufPrint(&ctrl, "\\u{x:0>4}", .{vc});
+                break :blk s;
             },
-            else => try out.append(alloc, vc),
-        }
+            else => null,
+        };
+        const esc = escape orelse continue;
+        try out.appendSlice(alloc, value[run_start..i]);
+        try out.appendSlice(alloc, esc);
+        run_start = i + 1;
     }
+    try out.appendSlice(alloc, value[run_start..]);
     try out.append(alloc, '"');
 }
 
@@ -2734,6 +2799,103 @@ test "Store: many inserts against one goal keep the layers bounded" {
     try std.testing.expectEqual(@as(usize, 64), store.goals.memcellsFor(gid).len);
 }
 
+test "Store: binding the same cell twice is a no-op, in both bind directions" {
+    const alloc = std.testing.allocator;
+    var store = try Store.init(alloc, .{ .data_dir = null, .seed_default_goals = false });
+    defer store.deinit();
+    const gid = try store.createGoal("dedup", "duplicate binds", null, 5, null, 1_700_000_000_000);
+
+    // Ascending: every bind takes `bindMemcell`'s O(1) fast path, because
+    // each id is strictly above the goal's high-water mark.
+    try store.goals.bindMemcell(gid, 10);
+    try store.goals.bindMemcell(gid, 20);
+    try store.goals.bindMemcell(gid, 30);
+    try store.goals.bindMemcell(gid, 20); // dup, below the mark
+    try store.goals.bindMemcell(gid, 10); // dup, below the mark
+    try std.testing.expectEqual(@as(usize, 3), store.goals.memcellsFor(gid).len);
+
+    // Descending: only the first bind is above the mark; the rest must be
+    // rejected by a real membership test. This is the case a naive
+    // "greater than the last element" check gets wrong — after binding 99,
+    // 50 sits below the last element yet is genuinely absent, and 99 must
+    // still be found and rejected.
+    try store.goals.bindMemcell(gid, 99);
+    try store.goals.bindMemcell(gid, 50);
+    try store.goals.bindMemcell(gid, 99); // dup, below the mark
+    try store.goals.bindMemcell(gid, 50); // dup, below the mark
+
+    const bound = store.goals.memcellsFor(gid);
+    try std.testing.expectEqual(@as(usize, 5), bound.len);
+    // Insertion order, exactly. `memcellsFor(gid)[0]` and the snapshot
+    // both read positionally, so a reordering here is a silent change of
+    // meaning, not a cosmetic one.
+    try std.testing.expectEqual(@as(u64, 10), bound[0]);
+    try std.testing.expectEqual(@as(u64, 20), bound[1]);
+    try std.testing.expectEqual(@as(u64, 30), bound[2]);
+    try std.testing.expectEqual(@as(u64, 99), bound[3]);
+    try std.testing.expectEqual(@as(u64, 50), bound[4]);
+}
+
+test "Store: forgetting a cell unbinds it from its goal" {
+    const alloc = std.testing.allocator;
+    var store = try Store.init(alloc, .{ .data_dir = null, .seed_default_goals = false });
+    defer store.deinit();
+    const gid = try store.createGoal("ephemeral-goal", "corpus will be forgotten", null, 5, null, 1_700_000_000_000);
+
+    const kept = try store.addRaw(.matter, "a memory that stays", "a|b|c", gid, 0.5);
+    const doomed = try store.addRaw(.matter, "a memory that will be forgotten", "a|b|c", gid, 0.5);
+    store.getCell(doomed).?.metadata.importance_score = 0.001;
+
+    try std.testing.expectEqual(@as(usize, 2), store.goals.memcellsFor(gid).len);
+
+    const swept = try store.forget(false);
+    try std.testing.expectEqual(@as(usize, 1), swept.fuzzied);
+
+    // The cell is gone from every index it used to be in, bindings
+    // included. Before the unbind was wired, the goal kept a pointer to a
+    // memory the system had declared not worth keeping.
+    try std.testing.expect(store.getCell(doomed) == null);
+    try std.testing.expectEqual(@as(usize, 1), store.goals.memcellsFor(gid).len);
+    try std.testing.expectEqual(kept, store.goals.memcellsFor(gid)[0]);
+
+    // And the reported count follows, rather than keeping the fiction.
+    const goals = try store.listGoals(alloc);
+    defer alloc.free(goals);
+    try std.testing.expectEqual(@as(usize, 1), goals[0].memcell_count);
+}
+
+test "Store: a goal whose memories are all forgotten does become unrealized" {
+    const alloc = std.testing.allocator;
+    var store = try Store.init(alloc, .{ .data_dir = null, .seed_default_goals = false });
+    defer store.deinit();
+
+    const created_at: i64 = 1_700_000_000_000;
+    const gid = try store.createGoal("doomed-goal", "everything it had is forgotten", null, 5, null, created_at);
+
+    const a = try store.addRaw(.matter, "first memory of a doomed goal", "a|b|c", gid, 0.5);
+    const b = try store.addRaw(.matter, "second memory of a doomed goal", "a|b|c", gid, 0.5);
+    store.getCell(a).?.metadata.importance_score = 0.001;
+    store.getCell(b).?.metadata.importance_score = 0.001;
+
+    const after_window = created_at + 8 * 86_400_000;
+
+    // With its memories still bound, the goal reads as covered and is
+    // correctly left alone — this is the control for the test below.
+    const before = try store.maintain(after_window);
+    try std.testing.expectEqual(@as(usize, 0), before.goals_unrealized);
+    try std.testing.expectEqual(core.GoalStatus.pending, store.goals.get(gid).?.status);
+
+    _ = try store.forget(false);
+    try std.testing.expectEqual(@as(usize, 0), store.goals.memcellsFor(gid).len);
+
+    // Now that the corpus is gone the 7-day rule can finally apply. It
+    // could not, before: a goal whose every memory had been forgotten was
+    // permanently "covered" and so could never age out.
+    const after = try store.maintain(after_window);
+    try std.testing.expectEqual(@as(usize, 1), after.goals_unrealized);
+    try std.testing.expectEqual(core.GoalStatus.unrealized, store.goals.get(gid).?.status);
+}
+
 test "Store: an insert naming no goal skips the traversal instead of faking one" {
     const alloc = std.testing.allocator;
     var store = try Store.init(alloc, .{ .data_dir = null, .seed_default_goals = false });
@@ -3206,20 +3368,37 @@ test "Store: snapshot replay and WAL replay rebuild the same poset" {
         try std.testing.expect(matched);
     }
 
-    // The one field the two paths genuinely cannot agree on, stated
-    // rather than papered over: `GoalSnapshot` has no `created_at` slot
-    // (see `takeSnapshot`), so the snapshot path stamps the restore time
-    // while the WAL path replays the recorded timestamp. Everything the
-    // format does carry is asserted equal above.
+    // Snapshot format v2 carries `deadline`, `created_at`, `updated_at`
+    // and `unrealized_at`, and `restoreGoalRow` reads them. So the two
+    // durability paths must now agree on all of them exactly. They did
+    // not: `restoreGoalRow` passed `null` for the deadline and the
+    // restore time for `created_at`, which reset every restored goal's
+    // age and silently restarted its 7-day unrealized clock. A comment
+    // here used to call that divergence unavoidable ("the one field the
+    // two paths genuinely cannot agree on") — it was avoidable, and the
+    // assertion was only `> 0`, which cannot tell a real timestamp from
+    // a freshly minted one.
     const wal_facts = try collectPosetFacts(wal_store, alloc);
     defer freePosetFacts(alloc, wal_facts);
     const snap_facts = try collectPosetFacts(snap_store, alloc);
     defer freePosetFacts(alloc, snap_facts);
+    try std.testing.expectEqual(wal_facts.len, snap_facts.len);
+    // Match by id, never by position: `collectPosetFacts` walks a hash
+    // map, so two stores holding the same goals emit them in whatever
+    // order their own maps happen to produce. Zipping the two slices
+    // compares unrelated goals and fails on ids, not on the fields this
+    // assertion is about.
     for (wal_facts) |wf| {
-        try std.testing.expect(wf.created_at >= 1_700_000_000_000);
-    }
-    for (snap_facts) |sf| {
-        try std.testing.expect(sf.created_at > 0);
+        var matched = false;
+        for (snap_facts) |sf| {
+            if (sf.id != wf.id) continue;
+            matched = true;
+            try std.testing.expectEqual(wf.created_at, sf.created_at);
+            try std.testing.expectEqual(wf.deadline, sf.deadline);
+            try std.testing.expectEqual(wf.unrealized_at, sf.unrealized_at);
+            break;
+        }
+        try std.testing.expect(matched);
     }
 }
 
@@ -3228,12 +3407,14 @@ const PosetFact = struct {
     parent_id: ?u64,
     status: core.GoalStatus,
     created_at: i64,
+    deadline: ?i64,
+    unrealized_at: ?i64,
 };
 
-/// What the poset actually holds, for the one comparison that needs
-/// `created_at` (which `GoalInfo` does not expose).
+/// What the poset actually holds, for the comparison that needs the
+/// fields `GoalInfo` does not expose.
 fn collectPosetFacts(store: *Store, alloc: Allocator) ![]PosetFact {
-    var out: std.ArrayList(PosetFact) = .empty;
+    var out = std.ArrayList(PosetFact).empty;
     errdefer out.deinit(alloc);
     var it = store.goals.nodes.iterator();
     while (it.next()) |entry| {
@@ -3244,6 +3425,8 @@ fn collectPosetFacts(store: *Store, alloc: Allocator) ![]PosetFact {
             .parent_id = node.parent_id,
             .status = node.status,
             .created_at = node.created_at,
+            .deadline = node.deadline,
+            .unrealized_at = node.unrealized_at,
         });
     }
     return out.toOwnedSlice(alloc);
@@ -3387,4 +3570,123 @@ test "Store: a mid-tree re-journal failure does not abandon the rest of the pose
         const kids = store.goals.childrenOf(parent_id);
         try std.testing.expectEqual(@as(usize, 1), kids.len);
     }
+}
+
+test "jsonFieldStringRaw: batched emit is byte-identical to the per-byte loop" {
+    // `jsonFieldStringRaw` is on-disk format. The batching optimisation must
+    // not be observable, so this pins it against a literal transcription of
+    // the loop it replaced, over every escape class the switch knows about
+    // plus the two cases batching actually changes: leading and trailing
+    // runs, and a value that is nothing but escapes.
+    const alloc = std.testing.allocator;
+
+    const reference = struct {
+        fn encode(a: Allocator, o: *std.ArrayList(u8), k: []const u8, v: []const u8) !void {
+            try o.append(a, '"');
+            for (k) |kc| try o.append(a, kc);
+            try o.appendSlice(a, "\":\"");
+            for (v) |vc| {
+                switch (vc) {
+                    '"' => try o.appendSlice(a, "\\\""),
+                    '\\' => try o.appendSlice(a, "\\\\"),
+                    8 => try o.appendSlice(a, "\\b"),
+                    '\n' => try o.appendSlice(a, "\\n"),
+                    '\r' => try o.appendSlice(a, "\\r"),
+                    '\t' => try o.appendSlice(a, "\\t"),
+                    12 => try o.appendSlice(a, "\\f"),
+                    0...7, 11, 14...31 => {
+                        var buf: [8]u8 = undefined;
+                        const s = try std.fmt.bufPrint(&buf, "\\u{x:0>4}", .{vc});
+                        try o.appendSlice(a, s);
+                    },
+                    else => try o.append(a, vc),
+                }
+            }
+            try o.append(a, '"');
+        }
+    }.encode;
+
+    // Every byte value 0..=255 as a single-byte value, so no escape class
+    // and no ordinary byte can be missed.
+    for (0..256) |b| {
+        const v = [_]u8{@intCast(b)};
+        var want = std.ArrayList(u8).empty;
+        defer want.deinit(alloc);
+        try reference(alloc, &want, "k", &v);
+
+        var got = std.ArrayList(u8).empty;
+        defer got.deinit(alloc);
+        try jsonFieldStringRaw(alloc, &got, "k", &v);
+
+        try std.testing.expectEqualSlices(u8, want.items, got.items);
+    }
+
+    // Multi-byte shapes: escapes at both ends, adjacent escapes, escapes in
+    // the middle of a run, and an empty value.
+    const cases = [_][]const u8{
+        "",
+        "plain",
+        "\nleading",
+        "trailing\t",
+        "\n\t\r",
+        "a\nb\tc\rd\\e\"f",
+        "\x00\x01\x07\x0b\x0e\x1f",
+        "\x08\x0c",
+        "no escapes at all just bytes 0x20..0x7e",
+        "\x80\xff",
+    };
+    for (cases) |v| {
+        var want = std.ArrayList(u8).empty;
+        defer want.deinit(alloc);
+        try reference(alloc, &want, "the_key", v);
+
+        var got = std.ArrayList(u8).empty;
+        defer got.deinit(alloc);
+        try jsonFieldStringRaw(alloc, &got, "the_key", v);
+
+        try std.testing.expectEqualSlices(u8, want.items, got.items);
+    }
+
+    // Empty key, which `jsonStringRawBody` relies on.
+    var want = std.ArrayList(u8).empty;
+    defer want.deinit(alloc);
+    try reference(alloc, &want, "", "x\ny");
+    var got = std.ArrayList(u8).empty;
+    defer got.deinit(alloc);
+    try jsonFieldStringRaw(alloc, &got, "", "x\ny");
+    try std.testing.expectEqualSlices(u8, want.items, got.items);
+}
+
+test "encodeWALPayload: round-trips through the replay parser unchanged" {
+    // The WAL is on-disk format and the batching change must not move a
+    // single byte of it. Assert the emitted payload against a literal.
+    const alloc = std.testing.allocator;
+    var store = try Store.init(alloc, .{ .data_dir = null, .seed_default_goals = false });
+    defer store.deinit();
+
+    const meta: core.Metadata = .{
+        .created_at = 1700000000000,
+        .updated_at = 1700000000001,
+        .last_accessed_at = 1700000000002,
+        .importance_score = 0.5,
+        .coherence_score = 0.25,
+        .decay_rate = 0.125,
+        .source_confidence = 1.0,
+        .emotional_valence = 0.0,
+        .access_count = 7,
+    };
+    const payload = try store.encodeWALPayload(
+        42,
+        .matter,
+        "quote \" backslash \\ tab \t",
+        "u|likes|coffee",
+        3,
+        0.75,
+        meta,
+    );
+    defer alloc.free(payload);
+
+    try std.testing.expectEqualStrings(
+        \\{"id":42,"source":"matter","episode":"quote \" backslash \\ tab \t","facts":"u|likes|coffee","goal_id":3,"relevance":0.750000,"created_at":1700000000000,"updated_at":1700000000001,"last_accessed_at":1700000000002,"importance_score":0.500000,"coherence_score":0.250000,"decay_rate":0.125000,"source_confidence":1.000000,"emotional_valence":0.000000,"access_count":7}
+    , payload);
 }
