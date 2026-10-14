@@ -590,7 +590,3 @@ test "GoalPoset: init survives OOM at every allocation site" {
         poset.deinit();
     }
 }
-
-test "ZZMARKER goal_tree collection probe" {
-    try std.testing.expect(true);
-}
