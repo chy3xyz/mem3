@@ -17,14 +17,27 @@ pub const RerankContext = struct {
     goals: *GoalPoset,
     query_goal_ids: []const u64 = &.{},
 
+    /// Relevance of `cell`'s best association with a goal the query asked
+    /// about, in [0, 1].
+    ///
+    /// Constitution III: a tombstoned goal contributes **0**, while its
+    /// `goal_associations` stay intact so the reference is not lost. This
+    /// check was missing — `types.zig` documented the 0-bonus rule and the
+    /// constitution suite "verified" it, but the verifier asserted a struct
+    /// literal it had just written. A tombstoned goal was in fact boosting
+    /// its cells at full weight.
+    ///
+    /// An id the poset does not hold is also worth 0: the reference points
+    /// at a goal that no longer exists, so there is no priority to apply.
     pub fn goalBonus(self: *const RerankContext, cell: *const MemCell) f32 {
         if (cell.goal_associations.len == 0 or self.query_goal_ids.len == 0) return 0.0;
         var max_rel: f32 = 0.0;
         for (cell.goal_associations) |ga| {
             for (self.query_goal_ids) |qg| {
-                if (ga.goal_id == qg and ga.relevance > max_rel) {
-                    max_rel = ga.relevance;
-                }
+                if (ga.goal_id != qg or ga.relevance <= max_rel) continue;
+                const goal = self.goals.get(ga.goal_id) orelse continue;
+                if (goal.status == .tombstoned) continue;
+                max_rel = ga.relevance;
             }
         }
         return max_rel;

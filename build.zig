@@ -152,6 +152,30 @@ pub fn build(b: *std.Build) void {
     longrun_step.dependOn(&run_longrun.step);
 
     // =========================================================================
+    // Example: `zig build example-hnsw-recall`
+    //
+    // Recall@10 of the index against an exhaustive scan, swept over the
+    // candidate budget, plus the resulting graph shape. Uses the same
+    // oracle corpus the unit tests assert against.
+    // =========================================================================
+    const hnsw_recall_module = b.createModule(.{
+        .root_source_file = b.path("examples/hnsw_recall.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+        .imports = &.{
+            .{ .name = "mem3", .module = libmem3_module },
+        },
+    });
+    const hnsw_recall_exe = b.addExecutable(.{
+        .name = "mem3-hnsw-recall",
+        .root_module = hnsw_recall_module,
+    });
+    b.installArtifact(hnsw_recall_exe);
+    const run_hnsw_recall = b.addRunArtifact(hnsw_recall_exe);
+    const hnsw_recall_step = b.step("example-hnsw-recall", "Measure HNSW recall@10 against an exhaustive scan");
+    hnsw_recall_step.dependOn(&run_hnsw_recall.step);
+
+    // =========================================================================
     // Example: `zig build example-forgetting-eval`
     //
     // Forgetting evaluation harness. Sweeps a simulated cell age (by

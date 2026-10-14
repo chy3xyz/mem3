@@ -108,45 +108,50 @@ pub const HNSW = struct {
             return;
         }
 
-        // Insert at each layer 0..level, with ef_construction beam search.
-        // v0.1.0 simplified: at level 0 only, do a TopK cosine search and
-        // connect. The upper layers (if any) get a single greedy descent
-        // pass.
+        // HNSW Algorithm 1 — descend the layers, then link on the way back.
         //
-        // `candidates` comes back sorted nearest-first and holds up to
-        // `ef_construction` (200) ids. Linking all of them and pruning after
-        // the fact costs a full shrink per candidate; the paper instead
-        // selects `M` neighbours up front. Same result — the shrink keeps
-        // the nearest `limit` anyway — for a fraction of the cosine work.
-        const link_limit = self.maxDegree(0);
-        if (level == 0) {
-            const candidates = try self.searchInternal(vector, self.cfg.hnsw_ef_construction, 0);
+        // Above the new node's own level it does not exist yet, so those
+        // layers get a cheap ef=1 hop whose only job is to find a better
+        // starting point for the next layer down. From its own level down
+        // to 0 it gets the full ef_construction beam and links to the M
+        // nearest.
+        //
+        // Both previous branches called `connect(id, cid, 0, vector)` —
+        // hardcoded layer 0 — so no adjacency list above layer 0 was ever
+        // written, however tall `randomLevel` made the graph. Every
+        // `greedyDescend` at level > 0 walked an empty list, which is why
+        // fixing the level distribution alone could not buy recall: the
+        // hierarchy it produced had no edges in it.
+        var entry: u64 = self.entry_point.?;
+
+        var lc: i32 = @intCast(self.max_level);
+        while (lc > @as(i32, @intCast(level))) : (lc -= 1) {
+            const hop = try self.searchLayer(vector, entry, 1, @intCast(lc));
+            defer self.alloc.free(hop);
+            if (hop.len > 0) entry = hop[0];
+        }
+
+        var l: i32 = @intCast(@min(self.max_level, level));
+        while (l >= 0) : (l -= 1) {
+            const ul: u8 = @intCast(l);
+            const candidates = try self.searchLayer(
+                vector,
+                entry,
+                @intCast(self.cfg.hnsw_ef_construction),
+                ul,
+            );
             defer self.alloc.free(candidates);
+
+            const limit = self.maxDegree(ul);
             var linked: usize = 0;
             for (candidates) |cid| {
                 if (cid == id) continue;
-                try self.connect(id, cid, 0, vector);
+                try self.connect(id, cid, ul, vector);
                 linked += 1;
-                if (linked >= link_limit) break;
+                if (linked >= limit) break;
             }
-        } else {
-            // Multi-layer insertion: greedy descent to nearest node at each
-            // layer, then beam search at layer 0.
-            var current: u64 = self.entry_point.?;
-            var l: i32 = @intCast(level);
-            while (l > 0) : (l -= 1) {
-                const ul: u8 = @intCast(l);
-                current = self.greedyDescend(vector, current, ul);
-            }
-            const candidates = try self.searchInternal(vector, self.cfg.hnsw_ef_construction, 0);
-            defer self.alloc.free(candidates);
-            var linked: usize = 0;
-            for (candidates) |cid| {
-                if (cid == id) continue;
-                try self.connect(id, cid, 0, vector);
-                linked += 1;
-                if (linked >= link_limit) break;
-            }
+            // Thread the nearest found into the next layer down.
+            if (candidates.len > 0) entry = candidates[0];
         }
 
         // Promote the entry point only once the node is fully linked.
@@ -179,90 +184,137 @@ pub const HNSW = struct {
         return out;
     }
 
-    fn searchInternal(self: *HNSW, query: []const f32, ef: usize, level: u8) errors![]u64 {
-        if (self.entry_point == null) return &.{};
-        var current: u64 = self.entry_point.?;
+    /// HNSW Algorithm 2 — best-first search within a single layer.
+    ///
+    /// `start` is the node the walk begins from. Callers pass the result
+    /// of the layer above (Algorithm 1) so each layer begins where the
+    /// layer above left off, rather than re-descending from the global
+    /// entry point every time.
+    ///
+    /// Two sets drive the walk:
+    ///
+    ///   * `results` (W in the paper) — the best `budget` nodes found so
+    ///     far. A new neighbour only enters by displacing the worst
+    ///     incumbent; everything else is dropped on the spot.
+    ///   * `frontier` (C) — nodes still to expand, always popped
+    ///     closest-first.
+    ///
+    /// The loop ends as soon as the closest unexpanded candidate is worse
+    /// than the worst node already in W and W is full: nothing left in
+    /// the queue can improve the answer.
+    ///
+    /// The previous version filled a `result_set` and stopped the entire
+    /// search the moment it reached `ef` *discovered* nodes. That is not a
+    /// beam: it never pruned, and it never followed a promising path past
+    /// the first ef nodes it happened to stumble into, so the answer
+    /// depended on which nodes sat near the entry point rather than on the
+    /// query. The signature was recall climbing almost linearly with the
+    /// budget — 0.0650 / 0.1340 / 0.3370 / 0.5670 / 0.7280 at
+    /// ef = 32 / 50 / 100 / 200 / 400 — which is what you see when a
+    /// search *samples* a slice of the corpus instead of navigating to the
+    /// neighbourhood.
+    ///
+    /// Both containers stay bounded (`frontier` by `budget`, because a node
+    /// only joins the frontier as it joins W), so the linear scans below
+    /// are far cheaper than the cosine evaluations they gate. A heap would
+    /// only move the constant factor.
+    fn searchLayer(self: *HNSW, query: []const f32, start: u64, ef: usize, level: u8) errors![]u64 {
+        const budget = @max(ef, 1);
 
-        // Greedy descent from current's level down to `level`.
-        const start_level: i32 = @intCast(self.nodes.get(current).?.level);
-        var l: i32 = start_level;
-        while (l > @as(i32, @intCast(level))) : (l -= 1) {
-            const ul: u8 = @intCast(l);
-            current = self.greedyDescend(query, current, ul);
-        }
-
-        // Beam search at `level`.
         var visited = std.AutoHashMap(u64, void).init(self.alloc);
         defer visited.deinit();
-        var frontier = std.ArrayList(u64).empty;
+        var frontier = std.ArrayList(Cand).empty;
         defer frontier.deinit(self.alloc);
-        var result_set = std.AutoHashMap(u64, f32).init(self.alloc);
-        defer result_set.deinit();
+        var results = std.ArrayList(Cand).empty;
+        defer results.deinit(self.alloc);
+        try results.ensureTotalCapacity(self.alloc, budget);
+        try frontier.ensureTotalCapacity(self.alloc, budget);
 
-        try visited.put(current, {});
-        try frontier.append(self.alloc, current);
-        try result_set.put(current, self.cosineSim(query, self.nodes.get(current).?.vector));
+        const start_score = self.cosineSim(query, self.nodes.get(start).?.vector);
+        try visited.put(start, {});
+        try frontier.append(self.alloc, .{ .id = start, .score = start_score });
+        try results.append(self.alloc, .{ .id = start, .score = start_score });
 
-        const target_ef = ef;
-        // The ef budget bounds how many candidates we keep expanding.
-        // It must gate the WHOLE beam search, not just one neighbour
-        // loop: previously the counter only ever decremented inside the
-        // expansion loop and the `break` only left the inner loop, so the
-        // outer loop kept running, re-entered the inner loop with
-        // `target_ef == 0`, and underflowed. Tests never reached it
-        // because they insert a handful of nodes — the budget is
-        // `hnsw_ef_construction` (200) neighbour expansions.
-        var exhausted = false;
-        while (frontier.items.len > 0 and !exhausted) {
-            // Pick the frontier node with highest score (lowest distance / highest sim).
-            // For cosine, higher is better.
-            var best_idx: usize = 0;
-            var best_score: f32 = -2.0;
-            for (frontier.items, 0..) |nid, i| {
-                const s = result_set.get(nid) orelse -2.0;
-                if (s > best_score) {
-                    best_score = s;
-                    best_idx = i;
-                }
+        while (frontier.items.len > 0) {
+            // Pop the closest unexpanded candidate.
+            var best_i: usize = 0;
+            for (frontier.items, 0..) |c, i| {
+                if (c.score > frontier.items[best_i].score) best_i = i;
             }
-            const current_nid = frontier.items[best_idx];
-            _ = frontier.orderedRemove(best_idx);
+            const c = frontier.swapRemove(best_i);
 
-            // Expand neighbors.
-            const node = self.nodes.get(current_nid) orelse continue;
-            const layer_idx: usize = if (level < node.neighbors.len) level else 0;
-            if (layer_idx >= node.neighbors.len) continue;
-            for (node.neighbors[layer_idx].items) |nid| {
+            if (results.items.len >= budget and c.score < results.items[worstIdx(results.items)].score) break;
+
+            const node = self.nodes.get(c.id) orelse continue;
+            if (level >= node.neighbors.len) continue;
+
+            // Locate the incumbent to displace once per expansion rather
+            // than once per neighbour: rescanning `results` inside the
+            // neighbour loop made the inner loop O(ef * degree) — 200 * 32
+            // comparisons for every node expanded at construction time,
+            // which dominated the whole search.
+            //
+            // `worst_valid` matters: while the beam is still filling, the
+            // cached index is meaningless and MUST be recomputed on the
+            // first neighbour seen *after* it fills. Caching it from the
+            // pre-fill state silently compared every candidate against
+            // `results[0]` and overwrote the best entry instead of the
+            // worst — measured as recall@10 dropping 0.5660 -> 0.5420 at
+            // ef = 10 before this was caught.
+            var worst: usize = 0;
+            var worst_valid = false;
+
+            for (node.neighbors[level].items) |nid| {
                 if (visited.contains(nid)) continue;
+                const n = self.nodes.get(nid) orelse continue;
                 try visited.put(nid, {});
-                try frontier.append(self.alloc, nid);
-                const s = self.cosineSim(query, self.nodes.get(nid).?.vector);
-                try result_set.put(nid, s);
-                // Stop on the size of the candidate set, which is what
-                // `ef` actually means, and cannot underflow.
-                if (result_set.count() >= target_ef) {
-                    exhausted = true;
-                    break;
+                const s = self.cosineSim(query, n.vector);
+
+                if (results.items.len < budget) {
+                    try results.append(self.alloc, .{ .id = nid, .score = s });
+                    try frontier.append(self.alloc, .{ .id = nid, .score = s });
+                } else {
+                    if (!worst_valid) {
+                        worst = worstIdx(results.items);
+                        worst_valid = true;
+                    }
+                    if (s > results.items[worst].score) {
+                        results.items[worst] = .{ .id = nid, .score = s };
+                        try frontier.append(self.alloc, .{ .id = nid, .score = s });
+                        worst = worstIdx(results.items);
+                    }
                 }
             }
         }
 
-        // Collect top ef by score.
-        var scores = std.ArrayList(struct { id: u64, s: f32 }).empty;
-        defer scores.deinit(self.alloc);
-        var it = result_set.iterator();
-        while (it.next()) |entry| {
-            try scores.append(self.alloc, .{ .id = entry.key_ptr.*, .s = entry.value_ptr.* });
-        }
-        std.mem.sort(@TypeOf(scores.items[0]), scores.items, {}, struct {
-            fn lt(_: void, a: @TypeOf(scores.items[0]), b: @TypeOf(scores.items[0])) bool {
-                return a.s > b.s; // descending
+        std.mem.sort(Cand, results.items, {}, struct {
+            fn lt(_: void, a: Cand, b: Cand) bool {
+                if (a.score != b.score) return a.score > b.score;
+                return a.id < b.id;
             }
         }.lt);
 
-        const out = try self.alloc.alloc(u64, @min(scores.items.len, ef));
-        for (out, 0..) |*o, i| o.* = scores.items[i].id;
+        const out = try self.alloc.alloc(u64, @min(results.items.len, budget));
+        for (out, 0..) |*o, i| o.* = results.items[i].id;
         return out;
+    }
+
+    /// Descend from the entry point down to `level`, then beam-search there.
+    ///
+    /// The layers above `level` are cheap greedy hops (ef = 1); the target
+    /// layer gets the real budget.
+    fn searchInternal(self: *HNSW, query: []const f32, ef: usize, level: u8) errors![]u64 {
+        const ep = self.entry_point orelse return &.{};
+        if (level > self.max_level) return &.{};
+
+        var current: u64 = ep;
+        var l: i32 = @intCast(self.max_level);
+        while (l > @as(i32, @intCast(level))) : (l -= 1) {
+            const hop = try self.searchLayer(query, current, 1, @intCast(l));
+            defer self.alloc.free(hop);
+            if (hop.len > 0) current = hop[0];
+        }
+        return self.searchLayer(query, current, ef, level);
     }
 
     pub const SearchResult = struct {
@@ -270,24 +322,19 @@ pub const HNSW = struct {
         score: f32,
     };
 
-    fn greedyDescend(self: *HNSW, query: []const f32, start: u64, level: u8) u64 {
-        var current = start;
-        var current_score = self.cosineSim(query, self.nodes.get(current).?.vector);
-        var changed = true;
-        while (changed) {
-            changed = false;
-            const node = self.nodes.get(current) orelse break;
-            if (level >= node.neighbors.len) break;
-            for (node.neighbors[level].items) |nid| {
-                const s = self.cosineSim(query, self.nodes.get(nid).?.vector);
-                if (s > current_score) {
-                    current = nid;
-                    current_score = s;
-                    changed = true;
-                }
-            }
+    /// A scored node id, as carried by the search frontier and the
+    /// bounded result set. Declared at container scope because Zig has no
+    /// nested functions or local type declarations.
+    const Cand = struct { id: u64, score: f32 };
+
+    /// Index of the lowest-scoring entry — the one a full result set
+    /// displaces when a better neighbour shows up.
+    fn worstIdx(items: []const Cand) usize {
+        var w: usize = 0;
+        for (items, 0..) |r, i| {
+            if (r.score < items[w].score) w = i;
         }
-        return current;
+        return w;
     }
 
     /// Maximum adjacency-list length at `level`.
@@ -324,20 +371,19 @@ pub const HNSW = struct {
         const level_idx: usize = level;
         const src = node.neighbors[level_idx].items;
 
-        const Cand = struct { id: u64, sim: f32 };
         var cands = std.ArrayList(Cand).empty;
         defer cands.deinit(self.alloc);
         try cands.ensureTotalCapacity(self.alloc, src.len);
         for (src) |cid| {
             if (cid == node.id) continue; // never keep a self loop
             const cn = self.nodes.get(cid) orelse continue; // never keep a dangling id
-            try cands.append(self.alloc, .{ .id = cid, .sim = self.cosineSim(query, cn.vector) });
+            try cands.append(self.alloc, .{ .id = cid, .score = self.cosineSim(query, cn.vector) });
         }
         // Nearest to the query first; ties broken by id so the resulting
         // graph is byte-for-byte reproducible for a given insertion order.
         std.mem.sort(Cand, cands.items, {}, struct {
             fn lt(_: void, a: Cand, b: Cand) bool {
-                if (a.sim != b.sim) return a.sim > b.sim;
+                if (a.score != b.score) return a.score > b.score;
                 return a.id < b.id;
             }
         }.lt);
@@ -361,7 +407,7 @@ pub const HNSW = struct {
                 for (cn.neighbors[c_layer].items) |c2| {
                     if (c2 == c.id or c2 == node.id) continue;
                     const c2n = self.nodes.get(c2) orelse continue;
-                    if (self.cosineSim(c2n.vector, query) > c.sim) {
+                    if (self.cosineSim(c2n.vector, query) > c.score) {
                         discard = true;
                         replacement = c2;
                         break;
@@ -373,7 +419,7 @@ pub const HNSW = struct {
                     const cv = cn.vector;
                     for (kept.items) |kid| {
                         const kn = self.nodes.get(kid) orelse continue;
-                        if (self.cosineSim(cv, kn.vector) >= c.sim) {
+                        if (self.cosineSim(cv, kn.vector) >= c.score) {
                             discard = true;
                             break;
                         }
@@ -564,34 +610,44 @@ test "HNSW: ef budget exhaustion does not underflow" {
 // A std PRNG would not do: its stream is free to shift between Zig versions,
 // and a corpus that shifts is a corpus whose measured recall is a fiction.
 //
-// Measured on this corpus (see the report in the commit that added it):
+// Measured on this corpus. Reproduce with `zig build example-hnsw-recall`,
+// which drives the same code paths these tests assert against:
 //
-//   | index                          | max degree | recall@10 |
-//   |--------------------------------|------------|-----------|
-//   | un-pruned (pre-fix HEAD)       |    399     |   0.2460  |
-//   | un-pruned, ef = N (400)        |    399     |   1.0000  |
-//   | pruned + bounded degree        |     32     |   0.3370  |
-//   | pruned, ef = N (400)           |     32     |   0.7280  |
+//   | index                                    | max degree | recall@10 |
+//   |------------------------------------------|------------|-----------|
+//   | un-pruned, sampled search (pre-fix HEAD) |    399     |   0.2460  |
+//   | degree-bounded, sampled search           |     32     |   0.3370  |
+//   | degree-bounded + real level distribution |     32     |   0.3790  |
+//   | degree-bounded + best-first beam (now)   |     32     |   0.7580  |
 //
-// The un-pruned/ef=N row is the load-bearing one: a complete graph scored
-// against brute force returns 1.0000, which proves the corpus, the ids, the
-// scoring and the comparison are all sound, and pins the entire recall loss
-// on the `ef` budget. It is also why the thresholds below are 0.30 and not
-// 0.90. The `ef` sweep on the pruned index reads 0.0650 / 0.1340 / 0.3370 /
-// 0.5670 / 0.7280 at ef = 32 / 50 / 100 / 200 / 400 — recall climbs almost
-// linearly with the budget, which is the signature of a search that
-// *samples* a fraction of the corpus instead of navigating to the
-// neighbourhood. Closing that gap means rewriting `searchInternal` as a
-// proper best-first beam search; it is a separate defect and out of scope
-// here. Until then 0.90 is simply not reachable, so asserting it would be
-// asserting a number nobody has measured.
+// The first row is load-bearing: a complete graph scored against brute
+// force returned 1.0000, which proves the corpus, the ids, the scoring and
+// the comparison are sound, and pins the loss on the search rather than on
+// the harness.
+//
+// The rewrite moved two things at once. `searchInternal` stopped the whole
+// walk the moment it had *discovered* `ef` nodes, so it never pruned and
+// never followed a promising path — recall climbed almost linearly with the
+// budget (0.0650 / 0.1340 / 0.3370 / 0.5670 / 0.7280 at ef = 32 / 50 / 100
+// / 200 / 400), the signature of a search that samples a slice of the
+// corpus. And `insert` linked at layer 0 only, hardcoded, so no adjacency
+// list above layer 0 was ever written however tall `randomLevel` made the
+// graph. Fixing both turns the sweep into 0.5660 / 0.6840 / 0.7230 / 0.7580
+// / 0.7690 / 0.7720 at ef = 10 / 32 / 50 / 100 / 200 / 400 — saturating
+// instead of linear, which is what navigating to a neighbourhood looks like.
+//
+// ~0.77 is the graph's ceiling, not the search's: at ef = N the budget no
+// longer binds, so the missing ~23% is edges the degree bound cut and
+// `shrinkConnections` then discarded. Raising it means a larger M or the
+// paper's `SELECT-NEIGHBORS` heuristic with candidate extension, which is a
+// graph-quality change, not a search change.
 
-const oracle_dim: u16 = 32;
-const oracle_n: usize = 400;
-const oracle_k: usize = 10;
-const oracle_queries: usize = 100;
+pub const oracle_dim: u16 = 32;
+pub const oracle_n: usize = 400;
+pub const oracle_k: usize = 10;
+pub const oracle_queries: usize = 100;
 
-fn oracleNormalize(v: []f32) void {
+pub fn oracleNormalize(v: []f32) void {
     var norm: f32 = 0;
     for (v) |x| norm += x * x;
     norm = @sqrt(norm);
@@ -602,7 +658,7 @@ fn oracleNormalize(v: []f32) void {
 
 /// splitmix64-derived unit vector for an integer tag. Pure integer ops, so
 /// the same tag yields the same bits on every target and optimize mode.
-fn oracleVec(out: []f32, tag: u64) void {
+pub fn oracleVec(out: []f32, tag: u64) void {
     var s: u64 = tag *% 0x9E37_79B9_7F4A_7C15 +% 0xDEAD_BEEF_CAFE_0001;
     for (out) |*v| {
         s ^= s >> 30;
@@ -619,7 +675,7 @@ fn oracleVec(out: []f32, tag: u64) void {
 /// 32-d are near-orthogonal — every pairwise cosine sits around 0 — so the
 /// "true" top-10 is noise that no index could recover. Blending gives the
 /// corpus local structure, which is what makes recall a measurement.
-fn oracleCorpusVec(out: []f32, tag: u64) void {
+pub fn oracleCorpusVec(out: []f32, tag: u64) void {
     oracleVec(out, tag);
     var second: [oracle_dim]f32 = undefined;
     oracleVec(&second, tag ^ 0xA5A5_A5A5_A5A5_A5A5);
@@ -627,7 +683,7 @@ fn oracleCorpusVec(out: []f32, tag: u64) void {
     oracleNormalize(out);
 }
 
-fn oracleCorpus(alloc: std.mem.Allocator) ![]f32 {
+pub fn oracleCorpus(alloc: std.mem.Allocator) ![]f32 {
     const corpus = try alloc.alloc(f32, oracle_n * oracle_dim);
     errdefer alloc.free(corpus);
     for (0..oracle_n) |i| {
@@ -638,7 +694,7 @@ fn oracleCorpus(alloc: std.mem.Allocator) ![]f32 {
 
 /// Query `q`: even queries are an exact corpus member, odd queries are that
 /// member plus 15% noise. Writes into `out` — no allocation per query.
-fn oracleQuery(out: []f32, corpus: []const f32, q: usize) void {
+pub fn oracleQuery(out: []f32, corpus: []const f32, q: usize) void {
     const base = (q * 7919 % oracle_n) * oracle_dim;
     @memcpy(out, corpus[base..][0..oracle_dim]);
     if (q % 2 != 0) {
@@ -652,7 +708,7 @@ fn oracleQuery(out: []f32, corpus: []const f32, q: usize) void {
 /// Exhaustive top-`k` by cosine over every vector in the corpus. Ids are the
 /// 1-based insert order used by `oracleFill`. Ties break on the lower index
 /// so the ground truth is reproducible rather than sort-order dependent.
-fn oracleTruth(alloc: std.mem.Allocator, corpus: []const f32, query: []const f32, k: usize) ![]u64 {
+pub fn oracleTruth(alloc: std.mem.Allocator, corpus: []const f32, query: []const f32, k: usize) ![]u64 {
     const Ctx = struct {
         corpus: []const f32,
         query: []const f32,
@@ -689,7 +745,7 @@ fn oracleTruth(alloc: std.mem.Allocator, corpus: []const f32, query: []const f32
     return truth;
 }
 
-fn oracleFill(hnsw: *HNSW, corpus: []const f32) !void {
+pub fn oracleFill(hnsw: *HNSW, corpus: []const f32) !void {
     for (0..oracle_n) |i| {
         try hnsw.insert(@intCast(i + 1), corpus[i * oracle_dim ..][0..oracle_dim]);
     }
@@ -697,7 +753,12 @@ fn oracleFill(hnsw: *HNSW, corpus: []const f32) !void {
 
 /// Builds the oracle corpus + index and returns the aggregate recall@k.
 /// Caller frees `corpus`. `ef_search` is passed through to the config.
-fn oracleRecall(alloc: std.mem.Allocator, ef_search: u16) !f32 {
+/// Recall@oracle_k on the oracle corpus at a given `ef_search`.
+///
+/// Public so `examples/hnsw_recall.zig` can sweep the budget and print the
+/// table — the numbers quoted in the comment block above used to exist only
+/// as prose, which is how they went stale in the first place.
+pub fn oracleRecallWith(alloc: std.mem.Allocator, ef_search: u16) !f32 {
     var cfg = Config{};
     cfg.hnsw_ef_construction = 200;
     cfg.hnsw_ef_search = ef_search;
@@ -708,7 +769,7 @@ fn oracleRecall(alloc: std.mem.Allocator, ef_search: u16) !f32 {
     const corpus = try oracleCorpus(alloc);
     defer alloc.free(corpus);
     try oracleFill(&hnsw, corpus);
-    try std.testing.expectEqual(@as(usize, oracle_n), hnsw.count);
+    if (hnsw.count != oracle_n) return error.OracleCorpusSizeMismatch;
 
     var hits: usize = 0;
     var qv: [oracle_dim]f32 = undefined;
@@ -720,7 +781,7 @@ fn oracleRecall(alloc: std.mem.Allocator, ef_search: u16) !f32 {
 
         const got = try hnsw.search(alloc, &qv, oracle_k);
         defer alloc.free(got);
-        try std.testing.expectEqual(@as(usize, oracle_k), got.len);
+        if (got.len != oracle_k) return error.OracleResultTruncated;
 
         for (got) |g| {
             for (truth) |t| {
@@ -734,29 +795,40 @@ fn oracleRecall(alloc: std.mem.Allocator, ef_search: u16) !f32 {
     return @as(f32, @floatFromInt(hits)) / @as(f32, @floatFromInt(oracle_queries * oracle_k));
 }
 
+fn oracleRecall(alloc: std.mem.Allocator, ef_search: u16) !f32 {
+    const r = try oracleRecallWith(alloc, ef_search);
+    try std.testing.expect(r >= 0.0 and r <= 1.0);
+    return r;
+}
+
 // Recall@k on the default configuration (`hnsw_ef_search` = 100).
 //
-// Threshold 0.30, measured 0.3370 — about 12% headroom, and roughly 12x
-// what a search returning garbage scores (~0.025 expected on a random
-// 10-of-400 draw). It deliberately does NOT clear the pre-fix un-pruned
-// index (0.2460): that gap is the regression this guard exists to catch.
-// A future fix to `searchInternal` can only push this number up.
+// Threshold 0.70, measured 0.7580. It was 0.30 / measured 0.3370 before the
+// best-first rewrite, which meant the guard cleared anything down to a third
+// of what the search actually delivered — a test that passes at 0.30 when the
+// code scores 0.758 is not a guard. The 0.70 floor now sits above every
+// pre-rewrite measurement in the table above (0.2460 / 0.3370 / 0.3790), so
+// a regression back to the sampled search turns this red instead of quietly
+// re-baselining.
 test "HNSW: recall against exhaustive scan at default ef" {
     const recall = try oracleRecall(std.testing.allocator, 100);
-    try std.testing.expect(recall >= 0.30);
+    try std.testing.expect(recall >= 0.70);
 }
 
 // Recall@k with the candidate budget raised to the corpus size, so the
 // search can walk everything the graph still reaches.
 //
-// This isolates *graph quality* from the search heuristic: with `ef = N`
-// the un-pruned complete graph scores 1.0000, while the degree-bounded
-// small-world graph scores 0.7280. Threshold 0.65 sits under the measured
-// 0.7280 and well above any graph whose pruning has cut edges it should
-// not have — that is the failure mode this catches.
+// This isolates *graph quality* from the search heuristic: at `ef = N` the
+// search is no longer the binding constraint, so whatever is missing is an
+// edge the degree bound or `shrinkConnections` cut. Measured 0.7720, up from
+// 0.7280 before the rewrite — inserting at every layer, not just layer 0,
+// also made the graph itself better. Threshold 0.75 leaves little room
+// above the measured value because this number is exactly determined: the
+// corpus is splitmix64 and the level seed is fixed, so there is no sampling
+// variance to absorb.
 test "HNSW: degree-bounded graph still reaches the true neighbours at ef = N" {
     const recall = try oracleRecall(std.testing.allocator, @intCast(oracle_n));
-    try std.testing.expect(recall >= 0.65);
+    try std.testing.expect(recall >= 0.75);
 }
 
 // Structural guard for the pruning: no adjacency list may exceed its
