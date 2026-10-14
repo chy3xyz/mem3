@@ -22,6 +22,10 @@ comptime {
     _ = @import("unit/coherence.zig");
     _ = @import("unit/consolidator.zig");
     _ = @import("unit/hnsw.zig");
+    // The CLI argument parser. Zero tests previously, across 223 lines of
+    // hand-rolled flag handling; three real parser bugs were found the day
+    // this was added.
+    _ = @import("unit/cli.zig");
 
     // Integration tests — end-to-end scenarios through Store /
     // HTTP server. Slow but high signal.
@@ -31,6 +35,9 @@ comptime {
     // Property-based tests — randomized round-trip coverage of the
     // comptime serializer.
     _ = @import("property/serializer_roundtrip.zig");
+    // Adjoint-pair sanity checks required by constitution Principle VI:
+    // Encode ∘ Decode ≈ id, and the Decode ∘ Encode ≤ id approximation.
+    _ = @import("property/adjoint.zig");
 }
 
 test "tests runner: all import paths resolved" {

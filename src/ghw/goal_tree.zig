@@ -288,13 +288,31 @@ pub const GoalPoset = struct {
     }
 
     /// Validate a candidate status transition.
+    ///
+    /// Enforced by `Store.updateGoalStatus` before the record is
+    /// journaled, so it is a durability rule and not advice. It used to
+    /// be test-only, which meant `mem3 goal status <id> completed` on a
+    /// goal that was still `pending` was refused while the product's own
+    /// persistence test exercised exactly that path — the table was
+    /// stricter than the system was ever run.
+    ///
+    /// What is genuinely illegal is resurrection out of a terminal
+    /// state: a `completed` or `tombstoned` goal is final, and letting
+    /// it move wrote a `goal_update` record that replay would apply,
+    /// silently undoing the decision on the next boot.
     pub fn isValidTransition(from: GoalStatus, to: GoalStatus) bool {
         return switch (from) {
-            .pending => to == .in_progress or to == .unrealized or to == .tombstoned,
+            // An agent that finished the work marks the goal done without
+            // ever staging it, which is what the CLI does.
+            .pending => to == .in_progress or to == .completed or
+                to == .failed or to == .unrealized or to == .tombstoned,
             .in_progress => to == .completed or to == .failed or to == .pending,
             .completed => false, // terminal
-            .failed => to == .pending or to == .tombstoned, // can retry or retire
-            .unrealized => to == .pending or to == .tombstoned, // can revive or retire
+            // Retry: pending to try again, completed if the retry worked,
+            // unrealized once retries are exhausted, tombstoned to retire.
+            .failed => to == .pending or to == .completed or
+                to == .unrealized or to == .tombstoned,
+            .unrealized => to == .pending or to == .completed or to == .tombstoned, // can revive or retire
             .tombstoned => false, // terminal
         };
     }
@@ -456,10 +474,24 @@ test "GoalPoset: cycle detection" {
 }
 
 test "GoalPoset: status transitions" {
+    // Forward progress and revival.
     try std.testing.expect(GoalPoset.isValidTransition(.pending, .in_progress));
+    try std.testing.expect(GoalPoset.isValidTransition(.pending, .completed));
     try std.testing.expect(GoalPoset.isValidTransition(.pending, .unrealized));
+    try std.testing.expect(GoalPoset.isValidTransition(.in_progress, .completed));
+    try std.testing.expect(GoalPoset.isValidTransition(.unrealized, .pending));
+    try std.testing.expect(GoalPoset.isValidTransition(.failed, .completed));
+
+    // Terminal states are final — this is the invariant `Store` now
+    // enforces before a `goal_update` record becomes durable.
     try std.testing.expect(!GoalPoset.isValidTransition(.completed, .pending));
+    try std.testing.expect(!GoalPoset.isValidTransition(.completed, .in_progress));
     try std.testing.expect(!GoalPoset.isValidTransition(.tombstoned, .pending));
+    try std.testing.expect(!GoalPoset.isValidTransition(.tombstoned, .in_progress));
+
+    // In flight cannot jump straight to being retired without being
+    // acknowledged first.
+    try std.testing.expect(!GoalPoset.isValidTransition(.in_progress, .tombstoned));
 }
 
 test "GoalPoset: init survives OOM at every allocation site" {

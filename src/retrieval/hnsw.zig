@@ -491,6 +491,43 @@ pub const HNSW = struct {
         return @intCast(@min(lvl, @as(u32, 16)));
     }
 
+    /// Number of vectors in the index.
+    ///
+    /// `const`-read-only and O(1): returns the counter `insert`
+    /// maintains, which the "nodeCount matches storage" test below
+    /// pins against `nodes.count()`. Exists for observability — the
+    /// daemon publishes it as `mem3_vector_index_nodes`.
+    pub fn nodeCount(self: *const HNSW) usize {
+        return self.count;
+    }
+
+    /// Highest layer level that currently holds at least one node.
+    ///
+    /// `self.max_level` is a sticky high-water mark: it is bumped when
+    /// a taller node arrives and never lowered. It would therefore
+    /// report an occupied layer even if every node above the base
+    /// layer were ever removed, so this recomputes the answer from
+    /// the nodes themselves — the only honest reading of "how deep is
+    /// the index right now" for an operator's dashboard.
+    ///
+    /// Returns -1 for an empty index: no layer is occupied at all,
+    /// which is distinct from "one node sitting on the base layer"
+    /// (0). Callers that publish a Prometheus gauge should render the
+    /// value as-is and pair it with `nodeCount` so -1 is unambiguous.
+    ///
+    /// O(n) over the node map. This is a scrape-time metric on a
+    /// daemon whose scrape path already walks the whole cell index for
+    /// `mem3_memstore_cells`; it is not on the query hot path.
+    pub fn maxOccupiedLevel(self: *const HNSW) i32 {
+        var top: i32 = -1;
+        var it = self.nodes.iterator();
+        while (it.next()) |entry| {
+            const lvl: i32 = entry.value_ptr.*.level;
+            if (lvl > top) top = lvl;
+        }
+        return top;
+    }
+
     pub fn cosineSim(self: *HNSW, a: []const f32, b: []const f32) f32 {
         _ = self;
         var dot: f32 = 0.0;
@@ -975,4 +1012,47 @@ test "HNSW: node levels are actually distributed, not all identical" {
         if (e.value_ptr.*.level > max2) max2 = e.value_ptr.*.level;
     }
     try std.testing.expectEqual(max_level, max2);
+}
+
+test "HNSW: observability accessors report the live index shape" {
+    // The daemon publishes these as `mem3_vector_index_depth` and
+    // `mem3_vector_index_nodes`. Two properties are worth pinning:
+    //
+    //  1. `nodeCount` must agree with actual storage. It is a counter
+    //     maintained by `insert`, so a drift between it and
+    //     `nodes.count()` would be invisible everywhere else.
+    //  2. `maxOccupiedLevel` must report the deepest *occupied*
+    //     layer, and -1 (not 0) when there is nothing indexed — a
+    //     flat "0" would be indistinguishable from "one node on the
+    //     base layer" and would silently make an empty index look
+    //     healthy.
+    const alloc = std.testing.allocator;
+
+    var empty = HNSW.init(alloc, .{ .hnsw_m = 16 }, 4);
+    defer empty.deinit();
+    try std.testing.expectEqual(@as(usize, 0), empty.nodeCount());
+    try std.testing.expectEqual(@as(i32, -1), empty.maxOccupiedLevel());
+
+    var idx = HNSW.init(alloc, .{ .hnsw_m = 16 }, 8);
+    defer idx.deinit();
+    var v: [8]f32 = undefined;
+    var n: usize = 0;
+    while (n < 200) : (n += 1) {
+        for (&v, 0..) |*x, j| {
+            x.* = @as(f32, @floatFromInt((n * 31 + j * 17) % 23)) - 11.0;
+        }
+        try idx.insert(n + 1, &v);
+    }
+
+    try std.testing.expectEqual(@as(usize, 200), idx.nodeCount());
+    try std.testing.expectEqual(idx.nodes.count(), idx.nodeCount());
+
+    // Recomputed from the nodes, so it equals the deep-est level
+    // actually present rather than a sticky high-water mark.
+    var deepest: i32 = 0;
+    var it = idx.nodes.iterator();
+    while (it.next()) |entry| {
+        deepest = @max(deepest, @as(i32, entry.value_ptr.*.level));
+    }
+    try std.testing.expectEqual(deepest, idx.maxOccupiedLevel());
 }

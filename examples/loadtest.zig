@@ -66,9 +66,7 @@ pub fn main() !void {
     // Get nanosecond timestamp via std.c (clock_gettime fallback).
     const ClockFn = struct {
         fn now() i128 {
-            var ts: std.c.timespec = .{ .sec = 0, .nsec = 0 };
-            _ = std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &ts);
-            return @as(i128, ts.sec) * 1_000_000_000 + @as(i128, ts.nsec);
+            return mem3.platform.clock.monotonicNs();
         }
     };
     const nowNs = ClockFn.now;

@@ -185,17 +185,6 @@ const MAX_CONFIGS = 512;
 // Small POSIX helpers (mirrors examples/longrun.zig)
 // ============================================================================
 
-fn openZ(alloc: Allocator, path: []const u8, oflag: std.c.O, mode: std.c.mode_t) ?std.c.fd_t {
-    const z = std.fmt.allocPrintSentinel(alloc, "{s}\x00", .{path}, 0) catch return null;
-    defer alloc.free(z);
-    const rc = std.c.open(z.ptr, oflag, mode);
-    if (rc < 0) return null;
-    return rc;
-}
-
-fn closeFd(fd: std.c.fd_t) void {
-    _ = std.c.close(fd);
-}
 
 /// Write every byte, or fail. A silently truncated JSONL file is well-formed
 /// up to the cut, which is the worst failure mode for a measurement
@@ -213,9 +202,26 @@ fn writeAll(fd: std.c.fd_t, bytes: []const u8) error{WriteFailed}!void {
     }
 }
 
-fn fileExists(alloc: Allocator, path: []const u8) bool {
-    const fd = openZ(alloc, path, .{ .ACCMODE = .RDONLY }, 0) orelse return false;
-    closeFd(fd);
+/// Open for writing, truncating any existing file.
+///
+/// These two functions are all that remains of this example's private copy
+/// of the POSIX file primitives. They are thin delegates onto
+/// `src/platform/fs.zig`, which is what makes the example cross-compile:
+/// the layer's `OpenMode` is identical on every target, whereas a
+/// `std.c.O` literal has a different shape per platform.
+fn openOut(path: []const u8) ?mem3.platform.fs.Fd {
+    const z = mem3.platform.fs.SentinelBuffer.init(path);
+    return mem3.platform.fs.open(z.ptr(), .{ .access = .write_only, .create = .truncate }) catch null;
+}
+
+fn closeFd(fd: mem3.platform.fs.Fd) void {
+    mem3.platform.fs.close(fd);
+}
+
+fn fileExists(path: []const u8) bool {
+    const z = mem3.platform.fs.SentinelBuffer.init(path);
+    const probe = mem3.platform.fs.open(z.ptr(), .{ .access = .read_only }) catch return false;
+    mem3.platform.fs.close(probe);
     return true;
 }
 
@@ -232,21 +238,19 @@ fn runScopedDir(alloc: Allocator, base: []const u8) ![]const u8 {
 }
 
 fn nowNs() i128 {
-    var ts: std.c.timespec = .{ .sec = 0, .nsec = 0 };
-    _ = std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &ts);
-    return @as(i128, ts.sec) * 1_000_000_000 + @as(i128, ts.nsec);
+    return mem3.platform.clock.monotonicNs();
 }
 
 fn out(comptime fmt: []const u8, args: anytype) void {
     var buf: [4096]u8 = undefined;
     const s = std.fmt.bufPrint(&buf, fmt, args) catch return;
-    _ = std.c.write(std.c.STDOUT_FILENO, s.ptr, s.len);
+    _ = mem3.platform.stdio.writeOut(s);
 }
 
 fn err(comptime fmt: []const u8, args: anytype) void {
     var buf: [2048]u8 = undefined;
     const s = std.fmt.bufPrint(&buf, fmt, args) catch return;
-    _ = std.c.write(std.c.STDERR_FILENO, s.ptr, s.len);
+    _ = mem3.platform.stdio.writeErr(s);
 }
 
 /// Render a float as JSON, or `null` when it is absent or non-finite.
@@ -596,16 +600,12 @@ pub fn main(init: std.process.Init.Minimal) !void {
         std.process.exit(2);
     };
 
-    if (!p.force and fileExists(alloc, p.out_path)) {
+    if (!p.force and fileExists(p.out_path)) {
         err("forgetting_eval: {s} already exists — pass --force or --out=PATH\n", .{p.out_path});
         std.process.exit(2);
     }
 
-    const out_fd = openZ(alloc, p.out_path, .{
-        .ACCMODE = .WRONLY,
-        .CREAT = true,
-        .TRUNC = true,
-    }, 0o644) orelse {
+    const out_fd = openOut(p.out_path) orelse {
         err("forgetting_eval: cannot open {s}\n", .{p.out_path});
         std.process.exit(2);
     };

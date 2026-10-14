@@ -363,3 +363,79 @@ test "E2E HTTP: server restart preserves inserted cells" {
         try testing.expect(std.mem.indexOf(u8, resp.body, "first server run cell B") != null);
     }
 }
+test "E2E HTTP: /metrics publishes the six constitutional families" {
+    // Constitution Principle VII requires the daemon to publish
+    // request count, retrieval P50/P95/P99, memstore size, vector
+    // index depth, hyperedge count and forgetting rate. This drives a
+    // real subprocess over a real socket — the unit tests in
+    // `src/server/http_server.zig` exercise the same renderer through
+    // `route`, but only this path proves the bytes actually leave the
+    // process.
+    const data_dir = try makeDataDir("metrics");
+    wipeDataDir(data_dir);
+
+    var srv = TestServer.start(data_dir) catch |err| {
+        wipeDataDir(data_dir);
+        return skipUnavailable(err);
+    };
+    defer srv.stop();
+    defer wipeDataDir(srv.data_dir);
+
+    const alloc = testing.allocator;
+
+    // A query, so the latency histogram is non-empty when scraped —
+    // an all-zero /metrics would pass a name-only assertion while
+    // proving nothing about the recording path.
+    var q_buf: [1024]u8 = undefined;
+    const q_body = "{\"text\":\"e2e metrics probe\",\"maxHops\":0}";
+    const query_req = std.fmt.bufPrint(
+        &q_buf,
+        "POST /api/query HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}",
+        .{ q_body.len, q_body },
+    ) catch return error.NoSpaceLeft;
+    const query_resp = try httpRequest(alloc, srv.port, query_req);
+    defer query_resp.deinit(alloc);
+    try testing.expectEqual(@as(u16, 200), query_resp.status);
+
+    const resp = try httpRequest(alloc, srv.port, "GET /metrics HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
+    defer resp.deinit(alloc);
+    try testing.expectEqual(@as(u16, 200), resp.status);
+
+    const required = [_][]const u8{
+        // request count
+        "mem3_requests_total",
+        // retrieval P50/P95/P99
+        "mem3_retrieval_latency_p50_us",
+        "mem3_retrieval_latency_p95_us",
+        "mem3_retrieval_latency_p99_us",
+        "mem3_retrieval_latency_samples_total",
+        // memstore size
+        "mem3_memstore_cells",
+        "mem3_memstore_cells_by_source",
+        // hyperedge count
+        "mem3_hyperedges",
+        // vector index depth
+        "mem3_vector_index_depth",
+        // forgetting rate
+        "mem3_forgetting_rate",
+    };
+    for (required) |name| {
+        // No logging on the failure path, even here: under `--listen=-`
+        // any stderr write from inside a test desynchronises the
+        // runner protocol and kills the test binary, and `zig build
+        // test` reports success anyway. Returning the error is the only
+        // way to make this failure visible.
+        try testing.expect(std.mem.indexOf(u8, resp.body, name) != null);
+    }
+
+    // Every source variant is reported, not just whichever one the
+    // daemon happened to see traffic for.
+    for ([_][]const u8{ "matter", "form", "spirit" }) |src| {
+        var line: [64]u8 = undefined;
+        const needle = std.fmt.bufPrint(&line, "mem3_memstore_cells_by_source{{source=\"{s}\"}}", .{src}) catch return error.NoSpaceLeft;
+        try testing.expect(std.mem.indexOf(u8, resp.body, needle) != null);
+    }
+
+    // The histogram recorded the one query we sent.
+    try testing.expect(std.mem.indexOf(u8, resp.body, "mem3_retrieval_latency_samples_total 1\n") != null);
+}

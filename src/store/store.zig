@@ -58,9 +58,11 @@ const Foresight = core.Foresight;
 const GoalAssociation = core.GoalAssociation;
 const Config = core.Config;
 const ghw = @import("../ghw/mod.zig");
+const ghw_io = @import("../ghw/ghw_io.zig");
 const ghw_goal_tree = @import("../ghw/goal_tree.zig");
 const memory = @import("../memory/mod.zig");
 const retrieval = @import("../retrieval/mod.zig");
+const RerankContext = @import("../retrieval/reranker.zig").RerankContext;
 const HNSW = retrieval.HNSW;
 const Embedder = retrieval.Embedder;
 const WAL = @import("../storage/wal.zig").WAL;
@@ -68,6 +70,8 @@ const WALRecord = @import("../storage/wal.zig").WALRecord;
 const Snapshot = @import("../storage/snapshot.zig");
 const SnapshotData = Snapshot.SnapshotData;
 const SnapshotWriter = Snapshot.SnapshotWriter;
+const GoalSnapshot = Snapshot.GoalSnapshot;
+const platform_fs = @import("../platform/fs.zig");
 const HyMem = @import("../hypermem/mod.zig").HyMem;
 const HyperEdge = @import("../hypermem/mod.zig").HyperEdge;
 
@@ -85,7 +89,12 @@ fn diag(comptime fmt: []const u8, args: anytype) void {
 }
 
 /// Build-time options for `Store.init`. See module doc for semantics.
-pub const BuildOptions = struct {
+    /// The WAL on disk is shorter than the size we computed for it. Replaying
+    /// a truncated prefix would resurrect a store state that never existed, so
+    /// this is an error rather than a short read.
+    pub const Error = error{WalReplayShortRead};
+
+    pub const BuildOptions = struct {
     /// Persistence directory (e.g. "data"). `null` → in-memory only,
     /// no WAL, no snapshot. Default: `"data"`.
     data_dir: ?[]const u8 = "data",
@@ -117,6 +126,19 @@ pub const Store = struct {
     /// Goal Poset — owned pointer so it can be passed by ref to APIs
     /// that take `*GoalPoset`.
     goals: *ghw.GoalPoset,
+    /// GHW layer 2 (Harness / 象源). Owned; released in `deinit`.
+    harness: *ghw.HarnessRegistry,
+    /// GHW layer 3 (World / 物源). Owned; released in `deinit`.
+    world: *ghw.WorldModel,
+    /// The three-layer handle every memory operation now travels
+    /// through. Built once in `init`; holds no ownership of its own.
+    ghw: ghw.GHW,
+    /// Bounded audit trail of every cross-layer hop. Owned; released in
+    /// `deinit`. Bounded by construction — see `CrossLayerLog`.
+    xlog: ghw.CrossLayerLog,
+    /// Three-way recall (dense + sparse + hypergraph). Owns no memory:
+    /// it borrows `self.hnsw`, `self.hymem` and a copy of `self.emb`.
+    hybrid: retrieval.HybridRetriever,
     /// Tri-Source Memory Manager.
     mgr: *memory.TriSourceManager,
     /// Lifecycle orchestrator. Wraps encoder + forgetter + consolidator.
@@ -150,6 +172,11 @@ pub const Store = struct {
             .alloc = alloc,
             .ids = .init(1),
             .goals = undefined,
+            .harness = undefined,
+            .world = undefined,
+            .ghw = undefined,
+            .xlog = undefined,
+            .hybrid = undefined,
             .mgr = undefined,
             .lc = undefined,
             .hymem = undefined,
@@ -197,18 +224,50 @@ pub const Store = struct {
         errdefer alloc.destroy(lc_ptr);
         lc_ptr.* = memory.Lifecycle.init(alloc, .{}, mgr_ptr);
         lc_ptr.wire();
+        // The encoder computes goal_relevance, the beta=0.40 term of
+        // importance_score = 0.30*coherence + 0.40*goal_relevance +
+        // 0.30*existential. Without this it reads only the caller-supplied
+        // values, so a tombstoned goal scores exactly like a live one and the
+        // single largest weight in the formula is blind. `mem3 add` wires
+        // this itself; the daemon and the benchmarks do not, which is why it
+        // belongs here rather than at each call site.
+        lc_ptr.encoder.goals = self.goals;
         self.lc = lc_ptr;
 
         // HyMem (uses the same id source — hyperedges are id-allocated
         // from the same monotonic counter, but live in their own space)
         self.hymem = HyMem.init(alloc, &self.ids);
 
+        // GHW layers 2 and 3 + the cross-layer audit log. These used to
+        // be constructed only by their own unit tests, so a NON-NEGOTIABLE
+        // constitutional principle (Principle II) was not enforced by
+        // anything that ships. Everything from here on crosses them.
+        const harness_ptr = try alloc.create(ghw.HarnessRegistry);
+        errdefer alloc.destroy(harness_ptr);
+        harness_ptr.* = ghw.HarnessRegistry.init(alloc);
+        self.harness = harness_ptr;
+
+        const world_ptr = try alloc.create(ghw.WorldModel);
+        errdefer alloc.destroy(world_ptr);
+        world_ptr.* = ghw.WorldModel.init(alloc);
+        self.world = world_ptr;
+
+        self.xlog = ghw.CrossLayerLog.init(alloc);
+        self.ghw = ghw.GHW.init(alloc, self.goals, self.harness, self.world, &self.ids);
+
         // HNSW + embedder
         const hnsw_ptr = try alloc.create(HNSW);
         errdefer alloc.destroy(hnsw_ptr);
         hnsw_ptr.* = HNSW.init(alloc, .{}, opts.embed_dim);
         self.hnsw = hnsw_ptr;
-        self.emb = Embedder.init(opts.embedder_kind, opts.embed_dim);
+        self.emb = try Embedder.init(opts.embedder_kind, opts.embed_dim);
+
+        // The retriever embeds queries with the *store's* embedder, not a
+        // second one built from `Config` defaults. With the old
+        // `HybridRetriever.init` it would have hashed queries with
+        // `.stub_xxhash` against an index built with `.lexical_hash` and
+        // silently returned noise.
+        self.hybrid = retrieval.HybridRetriever.init(alloc, lc_ptr.cfg, self.emb, self.hnsw, &self.hymem);
 
         // Persistence (optional)
         if (opts.data_dir) |dir| {
@@ -234,6 +293,11 @@ pub const Store = struct {
         self.wal_path = @constCast("");
 
         self.cell_index.deinit();
+        self.xlog.deinit();
+        self.harness.deinit();
+        self.alloc.destroy(self.harness);
+        self.world.deinit();
+        self.alloc.destroy(self.world);
         self.hnsw.deinit();
         self.alloc.destroy(self.hnsw);
         self.lc.fuzzy.deinit();
@@ -317,8 +381,67 @@ pub const Store = struct {
     /// Run the existence-gain-driven forgetting sweep. Pass
     /// `dry_run=true` to count without transferring cells to the
     /// fuzzy store.
+    ///
+    /// ## Why this is more than a delegate
+    ///
+    /// `Lifecycle.forget` removes cells from the `TriSourceManager` and hands
+    /// them to the fuzzy store. It does **not** touch `cell_index` and does
+    /// **not** write the WAL. Both omissions were live bugs:
+    ///
+    ///  - `cell_index` kept its entry, so `getCell(id)` returned memories
+    ///    that had been forgotten. Anything reading through the index could
+    ///    surface a cell the system had declared no longer worth keeping.
+    ///  - Nothing was journalled, so on restart the `memcell_insert` records
+    ///    replayed and every forgotten cell came back — while
+    ///    `mem3_forgotten_cells_total` still reported the sweep that removed
+    ///    them. Process counters and on-disk state diverged.
+    ///
+    /// The fix is to diff the id set around the sweep. `Forgetter.SweepResult`
+    /// carries only counts, and adding an id list to it would ripple through
+    /// every consumer for no benefit: the sweep is already O(cells), so one
+    /// extra pass is free.
+    ///
+    /// WAL-first ordering still holds — the `.forget` records are appended
+    /// after the in-memory transfer, which means a crash between the two can
+    /// lose the journal entry and resurrect the cell. That is the correct
+    /// direction to fail: a resurrected memory is recoverable, a journalled
+    /// deletion whose transfer did not happen is a phantom tombstone.
     pub fn forget(self: *Store, dry_run: bool) !memory.Forgetter.SweepResult {
-        return self.lc.forget(dry_run);
+        if (dry_run) return self.lc.forget(true);
+
+        var before = std.ArrayList(u64).empty;
+        defer before.deinit(self.alloc);
+        var it = self.cell_index.iterator();
+        while (it.next()) |e| try before.append(self.alloc, e.key_ptr.*);
+
+        const result = try self.lc.forget(false);
+
+        // Anything the sweep took out of the manager but left in the index.
+        for (before.items) |id| {
+            if (self.mgr.get(id) != null) continue;
+            _ = self.cell_index.remove(id);
+
+            if (self.wal) |wal| {
+                // `.forget` (0x20) has been in the record enum since the
+                // format was written and has never been emitted. Using it
+                // needs no format change at all.
+                var buf: [8]u8 = undefined;
+                std.mem.writeInt(u64, &buf, id, .little);
+                wal.append(.{
+                    .record_type = .forget,
+                    .payload = buf[0..8],
+                    .timestamp = wallClockSec(),
+                }) catch |err| {
+                    // A cell is already out of the manager. Failing to
+                    // journal that means it will come back on restart —
+                    // recoverable, and strictly better than aborting a sweep
+                    // that has already half-completed.
+                    log.warn("forget: WAL append failed for cell {d}: {}", .{ id, err });
+                };
+            }
+        }
+
+        return result;
     }
 
     /// Run HAC consolidation. Returns the number of abstract cells
@@ -522,6 +645,23 @@ pub const Store = struct {
         // exist must fail BEFORE anything is journaled, or replay would
         // try to apply an update to an absent goal.
         if (!self.goals.nodes.contains(id)) return core.Error.GoalNotFound;
+
+        // And the transition itself must be legal before anything is
+        // journaled. `GoalPoset.isValidTransition` existed only for its
+        // own unit tests, so `completed → pending` and every other
+        // illegal move was written to the WAL, fsynced, and reported as
+        // success; the poset then applied it, and replay applied it
+        // again on the next boot. The synthetic root/top are exempt:
+        // they are `pending` by construction and are never user-visible.
+        if (id != ghw_goal_tree.ROOT_GOAL_ID and id != ghw_goal_tree.TOP_GOAL_ID) {
+            const from = self.goals.get(id).?.status;
+            if (from != status and !ghw.GoalPoset.isValidTransition(from, status)) {
+                diag("updateGoalStatus: illegal transition {s} -> {s} for goal {d}, rejected", .{ @tagName(from), @tagName(status), id });
+                // Same error `GoalPoset.updateStatus` already reuses for
+                // an invalid transition.
+                return core.Error.GoalCycle;
+            }
+        }
 
         if (self.wal) |wal| {
             const payload = try self.encodeGoalUpdatePayload(id, status, now_ms);
@@ -895,7 +1035,178 @@ pub const Store = struct {
             self.hnsw.insert(id, v) catch |err| {
                 log.warn("hnsw insert failed: {}", .{err});
             };
+            // 外拓. Everything above this line is the World layer's
+            // storage job; everything GHW does with the memory happens
+            // here, and it happens in layer order.
+            try self.encodeAcrossLayers(id, stored);
         }
+    }
+
+    /// 外拓 — carry one committed memory across all three GHW layers.
+    ///
+    /// Goal → Harness → World, in that order, each hop checked against
+    /// `isValidDirection` inside `GHW.encode` before it runs. A
+    /// direction Principle II forbids is returned as an error, so it can
+    /// never be written to the WAL as a successful insert.
+    ///
+    /// A memory whose goal association names a goal the poset does not
+    /// hold (or a synthetic id, which is how "no goal" is spelled)
+    /// skips the traversal rather than inventing a binding. Everything
+    /// else about the insert has already succeeded, so this reports and
+    /// returns rather than rolling the cell back.
+    ///
+    /// Cost per insert is O(1): one `bindMemcell` append, one hash
+    /// lookup, two `updateWithSurprise` calls against an entity that
+    /// already exists. Nothing here scans the corpus.
+    fn encodeAcrossLayers(self: *Store, id: u64, cell: *MemCell) !void {
+        if (cell.goal_associations.len == 0) return;
+        const goal_id = cell.goal_associations[0].goal_id;
+        if (goal_id == ghw_goal_tree.ROOT_GOAL_ID or goal_id == ghw_goal_tree.TOP_GOAL_ID) return;
+        if (self.goals.get(goal_id) == null) {
+            diag("encodeAcrossLayers: cell {d} names goal {d}, which the poset does not hold; skipped the GHW traversal", .{ id, goal_id });
+            return;
+        }
+
+        // The cell reaches the Goal layer first, then flows outward.
+        // This also fixes the meta-goal rule being unenforceable: a goal
+        // with memories was never registered as having any, so the
+        // "no memories for 7 days → unrealized" sweep aged out goals
+        // that had a full corpus behind them.
+        self.goals.bindMemcell(goal_id, id) catch |err| {
+            diag("encodeAcrossLayers: bindMemcell(goal={d}, cell={d}) failed: {}", .{ goal_id, id, err });
+            return err;
+        };
+        try self.ghw.encode(&self.xlog, .{
+            .goal_id = goal_id,
+            .cell_id = id,
+            .now_ms = cell.metadata.created_at,
+        });
+    }
+
+    // =================================================================
+    // Retrieval (内求 — World → Harness → Goal)
+    // =================================================================
+
+    pub const QueryOptions = struct {
+        /// Hits to return. The dense stage over-fetches 3x.
+        topk: usize = 10,
+        /// Extra goal scope the caller already knows about. The GHW
+        /// traversal adds to this; it never narrows it.
+        goal_ids: []const u64 = &.{},
+    };
+
+    /// Retrieve by text, traversing World → Harness → Goal before
+    /// ranking.
+    ///
+    /// The traversal is what makes `RerankContext.goalBonus` live
+    /// without a caller-supplied `--goal-ids`: the goal scope that
+    /// multiplies the score is produced by the World layer picking the
+    /// situation the query describes, the Harness layer naming the
+    /// procedure that realises it, and the Goal layer naming the intent.
+    ///
+    /// Results are `topk` hits sorted by `final_score`. Caller owns the
+    /// returned slice.
+    pub fn query(self: *Store, alloc: Allocator, text: []const u8, opts: QueryOptions) ![]retrieval.ScoredCell {
+        // Goal scope: whatever the caller asked for, plus whatever the
+        // GHW traversal resolves to.
+        var scope = std.ArrayList(u64).empty;
+        defer scope.deinit(alloc);
+        for (opts.goal_ids) |gid| try appendUnique(alloc, &scope, gid);
+
+        if (try self.ghw.retrieve(&self.xlog, text, wallClockMs())) |gid| {
+            try appendUnique(alloc, &scope, gid);
+        }
+
+        const cands = try self.hybrid.recall(alloc, text, opts.topk * 3);
+        defer alloc.free(cands);
+
+        var pairs = std.ArrayList(RerankContext.Pair).empty;
+        defer pairs.deinit(alloc);
+        // `cand`, not `c`: `c` is the `std.c` binding this module uses
+        // for clock and fs calls, and a capture that shadows it silently
+        // changes what the next line means.
+        for (cands) |cand| {
+            const cell = self.getCell(cand.cell_id) orelse continue;
+            try pairs.append(alloc, .{
+                .id = cand.cell_id,
+                .score = cand.combined(self.lc.cfg),
+                .cell = cell,
+            });
+        }
+
+        var rr = RerankContext{
+            .alloc = alloc,
+            .cfg = self.lc.cfg,
+            .goals = self.goals,
+            .query_goal_ids = scope.items,
+        };
+        const scored = try rr.rerankPairs(alloc, pairs.items);
+        defer alloc.free(scored);
+
+        const n = @min(opts.topk, scored.len);
+        const out = try alloc.dupe(retrieval.ScoredCell, scored[0..n]);
+        return out;
+    }
+
+    /// The Goal layer's own answer to "how relevant is this goal",
+    /// as the β=0.40 term of `importance_score` should have used it.
+    ///
+    /// `Encoder.computeImportance` derives `goal_relevance` from the
+    /// caller-supplied `relevance` field on the association and nothing
+    /// else — the poset is never consulted, so the heaviest term in the
+    /// constitutional formula is a number the caller typed and a
+    /// tombstoned goal scores exactly like a live one. Fixing that
+    /// belongs in `memory/encoder.zig`, which this module does not own;
+    /// this is the Goal layer's answer, exposed so the call site can use
+    /// it.
+    pub fn goalRelevance(self: *const Store, goal_id: u64, stated: f32) f32 {
+        const node = self.goals.get(goal_id) orelse return 0.0;
+        return switch (node.status) {
+            // A retired goal carries no priority (same rule the
+            // reranker's `goalBonus` already applies).
+            .tombstoned => 0.0,
+            // Achieved: the goal still grounds its memories, but it is
+            // no longer pulling the agent forward.
+            .completed => stated * 0.5,
+            // In flight outranks not-yet-started.
+            .in_progress => @min(1.0, stated * 1.2),
+            .pending, .failed, .unrealized => stated,
+        };
+    }
+
+    // =================================================================
+    // GHW observability
+    // =================================================================
+
+    /// The bounded cross-layer trail, oldest entry first.
+    pub fn crossLayerLog(self: *const Store) *const ghw.CrossLayerLog {
+        return &self.xlog;
+    }
+
+    /// Number of harnesses — i.e. GHW goals that have been encoded into.
+    pub fn harnessCount(self: *const Store) usize {
+        return self.harness.count();
+    }
+
+    /// Number of world entities — one per encoded goal.
+    pub fn worldCount(self: *const Store) usize {
+        return self.world.count();
+    }
+
+    /// The harness bound to a goal, or null when it has none yet.
+    pub fn harnessForGoal(self: *const Store, goal_id: u64) ?u64 {
+        return self.harness.harnessForGoal(goal_id);
+    }
+
+    /// The world entity holding a goal's situated state, or null.
+    pub fn worldEntityForGoal(self: *const Store, goal_id: u64) ?u64 {
+        var buf: [48]u8 = undefined;
+        const name = std.fmt.bufPrint(&buf, "goal:{d}", .{goal_id}) catch return null;
+        var it = self.world.entities.iterator();
+        while (it.next()) |entry| {
+            if (std.mem.eql(u8, entry.value_ptr.*.name, name)) return entry.value_ptr.*.id;
+        }
+        return null;
     }
 
     /// Encode a `memcell_insert` payload. Public because `mem3 add` must
@@ -1060,6 +1371,46 @@ pub fn encodeGoalWALPayloadRaw(
             _ = self.ids.fetchMax(data.counter, .monotonic);
         }
 
+        // Goals.
+        //
+        // `SnapshotWriter.collectGoals` used to be a stub that emitted
+        // nothing, so this loop had nothing to read and the poset was
+        // rebuilt exclusively from WAL records. That made the WAL the
+        // only copy of every user goal — and `takeSnapshot` deleted it
+        // right after writing the snapshot, so a crash in that window
+        // destroyed the poset permanently. The snapshot now carries the
+        // goals, and this is the code that puts them back.
+        //
+        // `collectGoals` emits parents before children (breadth-first
+        // from ⊥), so a single forward pass restores any tree the writer
+        // saw. A row whose parent is missing is skipped rather than
+        // re-parented, matching `applyGoalRecord`.
+        var restored_goals: usize = 0;
+        var failed_goals: usize = 0;
+        var max_goal_id: u64 = 0;
+        const goal_now = wallClockMs();
+        for (data.goals) |gs| {
+            if (gs.id == ghw_goal_tree.ROOT_GOAL_ID or gs.id == ghw_goal_tree.TOP_GOAL_ID) {
+                diag("snapshot: goal row carries reserved id {d}, skipped", .{gs.id});
+                continue;
+            }
+            if (gs.id > max_goal_id) max_goal_id = gs.id;
+            if (self.goals.nodes.contains(gs.id)) continue;
+            self.restoreGoalRow(gs, goal_now) catch |err| {
+                diag("snapshot: goal id={d} not restored: {}", .{ gs.id, err });
+                failed_goals += 1;
+                continue;
+            };
+            restored_goals += 1;
+        }
+        if (restored_goals > 0 or failed_goals > 0) {
+            std.log.info("WAL: snapshot restored {d} goals ({d} failed)", .{ restored_goals, failed_goals });
+        }
+        // The id counter must clear every id the snapshot claims, even
+        // the ones that failed to restore, so a fresh create can never
+        // mint an id an existing snapshot row already uses.
+        if (max_goal_id > 0) _ = self.ids.fetchMax(max_goal_id + 1, .monotonic);
+
         for (data.cells) |cs| {
             const snapshot_cell: MemCell = .{
                 .id = cs.id,
@@ -1092,6 +1443,99 @@ pub fn encodeGoalWALPayloadRaw(
         }
     }
 
+    /// Put one snapshot goal row back into the poset, under the id the
+    /// row carries.
+    ///
+    /// Extracted from `loadSnapshot` so the parent/⊥ handling can be
+    /// asserted directly: `GoalSnapshot.parent_id` is written as the
+    /// API's "absent" form (`null`) when the live node hangs off ⊥, but
+    /// a row may equally name ⊥ explicitly, and both must land in the
+    /// same place — `GoalPoset.create` maps `null` to ⊥ itself, so
+    /// passing the row's value through unchanged is correct for both.
+    ///
+    /// `deadline`, `created_at`, `updated_at` and `unrealized_at` are
+    /// NOT in the snapshot record — see the note in `takeSnapshot`. A
+    /// restored goal is therefore stamped with the restore time rather
+    /// than `0`: `staleGoals` treats "no memcells for 7 days" as
+    /// unrealizable, and a `0` stamp would make every goal restored from
+    /// a snapshot immediately stale, i.e. the snapshot path would
+    /// manufacture the very data loss it was added to prevent.
+    fn restoreGoalRow(self: *Store, gs: GoalSnapshot, now_ms: i64) !void {
+        // Same trick as `createGoal` / `applyGoalRecord`: a private
+        // counter seeded to the id in the record, so the poset mints
+        // exactly that id rather than a fresh one.
+        var slot: std.atomic.Value(u64) = .init(gs.id);
+        const created = self.goals.create(
+            gs.name,
+            gs.description,
+            gs.parent_id,
+            gs.priority,
+            null,
+            now_ms,
+            &slot,
+        ) catch |err| return err;
+        if (created != gs.id) {
+            diag("snapshot: goal id drift — row {d}, poset returned {d}", .{ gs.id, created });
+            return error.GoalIdDrift;
+        }
+        if (gs.status != .pending) {
+            self.goals.updateStatus(gs.id, gs.status, now_ms) catch |err| {
+                // `.tombstoned` is refused by the poset's own transition
+                // rule (it requires a ≥7-day `unrealized_at`, which the
+                // snapshot does not carry), and WAL replay loses it the
+                // same way. A snapshot is a point-in-time copy, so the
+                // recorded status wins: silently resurrecting a retired
+                // goal as `pending` is a worse answer than skipping a
+                // state-machine check on data we just read off disk.
+                diag("snapshot: goal id={d} status {s} refused by the poset ({}), restored verbatim", .{ gs.id, @tagName(gs.status), err });
+                if (self.goals.get(gs.id)) |node_const| {
+                    const node = @constCast(node_const);
+                    node.status = gs.status;
+                    node.updated_at = now_ms;
+                }
+            };
+        }
+    }
+
+    /// Write a snapshot, then rotate the WAL.
+    ///
+    /// ## Order is the whole point
+    ///
+    /// 1. write the snapshot — goals included — to a temp file, `fsync`
+    ///    it, and atomically `rename` it over `snapshot.bin`;
+    /// 2. only then flush, close, `unlink` and re-create the WAL, and
+    ///    re-journal the poset into it.
+    ///
+    /// Steps 2 used to be the ONLY place goals were persisted. The WAL
+    /// was unlinked before the fresh one existed, so a crash anywhere in
+    /// it destroyed the only copy of every user goal — permanently, since
+    /// nothing else on disk had them. `SnapshotWriter.collectGoals` was
+    /// the missing half of the fix: a stub that emitted zero rows, so
+    /// `goals_count` was always 0. The durable copy is now in place
+    /// before the WAL is touched, and the re-journal is belt-and-braces.
+    ///
+    /// ## Residual window (not closed, and it is not goal data)
+    ///
+    /// `rename(2)` is atomic, but making the renamed *directory entry*
+    /// durable requires an `fsync` on the parent directory, and this
+    /// codebase has no primitive for it: `platform_fs.open` rejects
+    /// `.directory = true` on Windows, and there is no `syncDir`. So a
+    /// power cut immediately after the rename can still surface the
+    /// PREVIOUS snapshot on the next boot. That is a rollback, not a
+    /// loss — the WAL still exists at that point (it is rotated
+    /// afterwards) and the previous snapshot plus that WAL together
+    /// describe every goal. What a cut during step 2 can lose is
+    /// memcell inserts journaled since the previous snapshot, which was
+    /// already true before this function was fixed.
+    ///
+    /// ## What the snapshot format cannot carry
+    ///
+    /// `GoalSnapshot` has room for (id, name, description, parent,
+    /// status, priority) — no `deadline`, `created_at`, `updated_at` or
+    /// `unrealized_at`. Changing that would alter the on-disk layout, so
+    /// it is left alone: the re-journal below is what still preserves
+    /// those four on a normal restart, and the snapshot path stamps the
+    /// restore time. See `restoreGoalRow`.
     fn takeSnapshot(self: *Store) !void {
         var w = SnapshotWriter.init(self.alloc, self.snapshot_path);
         const bytes = w.write(
@@ -1104,8 +1548,10 @@ pub fn encodeGoalWALPayloadRaw(
             // Propagate. This used to `return` silently, which let
             // `POST /api/sync` answer 200 {"status":"synced"} even when no
             // snapshot reached disk — the caller had no way to tell
-            // "synced" from "tried and failed". The daemon surfaces it as
-            // a 500.
+            // "synced" from "tried and failed". The daemon surfaces it as a
+            // 500. It also leaves the WAL untouched, which is the safe
+            // direction: a snapshot that failed to reach disk must not be
+            // followed by a WAL truncation.
             return err;
         };
         std.log.info("snapshot: wrote {d} bytes to {s}", .{ bytes, self.snapshot_path });
@@ -1114,22 +1560,37 @@ pub fn encodeGoalWALPayloadRaw(
             wal.deinit();
             self.alloc.destroy(wal);
             self.wal = null;
-            var zbuf: [std.fs.max_path_bytes + 1]u8 = undefined;
+            var zbuf: [platform_fs.max_path_bytes + 1]u8 = undefined;
             const z = std.fmt.bufPrint(&zbuf, "{s}\x00", .{self.wal_path}) catch return;
-            _ = std.c.unlink(z[0 .. z.len - 1 :0].ptr);
+            // `WAL.open` appends (O_APPEND) and never truncates, so the
+            // old file must go before the fresh one is created — the
+            // snapshot is already durable at this point, which is what
+            // makes deleting the WAL safe.
+            platform_fs.unlink(z[0 .. z.len - 1 :0].ptr) catch {};
             const wal_ptr = self.alloc.create(WAL) catch return;
-            wal_ptr.* = WAL.init(self.alloc, self.wal_path) catch return;
+            wal_ptr.* = WAL.init(self.alloc, self.wal_path) catch |err| {
+                self.alloc.destroy(wal_ptr);
+                diag("snapshot: fresh WAL init failed: {}", .{err});
+                return;
+            };
             wal_ptr.open() catch {
                 wal_ptr.deinit();
                 self.alloc.destroy(wal_ptr);
+                diag("snapshot: fresh WAL open failed for {s}", .{self.wal_path});
                 return;
             };
             self.wal = wal_ptr;
-            // The WAL was just truncated and the snapshot does not
-            // carry goals, so re-journal the whole poset into the
-            // fresh file — otherwise every user goal dies here.
-            self.rejournalGoals(wal_ptr);
+            // Redundant for durability now that the snapshot carries the
+            // poset, but still worth emitting: it restores the four fields
+            // the snapshot record has no room for, and it keeps the WAL
+            // self-contained for any tool that replays it without a
+            // snapshot. A partial failure here costs fidelity in the WAL
+            // only; the snapshot copy is unaffected.
+            const goal_stats = self.rejournalGoals(wal_ptr);
             self.rejournalHyperedges(wal_ptr);
+            if (goal_stats.failed > 0) {
+                diag("snapshot: {d}/{d} goal records failed to re-journal into the fresh WAL (the snapshot copy is unaffected)", .{ goal_stats.failed, goal_stats.attempted });
+            }
         }
     }
 
@@ -1155,12 +1616,15 @@ pub fn encodeGoalWALPayloadRaw(
             };
             zbuf[written.len] = 0;
             const zptr: [*:0]const u8 = zbuf[0 .. written.len :0].ptr;
-            const rc = std.c.mkdir(zptr, 0o755);
-            if (rc == 0) continue;
-            var st: std.c.Stat = undefined;
-            if (std.c.stat(zptr, &st) != 0) return error.DataDirStatFailed;
-            const mode_u32: u32 = @intCast(st.mode);
-            if ((mode_u32 & 0xF000) != 0x4000) return error.DataDirNotADirectory;
+            if (std.c.mkdir(zptr, platform_fs.default_dir_mode) == 0) continue;
+            // `std.c.Stat` is `void` on Linux and Windows in Zig 0.17, and
+            // its field is `mode` on Darwin but `st_mode` elsewhere.
+            // Opening with O_DIRECTORY answers the same question with no
+            // struct layout involved at all.
+            const dir_flags: std.c.O = .{ .ACCMODE = .RDONLY, .DIRECTORY = true };
+            const dir_fd = std.c.open(zptr, dir_flags, @as(std.c.mode_t, 0));
+            if (dir_fd < 0) return error.DataDirNotADirectory;
+            _ = std.c.close(dir_fd);
         }
 
         const wal_path = std.fs.path.join(self.alloc, &.{ data_dir, "mem3.wal" }) catch |err| {
@@ -1187,24 +1651,21 @@ pub fn encodeGoalWALPayloadRaw(
         var existing: std.ArrayList(u8) = .empty;
         defer existing.deinit(self.alloc);
 
-        const fd = std.c.open(wal_z_slice.ptr, std.c.O{}, @as(c.mode_t, 0));
+        const fd = platform_fs.open(wal_z_slice.ptr, .{ .access = .read_only }) catch -1;
         if (fd >= 0) {
-            defer _ = std.c.close(fd);
-            var stat_buf: std.c.Stat = undefined;
-            if (std.c.fstat(fd, &stat_buf) == 0) {
-                const size: usize = @intCast(@max(0, stat_buf.size));
+            defer platform_fs.close(fd);
+            // No `std.c.Stat`: it is `void` on Linux and Windows. `sizeOf`
+            // does the same job with a seek and restores the read position,
+            // so the read below still starts at offset 0.
+            if (platform_fs.sizeOf(fd)) |sz| {
+                const size: usize = @intCast(sz);
                 if (size > 0) {
                     const buf = try self.alloc.alloc(u8, size);
                     defer self.alloc.free(buf);
-                    var got: usize = 0;
-                    while (got < size) {
-                        const n = std.c.read(fd, buf[got..].ptr, size - got);
-                        if (n <= 0) break;
-                        got += @intCast(n);
-                    }
+                    const got = platform_fs.readFull(fd, buf) catch return error.WalReplayShortRead;
                     try existing.appendSlice(self.alloc, buf[0..got]);
                 }
-            }
+            } else |_| {}
         }
 
         const wal_ptr = self.alloc.create(WAL) catch |err| {
@@ -1266,6 +1727,26 @@ pub fn encodeGoalWALPayloadRaw(
                 }
                 if (rec.record_type == .hyperedge_add) {
                     ctx_ptr.store.applyHyperedgeRecord(rec.payload, ctx_ptr.edges, ctx_ptr.max_id);
+                    return;
+                }
+                if (rec.record_type == .forget) {
+                    // A forgetting sweep journals the id of every cell it
+                    // transferred to the fuzzy store. Without this branch the
+                    // `memcell_insert` record for that cell would replay and
+                    // the memory would come back — while
+                    // `mem3_forgotten_cells_total` still claimed it was gone.
+                    if (rec.payload.len >= 8) {
+                        const id = std.mem.readInt(u64, rec.payload[0..8], .little);
+                        // `remove` hands back the pointer and frees nothing.
+                        // Dropping it on the floor leaks the cell and every
+                        // string it owns — and replay allocates these cells
+                        // fresh, so they are ours to release.
+                        if (ctx_ptr.store.mgr.remove(id)) |cell| {
+                            cell.deinit(ctx_ptr.store.alloc);
+                            ctx_ptr.store.alloc.destroy(cell);
+                        }
+                        _ = ctx_ptr.store.cell_index.remove(id);
+                    }
                     return;
                 }
                 if (rec.record_type != .memcell_insert) return;
@@ -1424,15 +1905,125 @@ fn applyGoalStatusRecord(self: *Store, payload: []const u8, count: *u64) void {
         count.* += 1;
     }
 
+    /// Outcome of one `rejournalGoals` pass. Returned rather than only
+    /// logged so a caller can see — and a test can assert — exactly how
+    /// much of the poset made it into the fresh WAL.
+    pub const RejournalStats = struct {
+        /// Non-synthetic goals visited. Equal to the poset size unless
+        /// the queue itself could not be extended.
+        attempted: usize = 0,
+        /// Goals whose `goal_create` record reached the WAL.
+        written: usize = 0,
+        /// Individual operations that failed (encode or append, create or
+        /// status). Counted, never silently swallowed.
+        failed: usize = 0,
+    };
+
     /// Re-emit every non-synthetic goal as a `goal_create` record into
-    /// a freshly truncated WAL. The snapshot carries only
-    /// (counter, cells, fuzzy) — see the `collectGoals` TODO in
-    /// snapshot.zig — so truncating the WAL without this would delete
-    /// every user goal on the next boot.
+    /// a freshly truncated WAL.
     ///
     /// Walks breadth-first from ⊥ so a parent is always journaled
     /// before its children; replay would otherwise drop a child whose
     /// parent has not been materialised yet.
+    ///
+    /// **Failure handling is per node.** This used to `return` out of
+    /// the whole walk on an append failure, and to `continue` on a status
+    /// encode failure — which skipped the `queue.append` below and so
+    /// silently abandoned every descendant of that node. One unwritable
+    /// record could therefore cost an entire subtree with no error
+    /// anywhere but a log line. Now a failed node is counted and the
+    /// walk continues: the worst case for one bad record is that one
+    /// goal, not the branch below it.
+    fn rejournalGoals(self: *Store, wal: *WAL) RejournalStats {
+        var stats = RejournalStats{};
+        var queue: std.ArrayList(u64) = .empty;
+        defer queue.deinit(self.alloc);
+        queue.append(self.alloc, ghw_goal_tree.ROOT_GOAL_ID) catch {
+            diag("rejournalGoals: out of memory - goals not carried into the new WAL", .{});
+            stats.failed += 1;
+            return stats;
+        };
+        var head: usize = 0;
+        while (head < queue.items.len) : (head += 1) {
+            for (self.goals.childrenOf(queue.items[head])) |child_id| {
+                if (child_id == ghw_goal_tree.ROOT_GOAL_ID or child_id == ghw_goal_tree.TOP_GOAL_ID) continue;
+                const node = self.goals.get(child_id) orelse continue;
+                stats.attempted += 1;
+                // `GoalPoset.create` stores ROOT as a concrete parent;
+                // store it back as the API's "absent" form - the same
+                // mapping `SnapshotWriter.collectGoals` makes, which is
+                // what keeps the two replay paths in agreement.
+                const parent_id: ?u64 = if (node.parent_id) |p|
+                    (if (p == ghw_goal_tree.ROOT_GOAL_ID) null else p)
+                else
+                    null;
+
+                // Note what is NOT here: there is no `continue` on the
+                // failure branch. The descend at the bottom of the loop
+                // has to run either way - a node we failed to journal
+                // must not take its subtree with it. Replay drops a child
+                // whose parent record is missing, so the cost is a little
+                // wasted WAL space and nothing else.
+                if (self.encodeGoalWALPayload(child_id, node.name, node.description, parent_id, node.priority, node.deadline, node.created_at)) |payload| {
+                    defer self.alloc.free(payload);
+                    const landed = blk: {
+                        wal.append(.{
+                            .record_type = .goal_create,
+                            .payload = payload,
+                            .timestamp = wallClockSec(),
+                        }) catch |err| {
+                            diag("rejournalGoals: append failed for goal {d}: {}", .{ child_id, err });
+                            stats.failed += 1;
+                            break :blk false;
+                        };
+                        break :blk true;
+                    };
+                    if (landed) stats.written += 1;
+                } else |err| {
+                    diag("rejournalGoals: encode failed for goal {d}: {}", .{ child_id, err });
+                    stats.failed += 1;
+                }
+
+                // `goal_create` carries no status field, and
+                // `GoalPoset.create` always starts at `.pending`. Without
+                // this the snapshot truncation that `rejournalGoals`
+                // exists to survive would silently reset every completed
+                // or failed goal back to pending.
+                if (node.status != .pending) {
+                    if (self.encodeGoalUpdatePayload(child_id, node.status, node.updated_at)) |sp| {
+                        defer self.alloc.free(sp);
+                        wal.append(.{
+                            .record_type = .goal_update,
+                            .payload = sp,
+                            .timestamp = wallClockSec(),
+                        }) catch |err| {
+                            diag("rejournalGoals: status append failed for goal {d}: {}", .{ child_id, err });
+                            stats.failed += 1;
+                        };
+                    } else |err| {
+                        diag("rejournalGoals: status encode failed for goal {d}: {}", .{ child_id, err });
+                        stats.failed += 1;
+                    }
+                }
+
+                queue.append(self.alloc, child_id) catch {
+                    // Cannot descend without a slot in the queue. Counted
+                    // like any other failure, and the walk continues with
+                    // the siblings rather than abandoning them too.
+                    diag("rejournalGoals: out of memory at depth {d} - subtree below goal {d} dropped", .{ head, child_id });
+                    stats.failed += 1;
+                    continue;
+                };
+            }
+        }
+        if (stats.written > 0) {
+            std.log.info("rejournalGoals: re-emitted {d} goal records into the fresh WAL ({d} failed)", .{ stats.written, stats.failed });
+        } else if (stats.attempted > 0) {
+            diag("rejournalGoals: 0/{d} goal records reached the fresh WAL ({d} operations failed)", .{ stats.attempted, stats.failed });
+        }
+        return stats;
+    }
+
     /// Re-emit every hyperedge into a freshly truncated WAL.
     ///
     /// Same failure class as goals, found by the regression test: the
@@ -1478,74 +2069,20 @@ fn applyGoalStatusRecord(self: *Store, payload: []const u8, count: *u64) void {
         }
     }
 
-    fn rejournalGoals(self: *Store, wal: *WAL) void {
-        var queue: std.ArrayList(u64) = .empty;
-        defer queue.deinit(self.alloc);
-        queue.append(self.alloc, ghw_goal_tree.ROOT_GOAL_ID) catch {
-            log.warn("rejournalGoals: out of memory — goals not carried into the new WAL", .{});
-            return;
-        };
-        var head: usize = 0;
-        var written: usize = 0;
-        while (head < queue.items.len) : (head += 1) {
-            for (self.goals.childrenOf(queue.items[head])) |child_id| {
-                if (child_id == ghw_goal_tree.ROOT_GOAL_ID or child_id == ghw_goal_tree.TOP_GOAL_ID) continue;
-                const node = self.goals.get(child_id) orelse continue;
-                // `GoalPoset.create` stores ROOT as a concrete parent;
-                // store it back as the API's "absent" form.
-                const parent_id: ?u64 = if (node.parent_id) |p|
-                    (if (p == ghw_goal_tree.ROOT_GOAL_ID) null else p)
-                else
-                    null;
-                {
-                    const payload = self.encodeGoalWALPayload(child_id, node.name, node.description, parent_id, node.priority, node.deadline, node.created_at) catch |err| {
-                        log.warn("rejournalGoals: encode failed for goal {d}: {}", .{ child_id, err });
-                        continue;
-                    };
-                    defer self.alloc.free(payload);
-                    wal.append(.{
-                        .record_type = .goal_create,
-                        .payload = payload,
-                        .timestamp = wallClockSec(),
-                    }) catch |err| {
-                        log.warn("rejournalGoals: append failed for goal {d}: {}", .{ child_id, err });
-                        return;
-                    };
-                }
-                written += 1;
-                // `goal_create` carries no status field, and
-                // `GoalPoset.create` always starts at `.pending`. Without
-                // this the snapshot truncation that `rejournalGoals`
-                // exists to survive would silently reset every completed
-                // or failed goal back to pending.
-                if (node.status != .pending) {
-                    const st_payload = self.encodeGoalUpdatePayload(child_id, node.status, node.updated_at) catch |err| {
-                        log.warn("rejournalGoals: status encode failed for goal {d}: {}", .{ child_id, err });
-                        continue;
-                    };
-                    defer self.alloc.free(st_payload);
-                    wal.append(.{
-                        .record_type = .goal_update,
-                        .payload = st_payload,
-                        .timestamp = wallClockSec(),
-                    }) catch |err| {
-                        log.warn("rejournalGoals: status append failed for goal {d}: {}", .{ child_id, err });
-                        return;
-                    };
-                }
-                queue.append(self.alloc, child_id) catch {
-                    log.warn("rejournalGoals: out of memory at depth {d} — subtree dropped", .{head});
-                    return;
-                };
-            }
-        }
-        std.log.info("rejournalGoals: re-emitted {d} goal records into the fresh WAL", .{written});
-    }
 };
 
 // =============================================================================
 // Helpers shared with the HTTP server
 // =============================================================================
+
+/// Append `v` unless already present. Keeps the GHW-resolved goal scope
+/// from listing the same id twice when the caller already named it.
+fn appendUnique(alloc: Allocator, list: *std.ArrayList(u64), v: u64) !void {
+    for (list.items) |existing| {
+        if (existing == v) return;
+    }
+    try list.append(alloc, v);
+}
 
 fn wallClockSec() i64 {
     var ts: std.c.timespec = .{ .sec = 0, .nsec = 0 };
@@ -2126,6 +2663,276 @@ test "Store: createGoal is WAL-journaled and survives restart" {
     }
 }
 
+// =============================================================================
+// GHW traversal tests (Principle II)
+//
+// These fail if the traversal is unwired. Each asserts an observable the
+// unwired store cannot produce — a non-empty Harness layer, a non-empty
+// World layer, a valid direction sequence, a bounded log, a goal-scoped
+// rerank — rather than re-asserting an internal call was made.
+// =============================================================================
+
+test "Store: insert traverses Goal → Harness → World" {
+    const alloc = std.testing.allocator;
+    var store = try Store.init(alloc, .{ .data_dir = null, .seed_default_goals = false });
+    defer store.deinit();
+
+    const gid = try store.createGoal("zig build", "compile the zig test binary", null, 9, null, 1_700_000_000_000);
+    try std.testing.expectEqual(@as(usize, 0), store.harnessCount());
+    try std.testing.expectEqual(@as(usize, 0), store.worldCount());
+
+    const id = try store.addRaw(.matter, "the build finished cleanly", "a|b|c", gid, 0.8);
+
+    // Both lower layers now hold state. Before this was wired, an insert
+    // produced a cell and nothing else.
+    try std.testing.expectEqual(@as(usize, 1), store.harnessCount());
+    try std.testing.expectEqual(@as(usize, 1), store.worldCount());
+    try std.testing.expect(store.harnessForGoal(gid) != null);
+    try std.testing.expect(store.worldEntityForGoal(gid) != null);
+
+    // The Goal layer holds the binding too, which is what the meta-goal
+    // sweep reads. It used to never register any.
+    try std.testing.expectEqual(@as(usize, 1), store.goals.memcellsFor(gid).len);
+    try std.testing.expectEqual(id, store.goals.memcellsFor(gid)[0]);
+
+    // Exactly two hops, in the constitutional order, each one legal.
+    const xlog = store.crossLayerLog();
+    try std.testing.expectEqual(@as(usize, 2), xlog.count());
+    const e0 = xlog.nth(0).?;
+    const e1 = xlog.nth(1).?;
+    try std.testing.expect(e0.from == .goal and e0.to == .harness);
+    try std.testing.expect(e0.direction == .outward);
+    try std.testing.expect(e1.from == .harness and e1.to == .world);
+    try std.testing.expect(e1.direction == .outward);
+    try std.testing.expectEqual(id, e0.cell_id.?);
+    try std.testing.expect(ghw.isValidDirection(e0.direction, e0.from, e0.to));
+    try std.testing.expect(ghw.isValidDirection(e1.direction, e1.from, e1.to));
+
+    // The world entity names the harness that realises it — the
+    // back-reference retrieval reads to cross world→harness.
+    const eid = store.worldEntityForGoal(gid).?;
+    const hid = std.fmt.parseInt(u64, store.world.entityAttribute(eid, ghw.HARNESS_ATTR).?, 10) catch 0;
+    try std.testing.expectEqual(store.harnessForGoal(gid).?, hid);
+}
+
+test "Store: many inserts against one goal keep the layers bounded" {
+    const alloc = std.testing.allocator;
+    var store = try Store.init(alloc, .{ .data_dir = null, .seed_default_goals = false });
+    defer store.deinit();
+
+    const gid = try store.createGoal("throughput", "measure insert cost", null, 5, null, 1_700_000_000_000);
+    var n: usize = 0;
+    while (n < 64) : (n += 1) {
+        _ = try store.addRaw(.matter, "insert number with some content", "a|b|c", gid, 0.5);
+    }
+
+    // 64 memories, 1 goal: 1 harness, 1 world entity. Per-memory evidence
+    // is a counter, so the daemon's memory does not track its corpus.
+    try std.testing.expectEqual(@as(usize, 1), store.harnessCount());
+    try std.testing.expectEqual(@as(usize, 1), store.worldCount());
+    try std.testing.expectEqual(@as(u64, 64), store.harness.get(store.harnessForGoal(gid).?).?.execution_count);
+    try std.testing.expectEqual(@as(usize, 64), store.goals.memcellsFor(gid).len);
+}
+
+test "Store: an insert naming no goal skips the traversal instead of faking one" {
+    const alloc = std.testing.allocator;
+    var store = try Store.init(alloc, .{ .data_dir = null, .seed_default_goals = false });
+    defer store.deinit();
+
+    // goal_id 0 is the synthetic root — the way "no goal" is spelled.
+    _ = try store.addRaw(.matter, "unattached memory", "a|b|c", 0, 0.5);
+    _ = try store.addRaw(.matter, "memory for a goal that does not exist", "a|b|c", 4242, 0.5);
+
+    try std.testing.expectEqual(@as(usize, 2), store.cellCount());
+    try std.testing.expectEqual(@as(usize, 0), store.harnessCount());
+    try std.testing.expectEqual(@as(usize, 0), store.worldCount());
+    try std.testing.expectEqual(@as(usize, 0), store.crossLayerLog().count());
+}
+
+test "Store: query traverses World → Harness → Goal and the goal scope ranks" {
+    const alloc = std.testing.allocator;
+    var store = try Store.init(alloc, .{ .data_dir = null, .seed_default_goals = false });
+    defer store.deinit();
+
+    const wanted = try store.createGoal("astronomy", "observe the telescope and the stars", null, 9, null, 1_700_000_000_000);
+    const other = try store.createGoal("gardening", "water the tomatoes and the basil", null, 3, null, 1_700_000_000_000);
+    const wanted_cell = try store.addRaw(.matter, "the telescope tracked a distant galaxy", "s|p|g", wanted, 0.9);
+    _ = try store.addRaw(.matter, "watered the tomatoes this evening", "w|t|e", other, 0.1);
+
+    const before = store.crossLayerLog().count();
+    const hits = try store.query(alloc, "telescope galaxy", .{ .topk = 5 });
+    defer alloc.free(hits);
+    try std.testing.expect(hits.len >= 1);
+
+    // The reverse traversal ran, in the reverse order, and only after
+    // the encode hops — 2 inward hops appended.
+    const xlog = store.crossLayerLog();
+    try std.testing.expectEqual(before + 2, xlog.count());
+    const inward0 = xlog.nth(before).?;
+    const inward1 = xlog.nth(before + 1).?;
+    try std.testing.expect(inward0.from == .world and inward0.to == .harness and inward0.direction == .inward);
+    try std.testing.expect(inward1.from == .harness and inward1.to == .goal and inward1.direction == .inward);
+    try std.testing.expect(ghw.isValidDirection(inward0.direction, inward0.from, inward0.to));
+    try std.testing.expect(ghw.isValidDirection(inward1.direction, inward1.from, inward1.to));
+
+    // And the goal the traversal resolved is the one the query was about:
+    // the reranker's goal bonus comes from the GHW layers, not from a
+    // caller-supplied flag.
+    try std.testing.expectEqual(wanted, inward1.cell_id.?);
+
+    // It also actually reorders. "telescope galaxy" is dense-similar to
+    // the astronomy episode and not to the gardening one, and the goal
+    // bonus the traversal unlocked multiplies that further — the
+    // astronomy cell has to come first.
+    try std.testing.expectEqual(wanted_cell, hits[0].cell.id);
+}
+
+test "Store: the GHW goal scope changes the ranking, and nothing else does" {
+    const alloc = std.testing.allocator;
+    var store = try Store.init(alloc, .{ .data_dir = null, .seed_default_goals = false });
+    defer store.deinit();
+
+    const a = try store.createGoal("alpha topic", "alpha", null, 5, null, 1_700_000_000_000);
+    const b = try store.createGoal("beta topic", "beta", null, 5, null, 1_700_000_000_000);
+    const id_a = try store.addRaw(.matter, "shared vocabulary about widgets", "w|is|g", a, 0.5);
+    _ = try store.addRaw(.matter, "shared vocabulary about widgets", "w|is|g", b, 0.5);
+
+    // The traversal resolves `alpha` from the query text alone.
+    const hits = try store.query(alloc, "alpha topic", .{ .topk = 2 });
+    defer alloc.free(hits);
+    try std.testing.expectEqual(@as(usize, 2), hits.len);
+    // `id_a` is the first insert and, with identical episode text, the
+    // base scores tie; only the goal bonus separates them.
+    try std.testing.expectEqual(id_a, hits[0].cell.id);
+    try std.testing.expect(hits[0].final_score > hits[1].final_score);
+}
+
+test "Store: cross-layer log stays bounded under sustained traffic" {
+    const alloc = std.testing.allocator;
+    var store = try Store.init(alloc, .{ .data_dir = null, .seed_default_goals = false });
+    defer store.deinit();
+
+    const gid = try store.createGoal("busy goal", "generate a lot of cross-layer traffic", null, 5, null, 1_700_000_000_000);
+    const cap = store.crossLayerLog().cap;
+    try std.testing.expect(cap > 0);
+
+    // 2 hops per insert plus 2 per query. Drive well past the cap: an
+    // append-only log would be a slow leak in every long-running daemon.
+    var n: usize = 0;
+    while (n < cap * 4) : (n += 1) {
+        _ = try store.addRaw(.matter, "sustained traffic about the busy goal", "a|b|c", gid, 0.5);
+    }
+    const hits = try store.query(alloc, "busy goal", .{ .topk = 1 });
+    defer alloc.free(hits);
+    try std.testing.expect(hits.len >= 1);
+
+    try std.testing.expectEqual(cap, store.crossLayerLog().count());
+    try std.testing.expect(store.crossLayerLog().count() <= cap);
+}
+
+test "Store: GHW state is released across many encode/decode cycles" {
+    const alloc = std.testing.allocator;
+    const data_dir = "/tmp/mem3_test_store_ghw_cycles";
+    wipeStoreDir(data_dir);
+    defer wipeStoreDir(data_dir);
+
+    // Run under `std.testing.allocator`, which fails the test on any
+    // leak. Each cycle adds a goal, harnesses, world entities and a full
+    // cross-layer log; a single un-released allocation shows up here.
+    var cycle: usize = 0;
+    while (cycle < 4) : (cycle += 1) {
+        var store = try Store.init(alloc, .{ .data_dir = data_dir, .seed_default_goals = false });
+        defer store.deinit();
+
+        const gid = try store.createGoal("cycle goal", "prove the layers are released", null, 5, null, 1_700_000_000_000);
+        var n: usize = 0;
+        while (n < 8) : (n += 1) {
+            _ = try store.addRaw(.matter, "cycle traffic", "a|b|c", gid, 0.5);
+        }
+        const hits = try store.query(alloc, "cycle goal", .{ .topk = 3 });
+        defer alloc.free(hits);
+        try store.sync();
+    }
+}
+
+test "Store: goalRelevance consults the Goal layer, the bare relevance does not" {
+    const alloc = std.testing.allocator;
+    var store = try Store.init(alloc, .{ .data_dir = null, .seed_default_goals = false });
+    defer store.deinit();
+
+    const gid = try store.createGoal("status probe", "check goal layer influence", null, 5, null, 1_700_000_000_000);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.7), store.goalRelevance(gid, 0.7), 1e-6);
+
+    // In flight outranks pending.
+    try store.updateGoalStatus(gid, .in_progress, 1_700_000_000_000);
+    try std.testing.expect(store.goalRelevance(gid, 0.7) > 0.7);
+
+    // Achieved still grounds its memories, at half weight. (`completed`
+    // is terminal, so it is the last state this goal can reach.)
+    try store.updateGoalStatus(gid, .completed, 1_700_000_000_000);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.35), store.goalRelevance(gid, 0.7), 1e-6);
+
+    // Retired contributes nothing, whatever the caller claimed.
+    const retired = try store.createGoal("retired probe", "tombstoned goals stop mattering", null, 5, null, 1_700_000_000_000);
+    try store.updateGoalStatus(retired, .unrealized, 1_700_000_000_000);
+    // Constitution III's 7-day grace: a goal cannot be retired the moment
+    // it goes unrealized.
+    try store.updateGoalStatus(retired, .tombstoned, 1_700_000_000_000 + 8 * 86_400_000);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), store.goalRelevance(retired, 0.7), 1e-6);
+
+    // A goal the poset never held contributes nothing, even when the
+    // caller claims full relevance.
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), store.goalRelevance(4242, 1.0), 1e-6);
+}
+
+test "Store: an illegal goal transition is rejected before it reaches the WAL" {
+    const alloc = std.testing.allocator;
+    const data_dir = "/tmp/mem3_test_store_transition";
+    wipeStoreDir(data_dir);
+    defer wipeStoreDir(data_dir);
+
+    var store = try Store.init(alloc, .{ .data_dir = data_dir, .seed_default_goals = false });
+    defer store.deinit();
+
+    const gid = try store.createGoal("transition probe", "terminal states stay terminal", null, 5, null, 1_700_000_000_000);
+    try store.updateGoalStatus(gid, .in_progress, 1_700_000_000_000);
+    try store.updateGoalStatus(gid, .completed, 1_700_000_000_000);
+
+    // `completed` is terminal. This used to be journaled, fsynced and
+    // reported as a success.
+    try std.testing.expectError(
+        core.Error.GoalCycle,
+        store.updateGoalStatus(gid, .pending, 1_700_000_000_001),
+    );
+    try std.testing.expectEqual(core.GoalStatus.completed, store.goals.get(gid).?.status);
+
+    // A missing goal still fails, and fails before anything is written.
+    try std.testing.expectError(
+        core.Error.GoalNotFound,
+        store.updateGoalStatus(9999, .pending, 1_700_000_000_000),
+    );
+}
+
+test "Store: a replayed illegal transition is still applied" {
+    // Replay must stay permissive: records written by older builds were
+    // never validated, so rejecting them on the way back in would turn
+    // a recoverable record into lost data.
+    const alloc = std.testing.allocator;
+    var store = try Store.init(alloc, .{ .data_dir = null, .seed_default_goals = false });
+    defer store.deinit();
+
+    const gid = try store.createGoal("replay probe", "legacy record", null, 5, null, 1_700_000_000_000);
+    try store.updateGoalStatus(gid, .in_progress, 1_700_000_000_000);
+    try store.updateGoalStatus(gid, .completed, 1_700_000_000_000);
+
+    const payload = Store.encodeGoalUpdatePayloadRaw(alloc, gid, .pending, 1_700_000_000_001) catch unreachable;
+    defer alloc.free(payload);
+    var counter: u64 = 0;
+    store.applyGoalStatusRecord(payload, &counter);
+    try std.testing.expectEqual(core.GoalStatus.pending, store.goals.get(gid).?.status);
+}
+
+
 /// Replay-side parse of a `hyperedge_add` payload, mirroring
 /// `encodeHyperedgePayload` field for field.
 const ParsedEdge = struct {
@@ -2213,4 +3020,371 @@ fn parseHyperedgePayload(alloc: Allocator, payload: []const u8) !ParsedEdge {
         .created_at = extractJsonInt(payload, "created_at") orelse 0,
         .metadata = meta_owned,
     };
+}
+
+// =============================================================================
+// Snapshot-carried goal poset
+//
+// Before this set, `SnapshotWriter.collectGoals` was a stub: the snapshot
+// held `goals_count = 0`, so `Store.takeSnapshot` unlinked the WAL and the
+// poset existed nowhere except in records it was in the middle of
+// rewriting. A crash in that window erased every user goal, permanently.
+// These tests pin the closed window: the snapshot carries the poset, both
+// replay paths rebuild the same tree, and a partial re-journal is counted
+// rather than swallowed.
+// =============================================================================
+
+/// Pid-scoped scratch directory. The older persistence tests above use
+/// fixed paths, which is fine for one binary but means a crashed run
+/// leaves state that silently becomes the next run's input.
+fn testDataDir(buf: []u8, name: []const u8) []const u8 {
+    const pid: u64 = @intCast(std.c.getpid());
+    return std.fmt.bufPrint(buf, "/tmp/mem3_test_{s}_{d}", .{ name, pid }) catch unreachable;
+}
+
+fn unlinkIfPresent(path: []const u8) void {
+    var buf: [platform_fs.max_path_bytes + 1]u8 = undefined;
+    if (std.fmt.bufPrint(&buf, "{s}\x00", .{path})) |z| {
+        platform_fs.unlink(z[0 .. z.len - 1 :0].ptr) catch {};
+    } else |_| {}
+}
+
+/// Ids of a poset tree used by the round-trip tests. Six deep plus a
+/// sibling off ⊥: deeper than any fixed-depth walk, and wide enough that
+/// a queue which only follows one branch is caught.
+const SeedTree = struct { chain: [6]u64, side: u64 };
+
+fn seedGoalTree(store: *Store) !SeedTree {
+    var ids: SeedTree = undefined;
+    var parent: ?u64 = null;
+    for (0..6) |i| {
+        const name = try std.fmt.allocPrint(store.alloc, "level-{d}", .{i});
+        defer store.alloc.free(name);
+        const desc = try std.fmt.allocPrint(store.alloc, "depth {d} goal", .{i});
+        defer store.alloc.free(desc);
+        ids.chain[i] = try store.createGoal(name, desc, parent, @intCast(10 - i), null, 1_700_000_000_000 + @as(i64, @intCast(i)));
+        parent = ids.chain[i];
+    }
+    ids.side = try store.createGoal("side", "hangs directly off root", null, 4, null, 1_700_000_999_999);
+    // Non-pending statuses: `goal_create` has no status field, so this is
+    // the part most likely to be silently reset to `pending`.
+    try store.updateGoalStatus(ids.chain[2], .completed, 1_700_000_500_000);
+    try store.updateGoalStatus(ids.chain[4], .in_progress, 1_700_000_600_000);
+    return ids;
+}
+
+test "Store: goals survive a snapshot when the WAL is deleted" {
+    const alloc = std.testing.allocator;
+    var dir_buf: [128]u8 = undefined;
+    const data_dir = testDataDir(&dir_buf, "goalsnap");
+    wipeStoreDir(data_dir);
+    defer wipeStoreDir(data_dir);
+
+    const seeded = blk: {
+        var store = try Store.init(alloc, .{ .data_dir = data_dir, .seed_default_goals = false });
+        defer store.deinit();
+        const ids = try seedGoalTree(store);
+        try store.sync();
+        break :blk ids;
+    };
+
+    // This is the defect, reproduced literally: the snapshot is on disk
+    // and the WAL is not. `takeSnapshot` had already unlinked the WAL by
+    // the time it finished, and the snapshot it had just written carried
+    // no goals, so nothing on this disk described the poset.
+    var wal_buf: [platform_fs.max_path_bytes + 1]u8 = undefined;
+    const wal_path = try std.fmt.bufPrint(&wal_buf, "{s}/mem3.wal", .{data_dir});
+    unlinkIfPresent(wal_path);
+
+    var store = try Store.init(alloc, .{ .data_dir = data_dir, .seed_default_goals = false });
+    defer store.deinit();
+
+    const goals = try store.listGoals(alloc);
+    defer alloc.free(goals);
+    try std.testing.expectEqual(@as(usize, 7), goals.len);
+
+    var seen: usize = 0;
+    for (goals) |g| {
+        if (g.id == seeded.chain[0]) {
+            // Created with `parent_id = null`, so ⊥-parented.
+            try std.testing.expectEqual(ghw_goal_tree.ROOT_GOAL_ID, g.parent_id.?);
+            try std.testing.expectEqualStrings("level-0", g.name);
+            try std.testing.expectEqual(@as(u8, 10), g.priority);
+            try std.testing.expectEqual(core.GoalStatus.pending, g.status);
+            seen += 1;
+        } else if (g.id == seeded.chain[2]) {
+            try std.testing.expectEqual(seeded.chain[1], g.parent_id.?);
+            try std.testing.expectEqualStrings("level-2", g.name);
+            try std.testing.expectEqualStrings("depth 2 goal", g.description);
+            try std.testing.expectEqual(core.GoalStatus.completed, g.status);
+            seen += 1;
+        } else if (g.id == seeded.chain[4]) {
+            try std.testing.expectEqual(seeded.chain[3], g.parent_id.?);
+            try std.testing.expectEqual(core.GoalStatus.in_progress, g.status);
+            seen += 1;
+        } else if (g.id == seeded.chain[5]) {
+            // The deepest node: a walk that stops early loses exactly
+            // this one, and nothing else would notice.
+            try std.testing.expectEqual(seeded.chain[4], g.parent_id.?);
+            try std.testing.expectEqualStrings("level-5", g.name);
+            seen += 1;
+        } else if (g.id == seeded.side) {
+            try std.testing.expectEqual(ghw_goal_tree.ROOT_GOAL_ID, g.parent_id.?);
+            try std.testing.expectEqualStrings("side", g.name);
+            seen += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 5), seen);
+
+    // The parent links survived as structure, not just as fields: every
+    // chain node is listed under its own parent.
+    for (0..5) |i| {
+        const parent = store.goals.childrenOf(seeded.chain[i]);
+        try std.testing.expectEqual(@as(usize, 1), parent.len);
+        try std.testing.expectEqual(seeded.chain[i + 1], parent[0]);
+    }
+}
+
+test "Store: snapshot replay and WAL replay rebuild the same poset" {
+    const alloc = std.testing.allocator;
+    var wal_buf: [128]u8 = undefined;
+    const wal_dir = testDataDir(&wal_buf, "eq_wal");
+    var snap_buf: [128]u8 = undefined;
+    const snap_dir = testDataDir(&snap_buf, "eq_snap");
+    wipeStoreDir(wal_dir);
+    wipeStoreDir(snap_dir);
+    defer {
+        wipeStoreDir(wal_dir);
+        wipeStoreDir(snap_dir);
+    }
+
+    // Two stores, seeded identically. One is left to be rebuilt by WAL
+    // replay; the other is snapshotted and has its WAL deleted, so it is
+    // rebuilt by the snapshot alone. Both then report what is actually in
+    // the poset.
+    {
+        var store = try Store.init(alloc, .{ .data_dir = wal_dir, .seed_default_goals = false });
+        defer store.deinit();
+        _ = try seedGoalTree(store);
+    }
+    {
+        var store = try Store.init(alloc, .{ .data_dir = snap_dir, .seed_default_goals = false });
+        defer store.deinit();
+        _ = try seedGoalTree(store);
+        try store.sync();
+    }
+    var wal_file: [platform_fs.max_path_bytes + 1]u8 = undefined;
+    const snap_wal = try std.fmt.bufPrint(&wal_file, "{s}/mem3.wal", .{snap_dir});
+    unlinkIfPresent(snap_wal);
+
+    var wal_store = try Store.init(alloc, .{ .data_dir = wal_dir, .seed_default_goals = false });
+    defer wal_store.deinit();
+    var snap_store = try Store.init(alloc, .{ .data_dir = snap_dir, .seed_default_goals = false });
+    defer snap_store.deinit();
+
+    const a = try wal_store.listGoals(alloc);
+    defer alloc.free(a);
+    const b = try snap_store.listGoals(alloc);
+    defer alloc.free(b);
+    try std.testing.expectEqual(a.len, b.len);
+    try std.testing.expectEqual(@as(usize, 7), a.len);
+
+    // `listGoals` walks a hash map, so match by id rather than by order.
+    for (a) |wa| {
+        var matched = false;
+        for (b) |sb| {
+            if (sb.id != wa.id) continue;
+            matched = true;
+            try std.testing.expectEqualStrings(wa.name, sb.name);
+            try std.testing.expectEqualStrings(wa.description, sb.description);
+            try std.testing.expectEqual(wa.parent_id, sb.parent_id);
+            try std.testing.expectEqual(wa.status, sb.status);
+            try std.testing.expectEqual(wa.priority, sb.priority);
+            try std.testing.expectEqual(wa.memcell_count, sb.memcell_count);
+            break;
+        }
+        try std.testing.expect(matched);
+    }
+
+    // The one field the two paths genuinely cannot agree on, stated
+    // rather than papered over: `GoalSnapshot` has no `created_at` slot
+    // (see `takeSnapshot`), so the snapshot path stamps the restore time
+    // while the WAL path replays the recorded timestamp. Everything the
+    // format does carry is asserted equal above.
+    const wal_facts = try collectPosetFacts(wal_store, alloc);
+    defer freePosetFacts(alloc, wal_facts);
+    const snap_facts = try collectPosetFacts(snap_store, alloc);
+    defer freePosetFacts(alloc, snap_facts);
+    for (wal_facts) |wf| {
+        try std.testing.expect(wf.created_at >= 1_700_000_000_000);
+    }
+    for (snap_facts) |sf| {
+        try std.testing.expect(sf.created_at > 0);
+    }
+}
+
+const PosetFact = struct {
+    id: u64,
+    parent_id: ?u64,
+    status: core.GoalStatus,
+    created_at: i64,
+};
+
+/// What the poset actually holds, for the one comparison that needs
+/// `created_at` (which `GoalInfo` does not expose).
+fn collectPosetFacts(store: *Store, alloc: Allocator) ![]PosetFact {
+    var out: std.ArrayList(PosetFact) = .empty;
+    errdefer out.deinit(alloc);
+    var it = store.goals.nodes.iterator();
+    while (it.next()) |entry| {
+        const node = entry.value_ptr.*;
+        if (node.id == ghw_goal_tree.ROOT_GOAL_ID or node.id == ghw_goal_tree.TOP_GOAL_ID) continue;
+        try out.append(alloc, .{
+            .id = node.id,
+            .parent_id = node.parent_id,
+            .status = node.status,
+            .created_at = node.created_at,
+        });
+    }
+    return out.toOwnedSlice(alloc);
+}
+
+fn freePosetFacts(alloc: Allocator, facts: []PosetFact) void {
+    alloc.free(facts);
+}
+
+test "Store: an empty poset survives a snapshot round trip" {
+    const alloc = std.testing.allocator;
+    var dir_buf: [128]u8 = undefined;
+    const data_dir = testDataDir(&dir_buf, "emptysnap");
+    wipeStoreDir(data_dir);
+    defer wipeStoreDir(data_dir);
+
+    {
+        var store = try Store.init(alloc, .{ .data_dir = data_dir, .seed_default_goals = false });
+        defer store.deinit();
+        _ = try store.addRaw(.matter, "cell-with-no-goals", "a|b|c", 0, 0.5);
+        try store.sync();
+    }
+    var wal_buf: [platform_fs.max_path_bytes + 1]u8 = undefined;
+    const wal_path = try std.fmt.bufPrint(&wal_buf, "{s}/mem3.wal", .{data_dir});
+    unlinkIfPresent(wal_path);
+
+    var store = try Store.init(alloc, .{ .data_dir = data_dir, .seed_default_goals = false });
+    defer store.deinit();
+    const goals = try store.listGoals(alloc);
+    defer alloc.free(goals);
+    // Zero goals must read back as zero goals, not as "the writer never
+    // got around to it".
+    try std.testing.expectEqual(@as(usize, 0), goals.len);
+    // The cell is still there, so the snapshot as a whole was read.
+    try std.testing.expectEqual(@as(usize, 1), store.cellCount());
+}
+
+test "Store: a snapshot row parented at ⊥ and one parented at null land identically" {
+    const alloc = std.testing.allocator;
+    var store = try Store.init(alloc, .{ .data_dir = null, .seed_default_goals = false });
+    defer store.deinit();
+
+    const now: i64 = 1_700_000_000_000;
+    // `collectGoals` writes ⊥ as the API's "absent" form (null), but a
+    // row may equally name ⊥ explicitly. Both must produce the same tree.
+    try store.restoreGoalRow(.{
+        .id = 11,
+        .name = "parented-at-root",
+        .description = "d",
+        .parent_id = ghw_goal_tree.ROOT_GOAL_ID,
+        .status = .pending,
+        .priority = 3,
+    }, now);
+    try store.restoreGoalRow(.{
+        .id = 12,
+        .name = "parented-at-null",
+        .description = "d",
+        .parent_id = null,
+        .status = .pending,
+        .priority = 3,
+    }, now);
+
+    try std.testing.expectEqual(@as(usize, 2), store.goals.childrenOf(ghw_goal_tree.ROOT_GOAL_ID).len);
+    try std.testing.expectEqual(ghw_goal_tree.ROOT_GOAL_ID, store.goals.get(11).?.parent_id.?);
+    try std.testing.expectEqual(ghw_goal_tree.ROOT_GOAL_ID, store.goals.get(12).?.parent_id.?);
+
+    // And a child of either is still a child, not flattened to ⊥.
+    try store.restoreGoalRow(.{
+        .id = 13,
+        .name = "child-of-11",
+        .description = "d",
+        .parent_id = 11,
+        .status = .pending,
+        .priority = 1,
+    }, now);
+    const kids = store.goals.childrenOf(11);
+    try std.testing.expectEqual(@as(usize, 1), kids.len);
+    try std.testing.expectEqual(@as(u64, 13), kids[0]);
+
+    // A recorded non-pending status survives the restore, and a
+    // `.tombstoned` one — which `updateStatus` refuses outright — is
+    // written back verbatim rather than reset to `pending`.
+    try store.restoreGoalRow(.{
+        .id = 14,
+        .name = "retired",
+        .description = "d",
+        .parent_id = null,
+        .status = .tombstoned,
+        .priority = 2,
+    }, now);
+    try std.testing.expectEqual(core.GoalStatus.tombstoned, store.goals.get(14).?.status);
+}
+
+test "Store: a mid-tree re-journal failure does not abandon the rest of the poset" {
+    const alloc = std.testing.allocator;
+    var dir_buf: [128]u8 = undefined;
+    const data_dir = testDataDir(&dir_buf, "rejfail");
+    wipeStoreDir(data_dir);
+    defer wipeStoreDir(data_dir);
+
+    var store = try Store.init(alloc, .{ .data_dir = data_dir, .seed_default_goals = false });
+    defer store.deinit();
+    const ids = try seedGoalTree(store);
+    const wal = store.wal.?;
+
+    // Happy path first: the counters have to mean something, and a test
+    // that only ever sees failures cannot tell "counted correctly" from
+    // "always counting".
+    const clean = store.rejournalGoals(wal);
+    try std.testing.expectEqual(@as(usize, 7), clean.attempted);
+    try std.testing.expectEqual(@as(usize, 7), clean.written);
+    try std.testing.expectEqual(@as(usize, 0), clean.failed);
+
+    // Now break allocation partway through. `FailingAllocator` keeps
+    // failing once it trips (its index stops advancing), so every encode
+    // from here on fails — which is the point: the old code `continue`d
+    // past the failed node without queueing it, so it never descended
+    // and every descendant of the first goal was silently abandoned.
+    // The queue itself still grows (ArrayList growth is a `resize`,
+    // which this allocator leaves alone), so the walk can and must
+    // continue.
+    const real_alloc = store.alloc;
+    var failing = std.testing.FailingAllocator.init(real_alloc, .{ .fail_index = 1 });
+    store.alloc = failing.allocator();
+    const broken = store.rejournalGoals(wal);
+    store.alloc = real_alloc;
+
+    try std.testing.expectEqual(@as(usize, 7), broken.attempted);
+    try std.testing.expectEqual(@as(usize, 0), broken.written);
+    try std.testing.expect(broken.failed > 0);
+
+    // `attempted == 7` is the assertion that distinguishes this from the
+    // old walk: chain[1] is reachable only by descending through
+    // chain[0], and the old failure path never queued chain[0], so it
+    // could not have reported 7 however many siblings ⊥ had.
+    //
+    // The rest is the observable that matters beyond the counter — a
+    // failed re-journal must not mutate the poset it is copying.
+    try std.testing.expectEqual(@as(usize, 7), store.goals.count());
+    for (ids.chain[0..5]) |parent_id| {
+        const kids = store.goals.childrenOf(parent_id);
+        try std.testing.expectEqual(@as(usize, 1), kids.len);
+    }
 }

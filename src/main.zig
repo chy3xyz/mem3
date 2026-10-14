@@ -61,12 +61,19 @@ comptime {
     _ = @import("memory/forgetter.zig");
     _ = @import("memory/lifecycle.zig");
     _ = @import("storage/wal.zig");
+    // `snapshot.zig` carries the durability round-trip test but was not
+    // named here, so — by the one-level collection rule — it never ran.
+    _ = @import("storage/snapshot.zig");
     // `cli_commands/*.zig` are reached only through the lazy `@import`
     // in `main`'s dispatch switch, so a `test` block in one of them is
     // never compiled by `zig build test` and silently never runs. That
     // is how a whole CLI module could sit outside the gate without
     // anyone noticing. Import the ones that now carry tests.
     _ = @import("cli_commands/goal.zig");
+    // `add.zig` is the single most-used command in the product and carried
+    // zero tests; the only other reference is the dispatch switch inside
+    // `main`, which never registers a test block. Same trap as `goal.zig`.
+    _ = @import("cli_commands/add.zig");
     // Same trap, different victim: `lib.zig` re-exports
     // `retrieval.RerankContext`, but a re-export does not pull a
     // module's `test` blocks into the test binary — verified: with
@@ -84,6 +91,25 @@ comptime {
     // below to a method that does not exist still gave `zig build test`
     // exit 0. A green suite that cannot fail is worse than no suite.
     _ = @import("server/http_server.zig");
+
+    // The portability layer, and the comptime serializer.
+    //
+    // These are named at the TOP level of this block on purpose: Zig
+    // collects `test` blocks only from files named **directly** in the root
+    // source file's comptime block. A file reached one level deeper is
+    // analysed but its tests are never registered with the runner. That is
+    // why `platform/mod.zig`'s own re-export of `fs.zig` is not enough —
+    // the four sub-modules have to be named here.
+    _ = @import("platform/clock.zig");
+    _ = @import("platform/fs.zig");
+    _ = @import("platform/stdio.zig");
+    _ = @import("platform/env.zig");
+    _ = @import("platform/mod.zig");
+    // `utils/serializer.zig` was likewise outside the gate entirely, which
+    // is how a size-accounting defect that silently dropped every
+    // `?[]const u8` payload survived — the tests that would have caught it
+    // were never run.
+    _ = @import("utils/serializer.zig");
 }
 
 const log = std.log.scoped(.mem3_main);

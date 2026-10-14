@@ -17,7 +17,7 @@ const EFS = [_]u16{ 10, 32, 50, 100, 200, 400 };
 fn out(comptime fmt: []const u8, args: anytype) void {
     var buf: [1024]u8 = undefined;
     const s = std.fmt.bufPrint(&buf, fmt, args) catch return;
-    _ = std.c.write(std.c.STDOUT_FILENO, s.ptr, s.len);
+    _ = mem3.platform.stdio.writeOut(s);
 }
 
 pub fn main() !void {

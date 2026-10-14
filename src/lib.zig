@@ -11,6 +11,24 @@
 
 const std = @import("std");
 
+comptime {
+    // The platform layer carries its own target guard in `fs.zig`, but that
+    // module is only semantically analysed when something actually calls it —
+    // so `zig build-lib src/lib.zig -Dtarget=x86_64-windows` used to produce a
+    // library that silently contained un-analysable platform code. The root of
+    // a library is always analysed, so the supported-target list is enforced
+    // here as well. See docs/constitution-amendments/2026-10-14-platform-scope.md
+    const os = @import("builtin").os.tag;
+    if (os == .windows or os == .wasi or os == .freestanding) {
+        @compileError(
+            "mem3 supports macOS and Linux only. Windows needs a Winsock port " ++
+                "of the HTTP daemon (src/server/http_server.zig binds raw POSIX " ++
+                "sockets); WASM is deferred to v0.3.0. Rationale and the full " ++
+                "sync-impact report: docs/constitution-amendments/2026-10-14-platform-scope.md",
+        );
+    }
+}
+
 pub const core = @import("core/mod.zig");
 pub const utils = @import("utils/mod.zig");
 pub const ghw = @import("ghw/mod.zig");
@@ -20,6 +38,14 @@ pub const retrieval = @import("retrieval/mod.zig");
 pub const storage = @import("storage/mod.zig");
 pub const server = @import("server/mod.zig");
 pub const store = @import("store/mod.zig");
+/// The CLI argument parser. Exposed so `tests/unit/cli.zig` can reach
+/// it through this module: giving `src/cli.zig` its own module root would
+/// put `src/core/types.zig` in two modules at once, which Zig refuses.
+pub const cli = @import("cli.zig");
+/// The portability layer (fs / clock / stdio / env). Public so the
+/// examples and benchmarks stop hand-rolling their own POSIX helpers —
+/// four of them carried byte-identical copies of ~30 lines each.
+pub const platform = @import("platform/mod.zig");
 pub const Store = store.Store;
 pub const BuildOptions = store.BuildOptions;
 
@@ -51,6 +77,15 @@ pub const Harness = ghw.Harness;
 pub const HarnessRegistry = ghw.HarnessRegistry;
 pub const WorldEntity = ghw.WorldEntity;
 pub const WorldModel = ghw.WorldModel;
+/// The three-layer handle `Store` runs every memory operation through.
+pub const GHW = ghw.GHW;
+/// Bounded audit trail of every cross-layer hop.
+pub const CrossLayerLog = ghw.CrossLayerLog;
+pub const Direction = ghw.Direction;
+/// Constitution Principle II's direction check. Exposed so a consumer
+/// that builds its own traversal can be held to the same rule the store
+/// enforces.
+pub const isValidDirection = ghw.isValidDirection;
 
 // Memory re-exports
 pub const TriSourceManager = memory.TriSourceManager;

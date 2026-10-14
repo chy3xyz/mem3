@@ -5,6 +5,40 @@
 //!   ./zig-out/bin/mem3-bench --cells=20000 --queries=2000 --seed=7
 //! (`zig build` in 0.17 no longer forwards `--` args to a run step.)
 //!
+//! ## Two suites, one binary
+//!
+//! With **no arguments** this runs the original micro-benchmark suite
+//! below — the nanosecond-level primitives (`hashing`, `serializer`,
+//! `encoder`, `hnsw`, `wal`, `store`) — and writes `bench-results.json`.
+//! That suite is unchanged; it is the fast one and it is what
+//! `zig build bench` runs.
+//!
+//! With **a benchmark name** it runs one of the seven constitutional
+//! benchmarks named in `.specify/memory/constitution.md`, each of which
+//! emits exactly one JSON object on stdout:
+//!
+//!   ./zig-out/bin/mem3-bench throughput      >= 10K MemCells/sec sustained
+//!   ./zig-out/bin/mem3-bench retrieval-p95   recall TopK=10 P95 < 10ms @100K
+//!   ./zig-out/bin/mem3-bench hnsw-build      100K vectors indexed in < 30s
+//!   ./zig-out/bin/mem3-bench multihop        3-hop traversal < 5ms for 1K seeds
+//!   ./zig-out/bin/mem3-bench cold-start      launch -> ready < 200ms
+//!   ./zig-out/bin/mem3-bench footprint       100K MemCells < 500MB RSS
+//!   ./zig-out/bin/mem3-bench longmemeval     end-to-end >= 80% accuracy
+//!
+//!   --list          print the benchmark names and their targets
+//!   <name> --help   flags and default scale for that one benchmark
+//!
+//! Shared flags every constitutional benchmark accepts:
+//!   --scale=F       multiply the benchmark's default scale (`--quick`
+//!                   is `--scale=0.1`)
+//!   --seed=N        PRNG seed; the same seed reproduces the run
+//!   --data-dir=P    scratch directory (default: a fresh dir under /tmp,
+//!                   never inside the checkout)
+//!
+//! Scratch data goes to /tmp by design: a benchmark that writes
+//! `data/` into the repository pollutes `git status` and makes two
+//! concurrent runs fight over one WAL.
+//!
 //! ## Honesty rules this file follows
 //!
 //! 1. **No hardcoded numbers.** Every figure printed here was measured in
@@ -20,6 +54,10 @@
 //!    output into `sink`, which is printed as a checksum.
 //! 5. **The JSON records its own provenance**: params, seed and a
 //!    timestamp, so a number can be traced back to the run that produced it.
+//! 6. **No projection is ever printed as a measurement.** The
+//!    constitutional benchmarks put every extrapolation in a separate
+//!    `projection` object carrying the fit it assumed, and print `null`
+//!    plus a reason where a number could not be produced at all.
 //!
 //! Scope limits worth stating plainly: the HNSW corpus is `--cells`
 //! (default 2 000) and `hnsw.search` is the shipped beam search
@@ -28,6 +66,15 @@
 
 const std = @import("std");
 const mem3 = @import("mem3");
+
+const harness = @import("harness.zig");
+const throughput_bench = @import("throughput.zig");
+const retrieval_p95_bench = @import("retrieval_p95.zig");
+const hnsw_build_bench = @import("hnsw_build.zig");
+const multihop_bench = @import("multihop.zig");
+const cold_start_bench = @import("cold_start.zig");
+const footprint_bench = @import("footprint.zig");
+const longmemeval_bench = @import("longmemeval.zig");
 
 /// Library logging stays quiet so it cannot interleave with bench output.
 pub const std_options: std.Options = .{
@@ -862,6 +909,9 @@ fn parseArgs(init: std.process.Init.Minimal) !Params {
             writeOut(
                 \\mem3-bench — measured in-process, no hardcoded numbers
                 \\
+                \\  (for the seven constitutional benchmarks, run
+                \\   `mem3-bench --list` and `mem3-bench <name> --help`)
+                \\
                 \\  --cells=N     HNSW corpus size (default 2000)
                 \\  --queries=N   search queries (default 600)
                 \\  --seed=N      PRNG seed; the same seed reproduces the run
@@ -886,10 +936,152 @@ fn appendStat(alloc: Allocator, all: *std.ArrayList(Stats), s: Stats) !void {
     try all.append(alloc, s);
 }
 
+// ============================================================================
+// Constitutional benchmark dispatch
+// ============================================================================
+
+/// The seven benchmark files named in the constitution's Performance
+/// Standards table. The table is the reason this list exists and the
+/// reason each entry carries its target: a benchmark nobody can find
+/// cannot be run before a release gate.
+const ConstitutionalBench = struct {
+    /// CLI name, with dashes (this is what the user types).
+    name: []const u8,
+    /// The same benchmark spelled with underscores, accepted so a name
+    /// copied straight out of the constitution (`hnsw_build.zig`) runs
+    /// without editing.
+    alt_name: []const u8,
+    /// The file's base name, as written in the constitution.
+    file: []const u8,
+    target: []const u8,
+    run: *const fn (Allocator, std.process.Init.Minimal) anyerror!void,
+};
+
+const CONSTITUTIONAL_BENCHES = [_]ConstitutionalBench{
+    .{
+        .name = "throughput",
+        .alt_name = "throughput",
+        .file = "bench/throughput.zig",
+        .target = ">= 10K MemCells/sec (sustained)",
+        .run = throughput_bench.run,
+    },
+    .{
+        .name = "retrieval-p95",
+        .alt_name = "retrieval_p95",
+        .file = "bench/retrieval_p95.zig",
+        .target = "< 10ms P95 at 100K corpus (TopK=10)",
+        .run = retrieval_p95_bench.run,
+    },
+    .{
+        .name = "hnsw-build",
+        .alt_name = "hnsw_build",
+        .file = "bench/hnsw_build.zig",
+        .target = "100K vectors indexed in < 30s",
+        .run = hnsw_build_bench.run,
+    },
+    .{
+        .name = "multihop",
+        .alt_name = "multihop",
+        .file = "bench/multihop.zig",
+        .target = "< 5ms for 1K seeds (3 hops)",
+        .run = multihop_bench.run,
+    },
+    .{
+        .name = "cold-start",
+        .alt_name = "cold_start",
+        .file = "bench/cold_start.zig",
+        .target = "< 200ms (binary launch -> ready)",
+        .run = cold_start_bench.run,
+    },
+    .{
+        .name = "footprint",
+        .alt_name = "footprint",
+        .file = "bench/footprint.zig",
+        .target = "< 500MB RSS for 100K MemCells",
+        .run = footprint_bench.run,
+    },
+    .{
+        .name = "longmemeval",
+        .alt_name = "longmemeval",
+        .file = "bench/longmemeval.zig",
+        .target = ">= 80% end-to-end accuracy",
+        .run = longmemeval_bench.run,
+    },
+};
+
+fn printBenchmarkList() void {
+    writeOut(
+        \\mem3-bench — constitutional benchmarks
+        \\
+        \\Each emits ONE JSON object on stdout. Progress goes to stderr,
+        \\so stdout stays parseable: `... | python3 -m json.tool` works.
+        \\
+        \\  benchmark         file                     constitutional target
+        \\  ---------------  -----------------------  ----------------------------------
+    , .{});
+    for (CONSTITUTIONAL_BENCHES) |b| {
+        writeOut("  {s:.<17} {s:<23} {s}\n", .{ b.name, b.file, b.target });
+    }
+    writeOut(
+        \\
+        \\  --list                 this table
+        \\  <name> --help          flags and default scale for one benchmark
+        \\  --scale=F              raise the scale (--quick is 0.1)
+        \\  --seed=N               PRNG seed; the same seed reproduces the run
+        \\  --data-dir=P           scratch dir (default: a fresh /tmp dir)
+        \\
+        \\With no arguments this runs the original micro-benchmark suite
+        \\instead (hashing, serializer, encoder, hnsw, wal, store), which
+        \\writes bench-results.json rather than stdout JSON.
+        \\
+    , .{});
+}
+
+/// Accept both `throughput` and `throughput.zig` / `bench/throughput.zig`,
+/// so a name copied straight out of the constitution works.
+fn findBenchmark(name: []const u8) ?ConstitutionalBench {
+    var want = name;
+    if (std.mem.lastIndexOfScalar(u8, want, '/')) |i| want = want[i + 1 ..];
+    if (std.mem.endsWith(u8, want, ".zig")) want = want[0 .. want.len - 4];
+
+    for (CONSTITUTIONAL_BENCHES) |b| {
+        if (std.mem.eql(u8, want, b.name) or std.mem.eql(u8, want, b.alt_name)) return b;
+    }
+    return null;
+}
+
+/// Route argv to a constitutional benchmark, or hand back to the
+/// original suite. Returns true when a named benchmark handled it.
+fn dispatch(alloc: Allocator, init: std.process.Init.Minimal) !bool {
+    var it = std.process.Args.iterate(init.args);
+    _ = it.next();
+    const first = it.next() orelse return false;
+
+    if (std.mem.eql(u8, first, "--list")) {
+        printBenchmarkList();
+        return true;
+    }
+    if (first.len > 0 and first[0] == '-') return false;
+
+    const bench = findBenchmark(first) orelse {
+        writeOut("mem3-bench: no benchmark named '{s}'\n\n", .{first});
+        printBenchmarkList();
+        std.process.exit(2);
+    };
+
+    // The named benchmark re-parses argv itself: it needs argv[0] to
+    // still be argv[0] so `--help` and the scale flags land where they
+    // were typed.
+    try bench.run(alloc, init);
+    return true;
+}
+
 pub fn main(init: std.process.Init.Minimal) !void {
     var gpa: std.heap.DebugAllocator(.{ .thread_safe = true }) = .init;
     defer _ = gpa.deinit();
     const alloc = gpa.allocator();
+
+    if (try dispatch(alloc, init)) return;
 
     const params = parseArgs(init) catch {
         writeOut("bench: bad arguments\n", .{});

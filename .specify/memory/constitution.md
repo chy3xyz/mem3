@@ -46,9 +46,11 @@ The system MUST be a **single binary, zero external runtime dependency** impleme
 
 - Language: **Zig 0.17 (dev branch, ≥ 0.17.0-dev.3000)**, no C/C++/Rust interop at runtime.
 - **NO** external vector libraries (FAISS, HNSWlib), graph databases (Neo4j, Memgraph), KV stores (Redis, RocksDB), or RPC frameworks. HNSW, hypergraph, LSM-tree, and KV indexes are all implemented from scratch in Zig.
-- Build target: `zig build` produces ONE binary, < 10MB, runnable on macOS/Linux/Windows/WASM32 with no `LD_LIBRARY_PATH` or service dependencies.
-- Cross-compile: `zig build -Dtarget=aarch64-linux-gnu` etc. must work without an external cross-toolchain.
-- Use Zig 0.17's `std.Io` (with `io_uring` on Linux, GCD on macOS) for async I/O. No thread-pool wrappers, no callback color.
+- Build target: `zig build` produces ONE binary, < 10MB, runnable on **macOS and Linux** with no `LD_LIBRARY_PATH` or service dependencies.
+- Cross-compile: `zig build -Dtarget=x86_64-linux-gnu` and `-Dtarget=aarch64-linux-gnu` must work without an external cross-toolchain. Both are verified.
+- **Windows is not supported**, and `src/platform/fs.zig` refuses the target at compile time with a stated reason. The HTTP daemon binds raw POSIX sockets and uses a `pthread_mutex_t`; Windows needs a Winsock port. The library, CLI and benchmarks were ported and cross-compiled, then withdrawn — see `docs/constitution-amendments/2026-10-14-platform-scope.md`.
+- **WASM32 is not supported** (deferred to v0.3.0; see Scope Boundaries). It is refused at compile time with a stated reason rather than failing incidentally.
+- Async I/O: the daemon uses a single background maintenance thread with libc `pthread` primitives and `clock_gettime`. This is a deliberate departure from an earlier draft of this principle that named `std.Io`; the amendment above is the rationale for the current shape. No thread-pool wrappers, no callback colour.
 - All serialization MUST be implemented via `comptime` metaprogramming — no runtime reflection.
 
 **Rationale**: The existential structure of memory is unified; splitting it across multiple services breaks the three-source coherence. Single-binary deployment also makes the system embedded-friendly and edge-deployable.
@@ -141,6 +143,7 @@ All public APIs MUST follow these contracts:
 - Distributed vector index sharding — v0.4.0
 - LLM embedding model integration (use a stub or bring-your-own) — v0.2.0
 - WASM32 target with full async — v0.3.0
+- Windows daemon (Winsock port) — v0.4.0; the library and CLI already cross-compile, see `docs/constitution-amendments/2026-10-14-platform-scope.md`
 - Embedding model fine-tuning — out of scope, defer to follow-up
 - GUI / Web UI — v0.5.0
 
@@ -157,5 +160,10 @@ All public APIs MUST follow these contracts:
   - `.specify/memory/constitution.md` — this file.
   - `AGENTS.md` (root) — agent onboarding.
 
-**Version**: 1.0.0 | **Ratified**: 2026-06-07 | **Last Amended**: 2026-06-07
+**Version**: 1.1.0 | **Ratified**: 2026-06-07 | **Last Amended**: 2026-10-14
+<!-- v1.1.0: Principle IV platform scope corrected to macOS + Linux. Windows and
+     WASM32 are now explicitly unsupported and refused at compile time with a
+     stated reason. The previous claim of Windows/WASM support was never true and
+     a document that declares itself supreme must not carry unmet claims.
+     Rationale and sync-impact: docs/constitution-amendments/2026-10-14-platform-scope.md -->
 <!-- v1.0.0: initial ratification. No prior version. -->

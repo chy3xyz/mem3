@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const platform_clock = @import("../platform/clock.zig");
 
 const log = std.log.scoped(.mem3_time);
 
@@ -14,21 +15,17 @@ pub const CivilDate = struct {
 
 /// Get current Unix time in milliseconds.
 ///
-/// Per Zig 0.17-compat memory: `std.time.timestamp` / `milliTimestamp` do
-/// not exist. We use the C `clock_gettime` via `std.c` for portability.
+/// Routed through the platform layer: `std.time` was deleted in Zig 0.17,
+/// and the obvious replacement — `std.c.clock_gettime` plus a `std.c.timespec`
+/// literal — compiles on macOS and Linux but is `void` on Windows, so the
+/// whole tree failed to cross-compile there.
 pub fn nowMs() i64 {
-    var ts: std.c.timespec = .{ .sec = 0, .nsec = 0 };
-    _ = std.c.clock_gettime(std.c.CLOCK.REALTIME, &ts);
-    return @as(i64, ts.sec) * 1000 + @divTrunc(@as(i64, ts.nsec), 1_000_000);
+    return platform_clock.realtimeMs();
 }
 
 /// High-resolution monotonic time in nanoseconds. For benchmarking only.
 pub fn monotonicNs() u128 {
-    var ts: std.c.timespec = .{ .sec = 0, .nsec = 0 };
-    _ = std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &ts);
-    const sec: u128 = @intCast(ts.sec);
-    const nsec: u128 = @intCast(ts.nsec);
-    return sec * 1_000_000_000 + nsec;
+    return @intCast(platform_clock.monotonicNs());
 }
 
 /// Duration in milliseconds (for delta computations, log rotation, etc.).

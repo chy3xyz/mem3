@@ -49,6 +49,14 @@ pub fn run(alloc: std.mem.Allocator, p: cli.Parsed) !void {
     // survives a restart. This is what makes the invariant real rather than
     // merely unit-tested — before this the rule existed only in
     // `GoalPoset.evaluateMetaGoals`, which nothing called.
+    //
+    // Scheduled forgetting rides the same thread on its own, much slower
+    // deadline: a daemon that never calls `store.forget` retains every
+    // memory it is ever given and reports `mem3_forgetting_rate 0` forever,
+    // which is indistinguishable from a memory system in good health.
+    // `--forget-interval=0` opts out; `--dry-run` keeps the sweep but makes
+    // it a preview.
+    srv.setForgetSchedule(p.forget_interval_sec, p.dry_run);
     try srv.startMaintenance(p.maint_interval_sec);
 
     std.debug.print("mem3 v0.1.0-alpha listening on http://{s}:{d}\n", .{ p.bind, p.port });
@@ -56,6 +64,18 @@ pub fn run(alloc: std.mem.Allocator, p: cli.Parsed) !void {
     std.debug.print("  web UI:    http://{s}:{d}/\n", .{ p.bind, p.port });
     std.debug.print("  health:    http://{s}:{d}/healthz\n", .{ p.bind, p.port });
     std.debug.print("  metrics:   http://{s}:{d}/metrics\n", .{ p.bind, p.port });
+    if (p.forget_interval_sec == 0) {
+        std.debug.print("  forgetting: off (--forget-interval=0); every memory is retained\n", .{});
+    } else {
+        std.debug.print("  forgetting: every {d}s{s}\n", .{
+            p.forget_interval_sec,
+            if (p.dry_run) " (dry run — previews only)" else "",
+        });
+        std.debug.print("  forget:    POST http://{s}:{d}/api/forget (preview; add {{\"dry_run\":false}} to actually forget)\n", .{ p.bind, p.port });
+    }
+    if (p.maint_interval_sec == 0) {
+        std.debug.print("  maintenance: off (--maint-interval=0)\n", .{});
+    }
     if (!in_memory) {
         std.debug.print("  sync:      POST http://{s}:{d}/api/sync\n", .{ p.bind, p.port });
     } else {

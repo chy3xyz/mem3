@@ -10,6 +10,7 @@ const cli = @import("../cli.zig");
 const store_mod = @import("../store/mod.zig");
 const Store = store_mod.Store;
 const MemorySource = @import("../core/mod.zig").MemorySource;
+const platform_stdio = @import("../platform/stdio.zig");
 
 /// Open a Store according to CLI global flags.
 ///
@@ -24,10 +25,12 @@ pub fn openStore(alloc: std.mem.Allocator, parsed: cli.Parsed) !*Store {
     });
 }
 
-/// Print a complete line to stdout via POSIX write. Use this in
-/// place of `std.io.getStdOut().writer()` which doesn't exist in
-/// Zig 0.17 dev. Buffer is stack-allocated; format the line in full
-/// before calling.
+/// Print a complete line to stdout. Use this in place of
+/// `std.io.getStdOut().writer()`, which doesn't exist in Zig 0.17.
+/// The buffer is stack-allocated; format the line in full before calling.
+///
+/// Goes through the platform layer rather than `std.c.write(std.c.STDOUT_FILENO, …)`
+/// because that handle is `*anyopaque` on Windows and does not type-check there.
 pub fn println(s: []const u8) void {
     var buf: [8192]u8 = undefined;
     const out = if (s.len + 1 <= buf.len) blk: {
@@ -35,7 +38,7 @@ pub fn println(s: []const u8) void {
         buf[s.len] = '\n';
         break :blk buf[0 .. s.len + 1];
     } else s;
-    _ = std.c.write(std.c.STDOUT_FILENO, out.ptr, out.len);
+    _ = platform_stdio.writeOut(out);
 }
 
 /// Print a complete line to stderr via POSIX write.
@@ -46,14 +49,14 @@ pub fn eprintln(s: []const u8) void {
         buf[s.len] = '\n';
         break :blk buf[0 .. s.len + 1];
     } else s;
-    _ = std.c.write(std.c.STDERR_FILENO, out.ptr, out.len);
+    _ = platform_stdio.writeErr(out);
 }
 
 /// Pretty-print an error to stderr and exit with code 1.
 pub fn fatal(comptime fmt: []const u8, args: anytype) noreturn {
     var buf: [1024]u8 = undefined;
     const s = std.fmt.bufPrint(&buf, fmt, args) catch "fatal: format error\n";
-    _ = std.c.write(std.c.STDERR_FILENO, s.ptr, s.len);
+    _ = platform_stdio.writeErr(s);
     std.process.exit(1);
 }
 

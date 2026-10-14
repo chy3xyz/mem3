@@ -289,15 +289,25 @@ pub const Embedder = union(enum) {
     stub_xxhash: StubEmbedder,
     lexical_hash: LexicalEmbedder,
 
-    pub fn init(kind: config.Config.EmbedderKind, dim: u16) Embedder {
+    /// `EmbedderKind.onnx_external` is reserved for a v0.2.0 model load
+    /// and has no implementation. It used to `@panic` from `init`, which
+    /// is a crash: the variant is reachable from a deserialised config
+    /// (`Config.embedder_kind`), so any future config loader would take
+    /// the whole daemon down on a value that is documented as legal.
+    /// The constitution's API Surface Standards say no panics in
+    /// libraries, so this is a typed error the caller decides what to
+    /// do with.
+    pub const InitError = error{UnsupportedEmbedder};
+
+    pub fn init(kind: config.Config.EmbedderKind, dim: u16) InitError!Embedder {
         return switch (kind) {
             .stub_xxhash => .{ .stub_xxhash = StubEmbedder.init(dim) },
             .lexical_hash => .{ .lexical_hash = LexicalEmbedder.init(dim) },
-            .onnx_external => @panic("EmbedderKind.onnx_external is reserved and unimplemented"),
+            .onnx_external => error.UnsupportedEmbedder,
         };
     }
 
-    pub fn fromConfig(cfg: config.Config) Embedder {
+    pub fn fromConfig(cfg: config.Config) InitError!Embedder {
         return init(cfg.embedder_kind, cfg.embedder_dim);
     }
 
@@ -573,11 +583,11 @@ test "Embedder: union selects the configured kind" {
     cfg.embedder_dim = 384;
 
     cfg.embedder_kind = .stub_xxhash;
-    const stub = Embedder.fromConfig(cfg);
+    const stub = try Embedder.fromConfig(cfg);
     try std.testing.expect(stub == .stub_xxhash);
 
     cfg.embedder_kind = .lexical_hash;
-    const lex = Embedder.fromConfig(cfg);
+    const lex = try Embedder.fromConfig(cfg);
     try std.testing.expect(lex == .lexical_hash);
 
     const via_stub = try stub.embed(alloc, "the user prefers zig");
@@ -594,6 +604,21 @@ test "Embedder: union selects the configured kind" {
         alloc.free(batch);
     }
     try std.testing.expectEqual(@as(usize, 2), batch.len);
+}
+
+test "Embedder: the reserved variant is a typed error, never a panic" {
+    // The constitution's API Surface Standards forbid panics in
+    // libraries, and `.onnx_external` is reachable from a config file.
+    // This test fails loudly if anyone reintroduces `@panic` here: the
+    // process dies instead of returning, and the runner reports it.
+    try std.testing.expectError(
+        error.UnsupportedEmbedder,
+        Embedder.init(.onnx_external, 384),
+    );
+    try std.testing.expectError(
+        error.UnsupportedEmbedder,
+        Embedder.fromConfig(.{ .embedder_kind = .onnx_external }),
+    );
 }
 
 test "Config: lexical_hash is a selectable EmbedderKind" {

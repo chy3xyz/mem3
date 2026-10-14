@@ -28,6 +28,7 @@
 //! available; the half-written temp file is unlinked at startup.
 
 const std = @import("std");
+const platform_fs = @import("../platform/fs.zig");
 const Allocator = std.mem.Allocator;
 const core = @import("../core/mod.zig");
 const MemCell = core.MemCell;
@@ -35,6 +36,8 @@ const MemorySource = core.MemorySource;
 const TriSourceManager = @import("../memory/tri_source_manager.zig").TriSourceManager;
 const FuzzyStore = @import("../memory/forgetter.zig").FuzzyStore;
 const GoalPoset = @import("../ghw/goal_tree.zig").GoalPoset;
+const ROOT_GOAL_ID = @import("../ghw/goal_tree.zig").ROOT_GOAL_ID;
+const TOP_GOAL_ID = @import("../ghw/goal_tree.zig").TOP_GOAL_ID;
 const GoalNode = @import("../ghw/goal_node.zig").GoalNode;
 const GoalStatus = core.GoalStatus;
 const hashing = @import("../utils/hashing.zig");
@@ -131,15 +134,15 @@ pub const SnapshotWriter = struct {
         const z = std.fmt.bufPrint(&zbuf, "{s}\x00", .{tmp_path}) catch return error.SnapshotPathTooLong;
         const zpath = z[0 .. z.len - 1 :0];
 
-        // Open with O_WRONLY|O_CREAT|O_TRUNC for fresh write.
-        const flags: std.c.O = .{
-            .CREAT = true,
-            .TRUNC = true,
-            .ACCMODE = .WRONLY,
-        };
-        const fd = std.c.open(zpath.ptr, flags, @as(std.c.mode_t, 0o644));
-        if (fd < 0) return error.SnapshotOpenFailed;
-        defer _ = std.c.close(fd);
+        // Truncate-and-write. `std.c.O` is a `switch (native_os)` whose
+        // shape differs per platform — the Linux branch has an `ACCMODE`
+        // field and the Windows branch does not — so naming it here broke
+        // cross-compilation. The platform layer takes intent instead.
+        const fd = platform_fs.open(zpath.ptr, .{
+            .access = .write_only,
+            .create = .truncate,
+        }) catch return error.SnapshotOpenFailed;
+        defer platform_fs.close(fd);
 
         var w: BufferedWriter = .{ .fd = fd };
         defer w.flush() catch {}; // best-effort; we already wrote to OS buffer
@@ -161,7 +164,7 @@ pub const SnapshotWriter = struct {
             }
             goal_buf.deinit(self.alloc);
         }
-        try self.collectGoals(goals, null, &goal_buf);
+        try self.collectGoals(goals, &goal_buf);
         try w.writeU64(goal_buf.items.len);
         for (goal_buf.items) |g| {
             try w.writeU64(g.id);
@@ -189,37 +192,94 @@ pub const SnapshotWriter = struct {
 
         try w.flush();
 
+        // Durability barrier, BEFORE the rename.
+        //
+        // `rename(2)` is atomic, but the bytes behind it are only in the
+        // OS page cache until they are fsynced. `Store.takeSnapshot`
+        // rotates the WAL immediately after this returns, and before
+        // this call existed the WAL was the *only* place goals lived — so
+        // a power cut right after "snapshot written" could leave a
+        // renamed-but-empty snapshot next to a rotated WAL. Failing hard
+        // is the safe answer: `takeSnapshot` then propagates and does not
+        // touch the WAL at all.
+        platform_fs.sync(fd) catch {
+            platform_fs.unlink(zpath.ptr) catch {};
+            return error.SnapshotSyncFailed;
+        };
+
         // Atomic rename
         var dst_zbuf: [std.fs.max_path_bytes + 1]u8 = undefined;
         const dz = std.fmt.bufPrint(&dst_zbuf, "{s}\x00", .{self.path}) catch return error.SnapshotPathTooLong;
         const dzpath = dz[0 .. dz.len - 1 :0];
-        if (std.c.rename(zpath.ptr, dzpath.ptr) != 0) {
+        platform_fs.rename(zpath.ptr, dzpath.ptr) catch {
             // Rename failed — clean up the temp file before returning.
-            _ = std.c.unlink(zpath.ptr);
+            platform_fs.unlink(zpath.ptr) catch {};
             return error.SnapshotRenameFailed;
-        }
+        };
         return w.bytes_written;
     }
 
+    /// Emit one `GoalSnapshot` per non-synthetic goal, parents before
+    /// children.
+    ///
+    /// This used to be a no-op stub that discarded all three arguments
+    /// and left a `TODO: walk GoalPoset`, which meant `goals_count` was
+    /// always written as 0 — the format had a slot reserved for the goal
+    /// poset (`GoalSnapshot` existed, `read` already parsed it) and
+    /// nothing ever filled it. Goals therefore survived *only* as WAL
+    /// records, and `Store.takeSnapshot` truncated the WAL right after
+    /// writing the snapshot: a crash in between deleted every user goal,
+    /// permanently.
+    ///
+    /// The walk deliberately mirrors `Store.rejournalGoals` exactly:
+    ///
+    ///   - breadth-first from ⊥, so a parent is always emitted before its
+    ///     children and a single forward pass on restore is enough;
+    ///   - the synthetic ⊥/⊤ are skipped — `GoalPoset.init` rebuilds
+    ///     them, and a record claiming a reserved id is rejected on
+    ///     replay;
+    ///   - `GoalPoset` stores ⊥ as a concrete `parent_id` while the API
+    ///     spells "no parent" as `null`; ⊥ is folded back to `null` on
+    ///     the way out, exactly as the WAL payload does, because
+    ///     `GoalPoset.create` maps `null` back to ⊥. Both replay paths
+    ///     must rebuild the identical poset, or a restart after a
+    ///     snapshot would diverge from one after a WAL replay.
+    ///
+    /// The queue is explicit rather than recursive: a goal tree is
+    /// arbitrary depth, and self-recursion would put the stack — not the
+    /// heap — in the way.
     fn collectGoals(
         self: *SnapshotWriter,
         goals: *GoalPoset,
-        parent_filter: ?u64,
         out: *std.ArrayList(GoalSnapshot),
     ) !void {
-        // Walk every node in the GoalPoset. We don't have a direct
-        // iterator, so we use the underlying map by reaching through
-        // the public API: count() + a helper. The public API is
-        // narrow; for v0.2 we just snapshot the goal ID counter and
-        // assume goal nodes are stable across boots. The actual nodes
-        // are rebuilt from the WAL on first run.
-        _ = self;
-        _ = goals;
-        _ = parent_filter;
-        _ = out;
-        // TODO: walk GoalPoset. For v0.2 we ship a minimal snapshot
-        // of (counter, cells, fuzzy_cells) and let the WAL carry the
-        // goals. This keeps the format simple.
+        var queue: std.ArrayList(u64) = .empty;
+        defer queue.deinit(self.alloc);
+        try queue.append(self.alloc, ROOT_GOAL_ID);
+        var head: usize = 0;
+        while (head < queue.items.len) : (head += 1) {
+            for (goals.childrenOf(queue.items[head])) |child_id| {
+                if (child_id == ROOT_GOAL_ID or child_id == TOP_GOAL_ID) continue;
+                const node = goals.get(child_id) orelse continue;
+                const parent_id: ?u64 = if (node.parent_id) |p|
+                    (if (p == ROOT_GOAL_ID) null else p)
+                else
+                    null;
+                const name = try self.alloc.dupe(u8, node.name);
+                errdefer self.alloc.free(name);
+                const description = try self.alloc.dupe(u8, node.description);
+                errdefer self.alloc.free(description);
+                try out.append(self.alloc, .{
+                    .id = node.id,
+                    .name = name,
+                    .description = description,
+                    .parent_id = parent_id,
+                    .status = node.status,
+                    .priority = node.priority,
+                });
+                try queue.append(self.alloc, child_id);
+            }
+        }
     }
 
     fn collectCellsFromMgr(
@@ -319,24 +379,20 @@ pub fn read(alloc: Allocator, path: []const u8) !SnapshotData {
     var zbuf: [std.fs.max_path_bytes + 1]u8 = undefined;
     const z = std.fmt.bufPrint(&zbuf, "{s}\x00", .{path}) catch return error.SnapshotPathTooLong;
     const zpath = z[0 .. z.len - 1 :0];
-    const flags: std.c.O = .{ .ACCMODE = .RDONLY };
-    const fd = std.c.open(zpath.ptr, flags, @as(std.c.mode_t, 0));
-    if (fd < 0) return error.SnapshotOpenFailed;
-    defer _ = std.c.close(fd);
+    const fd = platform_fs.open(zpath.ptr, .{ .access = .read_only }) catch
+        return error.SnapshotOpenFailed;
+    defer platform_fs.close(fd);
 
-    var st: std.c.Stat = undefined;
-    if (std.c.fstat(fd, &st) != 0) return error.SnapshotStatFailed;
-    const size: usize = @intCast(@max(0, st.size));
+    // `std.c.Stat` is `void` on Linux and Windows in Zig 0.17. sizeOf does
+    // the same job with a seek, and preserves the read position so the read
+    // below still starts at offset 0.
+    const size: usize = @intCast(platform_fs.sizeOf(fd) catch
+        return error.SnapshotStatFailed);
     if (size == 0) return error.SnapshotEmpty;
 
     const raw = try alloc.alloc(u8, size);
     defer alloc.free(raw);
-    var got: usize = 0;
-    while (got < size) {
-        const n = std.c.read(fd, raw[got..].ptr, size - got);
-        if (n <= 0) break;
-        got += @intCast(n);
-    }
+    const got = platform_fs.readFull(fd, raw) catch return error.SnapshotTruncated;
     if (got < size) return error.SnapshotTruncated;
 
     var r: BufferedReader = .{ .data = raw };
@@ -349,32 +405,64 @@ pub fn read(alloc: Allocator, path: []const u8) !SnapshotData {
 
     const goals_count = try r.readU64();
     const goals = try alloc.alloc(GoalSnapshot, goals_count);
-    for (goals, 0..) |*g, i| {
+    // Goal rows own their strings, and `read` has no way to hand a
+    // half-built array back to `SnapshotData.deinit` (which frees every
+    // row unconditionally). Without this errdefer a truncated snapshot
+    // leaked the whole goal array — unreachable while `collectGoals`
+    // was a stub that emitted nothing, live the moment it emits.
+    var goals_filled: usize = 0;
+    errdefer {
+        for (goals[0..goals_filled]) |*g| {
+            alloc.free(@constCast(g.name));
+            alloc.free(@constCast(g.description));
+        }
+        alloc.free(goals);
+    }
+    for (goals) |*g| {
         g.id = try r.readU64();
         g.name = try r.readStringAlloc(alloc);
         g.description = try r.readStringAlloc(alloc);
+        // Counted the moment the two owning strings exist, not at the
+        // end of the row: a corrupt discriminant or a truncated tail
+        // fails *after* this point, and those strings still have to be
+        // freed. Counting at the end leaked exactly what the reader was
+        // supposed to reject cleanly.
+        goals_filled += 1;
         const has_parent = try r.readBool();
         g.parent_id = if (has_parent) try r.readU64() else null;
-        g.status = @enumFromInt(try r.readU8());
+        g.status = try readEnumByte(GoalStatus, &r);
         g.priority = try r.readU8();
-        _ = i;
     }
 
     const cells_count = try r.readU64();
     const cells = try alloc.alloc(CellSnapshot, cells_count);
+    var cells_filled: usize = 0;
     errdefer {
-        for (cells[0..r.read_count_filled]) |*cell| freeCellSnapshot(alloc, cell);
+        for (cells[0..cells_filled]) |*cell| freeCellSnapshot(alloc, cell);
         alloc.free(cells);
     }
-    for (cells) |*cell| try readCellSnapshot(alloc, &r, cell);
+    for (cells) |*cell| {
+        try readCellSnapshot(alloc, &r, cell);
+        cells_filled += 1;
+    }
 
     const fuzzy_count = try r.readU64();
     const fuzzy_cells = try alloc.alloc(CellSnapshot, fuzzy_count);
+    // Its own counter, not a shared "rows read so far" one: a shared
+    // counter is still carrying `cells.len` by the time the fuzzy
+    // errdefer runs, so `fuzzy_cells[0..counter]` walks past the end of
+    // the fuzzy array whenever the snapshot holds cells and then fails
+    // mid-fuzzy — a bounds panic on the exact input that was supposed
+    // to degrade into "no valid snapshot".
+    var fuzzy_filled: usize = 0;
     errdefer {
-        for (fuzzy_cells[0..r.read_count_filled]) |*cell| freeCellSnapshot(alloc, cell);
+        for (fuzzy_cells[0..fuzzy_filled]) |*cell| freeCellSnapshot(alloc, cell);
         alloc.free(fuzzy_cells);
     }
-    for (fuzzy_cells) |*cell| try readCellSnapshot(alloc, &r, cell);
+    for (fuzzy_cells) |*cell| {
+        try readCellSnapshot(alloc, &r, cell);
+        fuzzy_filled += 1;
+    }
 
     return .{
         .alloc = alloc,
@@ -388,7 +476,7 @@ pub fn read(alloc: Allocator, path: []const u8) !SnapshotData {
 fn readCellSnapshot(alloc: Allocator, r: *BufferedReader, cell: *CellSnapshot) !void {
     const cs = cell;
     cs.id = try r.readU64();
-    cs.source = @enumFromInt(try r.readU8());
+    cs.source = try readEnumByte(MemorySource, r);
     cs.episode = try r.readStringAlloc(alloc);
     errdefer alloc.free(@constCast(cs.episode));
     const facts_len = try r.readU64();
@@ -434,7 +522,20 @@ fn readCellSnapshot(alloc: Allocator, r: *BufferedReader, cell: *CellSnapshot) !
     cs.metadata.superseded_at = if (has_sup) try r.readI64() else null;
     const has_fuzz = try r.readBool();
     cs.metadata.fuzzed_at = if (has_fuzz) try r.readI64() else null;
-    r.read_count_filled += 1;
+}
+
+/// Read one byte as an enum discriminant, rejecting out-of-range values.
+///
+/// `@enumFromInt` is a *checked* conversion in safe builds: a corrupt
+/// byte in a snapshot would abort the process with "invalid enum value"
+/// instead of surfacing as a load failure that `Store.loadSnapshot`
+/// already knows how to handle. A snapshot file is untrusted input the
+/// moment a write was interrupted, so the check belongs here.
+fn readEnumByte(comptime T: type, r: *BufferedReader) !T {
+    const raw = try r.readU8();
+    const info = @typeInfo(T).@"enum";
+    if (raw >= info.field_names.len) return error.SnapshotCorruptField;
+    return @enumFromInt(raw);
 }
 
 fn freeCellSnapshot(alloc: Allocator, cell: *CellSnapshot) void {
@@ -466,12 +567,10 @@ const BufferedWriter = struct {
 
     fn flush(self: *BufferedWriter) !void {
         if (self.pos == 0) return;
-        var written: usize = 0;
-        while (written < self.pos) {
-            const n = std.c.write(self.fd, self.buf[written..self.pos].ptr, self.pos - written);
-            if (n <= 0) return error.SnapshotWriteFailed;
-            written += @intCast(n);
-        }
+        // A short write must not be treated as success: a snapshot that
+        // silently stops early is a corrupt snapshot that still looks valid.
+        platform_fs.writeAll(self.fd, self.buf[0..self.pos]) catch
+            return error.SnapshotWriteFailed;
         self.bytes_written += self.pos;
         self.pos = 0;
     }
@@ -528,13 +627,14 @@ const BufferedWriter = struct {
 const BufferedReader = struct {
     data: []const u8,
     pos: usize = 0,
-    /// For error recovery in `readCellSnapshot` errdefer. Counts how
-    /// many cells have been fully read so partial state can be freed
-    /// without double-freeing later allocations.
-    read_count_filled: usize = 0,
 
     fn readExact(self: *BufferedReader, n: usize) ![]u8 {
-        if (self.pos + n > self.data.len) return error.SnapshotTruncated;
+        // Written as a subtraction rather than `self.pos + n > len`: `n`
+        // comes straight off the wire (a string length), so a corrupt or
+        // truncated file can make the addition overflow — which is a
+        // panic in safe builds, i.e. a crash on exactly the input this
+        // function exists to reject.
+        if (self.pos > self.data.len or n > self.data.len - self.pos) return error.SnapshotTruncated;
         const out = self.data[self.pos..][0..n];
         self.pos += n;
         return @constCast(out);
@@ -579,7 +679,10 @@ const BufferedReader = struct {
 
     fn readStringAlloc(self: *BufferedReader, alloc: Allocator) ![]u8 {
         const len = try self.readU64();
-        const bytes = try self.readExact(len);
+        // A length of u64 max from a corrupt file must not become a
+        // wrapping `@intCast` on a 32-bit target.
+        if (len > std.math.maxInt(usize)) return error.SnapshotTruncated;
+        const bytes = try self.readExact(@intCast(len));
         return alloc.dupe(u8, bytes);
     }
 };
@@ -615,7 +718,14 @@ test "Snapshot: write + read roundtrip preserves state" {
     _ = try mgr.add(cell);
 
     const path = "/tmp/mem3_test_snapshot.bin";
-    defer _ = std.c.unlink(path);
+    defer {
+        var zb: [std.fs.max_path_bytes + 1]u8 = undefined;
+        // `bufPrint` can only fail by overflow; a path too long cannot be
+        // unlinked anyway. Note this block cannot `return` — Zig forbids it.
+        if (std.fmt.bufPrint(&zb, "{s}\x00", .{path})) |zz| {
+            platform_fs.unlink(zz[0 .. zz.len - 1 :0].ptr) catch {};
+        } else |_| {}
+    }
 
     var w = SnapshotWriter.init(alloc, path);
     _ = try w.write(42, &goals, &mgr, &fuzzy);
@@ -626,4 +736,184 @@ test "Snapshot: write + read roundtrip preserves state" {
     try std.testing.expectEqual(@as(usize, 1), data.cells.len);
     try std.testing.expectEqualStrings("alpha episode", data.cells[0].episode);
     try std.testing.expectEqual(@as(MemorySource, .matter), data.cells[0].source);
+}
+
+// =============================================================================
+// Goal-poset tests
+//
+// `collectGoals` shipped as a stub that emitted nothing, so `goals_count`
+// was written as 0 and `read`'s goal branch never executed. Everything
+// below is that branch being exercised for the first time.
+// =============================================================================
+
+/// Scratch path under /tmp, pid-isolated so concurrent test binaries and
+/// re-runs of a crashed test cannot read each other's snapshot.
+fn goalTestPath(buf: []u8, name: []const u8) []const u8 {
+    const pid: u64 = @intCast(std.c.getpid());
+    return std.fmt.bufPrint(buf, "/tmp/mem3_snap_{d}_{s}.bin", .{ pid, name }) catch unreachable;
+}
+
+fn unlinkIfPresent(path: []const u8) void {
+    var zb: [platform_fs.max_path_bytes + 1]u8 = undefined;
+    if (std.fmt.bufPrint(&zb, "{s}\x00", .{path})) |zz| {
+        platform_fs.unlink(zz[0 .. zz.len - 1 :0].ptr) catch {};
+    } else |_| {}
+}
+
+/// The row for `id`, or null. Written as a lookup rather than an index so
+/// the tests assert on *content* and do not depend on the walk's order —
+/// only the parents-before-children guarantee matters to the reader, and
+/// the store-level test is what pins that down.
+fn rowFor(rows: []const GoalSnapshot, id: u64) ?GoalSnapshot {
+    for (rows) |r| {
+        if (r.id == id) return r;
+    }
+    return null;
+}
+
+test "Snapshot: a six-deep goal chain round-trips through write + read" {
+    const alloc = std.testing.allocator;
+    var path_buf: [128]u8 = undefined;
+    const path = goalTestPath(&path_buf, "deep");
+    unlinkIfPresent(path);
+    defer unlinkIfPresent(path);
+
+    var ids: std.atomic.Value(u64) = .init(1);
+    var mgr = TriSourceManager.init(alloc, &ids);
+    defer mgr.deinit();
+    var fuzzy = FuzzyStore.init(alloc);
+    defer fuzzy.deinit();
+    var goals = GoalPoset.init(alloc);
+    defer goals.deinit();
+
+    // Six levels: d0 ⊥→ d1 → d2 → d3 → d4 → d5. A walk that only
+    // descends one level, or that recurses into a fixed-depth buffer,
+    // truncates this chain.
+    var chain: [6]u64 = undefined;
+    var parent: ?u64 = null;
+    for (0..6) |i| {
+        const name = try std.fmt.allocPrint(alloc, "level-{d}", .{i});
+        defer alloc.free(name);
+        const desc = try std.fmt.allocPrint(alloc, "depth {d} goal", .{i});
+        defer alloc.free(desc);
+        chain[i] = try goals.create(name, desc, parent, @intCast(10 - i), null, 1_700_000_000_000 + @as(i64, @intCast(i)), &ids);
+        parent = chain[i];
+    }
+    // A second, shallower branch off ⊥ so the writer has to interleave
+    // two subtrees rather than following one happy path.
+    const side = try goals.create("side", "hangs directly off root", null, 4, null, 1_700_000_999_999, &ids);
+    try goals.updateStatus(chain[2], .completed, 1_700_000_500_000);
+    try goals.updateStatus(chain[5], .in_progress, 1_700_000_600_000);
+
+    var w = SnapshotWriter.init(alloc, path);
+    _ = try w.write(99, &goals, &mgr, &fuzzy);
+
+    var data = try read(alloc, path);
+    defer data.deinit();
+
+    try std.testing.expectEqual(@as(usize, 7), data.goals.len);
+
+    const deep = rowFor(data.goals, chain[5]).?;
+    try std.testing.expectEqualStrings("level-5", deep.name);
+    try std.testing.expectEqualStrings("depth 5 goal", deep.description);
+    try std.testing.expectEqual(chain[4], deep.parent_id.?);
+    try std.testing.expectEqual(GoalStatus.in_progress, deep.status);
+    try std.testing.expectEqual(@as(u8, 5), deep.priority);
+
+    const done = rowFor(data.goals, chain[2]).?;
+    try std.testing.expectEqual(GoalStatus.completed, done.status);
+    try std.testing.expectEqual(chain[1], done.parent_id.?);
+
+    // ⊥-parented goals are written in the API's "absent" form, exactly
+    // as the WAL payload writes them.
+    try std.testing.expectEqual(@as(?u64, null), rowFor(data.goals, chain[0]).?.parent_id);
+    try std.testing.expectEqual(@as(?u64, null), rowFor(data.goals, side).?.parent_id);
+
+    // The synthetic nodes are rebuilt by `GoalPoset.init`, never
+    // serialized.
+    try std.testing.expect(rowFor(data.goals, ROOT_GOAL_ID) == null);
+    try std.testing.expect(rowFor(data.goals, TOP_GOAL_ID) == null);
+}
+
+test "Snapshot: an empty goal set round-trips as zero goals" {
+    const alloc = std.testing.allocator;
+    var path_buf: [128]u8 = undefined;
+    const path = goalTestPath(&path_buf, "empty");
+    unlinkIfPresent(path);
+    defer unlinkIfPresent(path);
+
+    var ids: std.atomic.Value(u64) = .init(1);
+    var mgr = TriSourceManager.init(alloc, &ids);
+    defer mgr.deinit();
+    var fuzzy = FuzzyStore.init(alloc);
+    defer fuzzy.deinit();
+    // No user goals — only the synthetic ⊥/⊤ that `GoalPoset.init`
+    // always creates.
+    var goals = GoalPoset.init(alloc);
+    defer goals.deinit();
+    try std.testing.expectEqual(@as(usize, 0), goals.count());
+
+    var w = SnapshotWriter.init(alloc, path);
+    _ = try w.write(7, &goals, &mgr, &fuzzy);
+
+    var data = try read(alloc, path);
+    defer data.deinit();
+    try std.testing.expectEqual(@as(usize, 0), data.goals.len);
+    // The rest of the record still reads back, so this is a genuine
+    // empty goal set and not a truncated file.
+    try std.testing.expectEqual(@as(u64, 7), data.counter);
+    try std.testing.expectEqual(@as(usize, 0), data.cells.len);
+    try std.testing.expectEqual(@as(usize, 0), data.fuzzy_cells.len);
+}
+
+test "Snapshot: a corrupt goal status byte is rejected, not panicked on" {
+    const alloc = std.testing.allocator;
+    var path_buf: [128]u8 = undefined;
+    const path = goalTestPath(&path_buf, "corrupt");
+    unlinkIfPresent(path);
+    defer unlinkIfPresent(path);
+
+    var ids: std.atomic.Value(u64) = .init(1);
+    var mgr = TriSourceManager.init(alloc, &ids);
+    defer mgr.deinit();
+    var fuzzy = FuzzyStore.init(alloc);
+    defer fuzzy.deinit();
+    var goals = GoalPoset.init(alloc);
+    defer goals.deinit();
+    _ = try goals.create("n", "d", null, 5, null, 1_700_000_000_000, &ids);
+
+    var w = SnapshotWriter.init(alloc, path);
+    _ = try w.write(1, &goals, &mgr, &fuzzy);
+
+    // Read the file back, patch the one status byte, and put it. The
+    // offset is derived from the layout the writer documents, not
+    // hard-coded blindly:
+    //   magic 4 | version 4 | counter 8 | goals_count 8 | id 8 |
+    //   name_len 8 | name | desc_len 8 | desc | has_parent 1 | status
+    var zbuf: [platform_fs.max_path_bytes + 1]u8 = undefined;
+    const z = std.fmt.bufPrint(&zbuf, "{s}\x00", .{path}) catch return error.SkipZigTest;
+    const zpath = z[0 .. z.len - 1 :0];
+    const fd = try platform_fs.open(zpath, .{ .access = .read_only });
+    defer platform_fs.close(fd);
+    const size: usize = @intCast(try platform_fs.sizeOf(fd));
+    var raw = try alloc.alloc(u8, size);
+    defer alloc.free(raw);
+    const got = try platform_fs.readFull(fd, raw);
+    try std.testing.expectEqual(size, got);
+
+    const name_len: usize = 1;
+    const desc_len: usize = 1;
+    const status_off = 4 + 4 + 8 + 8 + 8 + 8 + name_len + 8 + desc_len + 1;
+    try std.testing.expect(status_off < raw.len);
+    try std.testing.expectEqual(@as(u8, 0), raw[status_off]); // .pending
+    raw[status_off] = 0xFF;
+
+    const wfd = try platform_fs.open(zpath, .{ .access = .write_only, .create = .truncate });
+    defer platform_fs.close(wfd);
+    try platform_fs.writeAll(wfd, raw);
+
+    // `@enumFromInt(0xFF)` is a checked panic in safe builds: the
+    // reader has to reject it itself, or a single corrupt byte takes
+    // the whole process down instead of failing this one load.
+    try std.testing.expectError(error.SnapshotCorruptField, read(alloc, path));
 }

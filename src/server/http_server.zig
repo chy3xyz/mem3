@@ -28,8 +28,23 @@ const mem3_store = @import("../store/store.zig");
 const RerankContext = @import("../retrieval/reranker.zig").RerankContext;
 const memory = @import("../memory/mod.zig");
 const retrieval = @import("../retrieval/mod.zig");
+/// The CLI parser, for the daemon-flag tests at the bottom of this file.
+/// Referenced as a type/module only — its own `test` blocks are not
+/// collected here (see the note on that test section).
+const cli = @import("../cli.zig");
 
 const log = std.log.scoped(.mem3_server);
+
+/// Diagnostic logging that is compiled out of tests.
+///
+/// Zig 0.17 fails a test that writes a log line at ANY level — including
+/// `warn` — and `std_options.log_level = .err` does not suppress it. Under
+/// `--listen=-` the test runner speaks its protocol over the same pipe, so a
+/// stray stderr write desynchronises it, kills the test binary, and
+/// `zig build test` still exits 0. Silent failure is worse than no log.
+fn diag(comptime fmt: []const u8, args: anytype) void {
+    if (!builtin.is_test) log.warn(fmt, args);
+}
 
 /// Embedded web UI (loaded at compile time via @embedFile).
 const WEB_INDEX: []const u8 = @embedFile("web_index.html");
@@ -87,6 +102,128 @@ fn wallClockSec() i64 {
 /// second copy to forget to update.
 const Store = mem3_store.Store;
 
+/// Number of buckets in the retrieval-latency histogram.
+///
+/// Sized so that the range an operator can act on — 1µs to 10s —
+/// lands in the low quarter of the array. Bucket 23's upper bound is
+/// 2^24-1 ≈ 16.8s, so 10s is comfortably inside, and everything above
+/// it is headroom: a pathological outlier saturates the last bucket
+/// instead of wrapping an index or panicking.
+const LATENCY_BUCKET_COUNT: usize = 64;
+
+/// Lower edge of bucket 0, in microseconds.
+const LATENCY_BUCKET_MIN_US: u64 = 1;
+
+/// Bucket-width growth factor. 2× per bucket: the index is a bit
+/// operation rather than a search, and the reported percentile is
+/// within one factor of two of the truth — see `LatencyHistogram`.
+const LATENCY_BUCKET_GROWTH: u64 = 2;
+
+comptime {
+    // `LatencyHistogram.bucketIndexFor` is a bit trick, not a search,
+    // so it is only equivalent to the general bucket formula while the
+    // base is 1 and the factor is 2. Change either constant and the
+    // index would silently stop matching the boundaries
+    // `bucketUpperBound` reports — make that a compile error instead.
+    if (LATENCY_BUCKET_MIN_US != 1 or LATENCY_BUCKET_GROWTH != 2) {
+        @compileError("bucketIndexFor assumes LATENCY_BUCKET_MIN_US == 1 and LATENCY_BUCKET_GROWTH == 2");
+    }
+}
+
+/// Fixed-bucket latency histogram. Zero allocation, zero locks: the
+/// query handler records a sample with one atomic increment per bucket
+/// and nothing else, which is what keeps the hot path allocation-free.
+///
+/// ## Bucket formula
+///
+/// Bucket `i` covers the half-open microsecond range
+///
+///     [LATENCY_BUCKET_MIN_US * LATENCY_BUCKET_GROWTH^i,
+///      LATENCY_BUCKET_MIN_US * LATENCY_BUCKET_GROWTH^(i+1) - 1]
+///
+/// With the constants above that collapses to `[2^i, 2^(i+1) - 1]`,
+/// so the bucket index of a sample is just its base-2 logarithm.
+///
+/// ## Resolution — stated honestly
+///
+/// Each bucket is twice as wide as the one below it, and every
+/// percentile is reported as the **upper bound of the bucket that
+/// contains the requested rank**. A reported value is therefore
+/// conservative in the direction that matters for an alert: never
+/// below the true percentile, and at most 2× above it. `p99 = 8192`
+/// means "the true p99 is somewhere in (4096, 8192] µs" — not 8192µs
+/// to three significant figures. The sample count is published
+/// alongside (`mem3_retrieval_latency_samples_total`) because a
+/// percentile over three samples is noise, not a measurement.
+const LatencyHistogram = struct {
+    /// `@splat` rather than `{ .init(0) } ** N`: the array-repeat
+    /// spelling does not parse here (the `**` after a struct literal
+    /// is read as a pointer type), and the length is already in the
+    /// field's type.
+    buckets: [LATENCY_BUCKET_COUNT]std.atomic.Value(u64) = @splat(.init(0)),
+    /// Total samples recorded, i.e. the sum of `buckets`.
+    samples: std.atomic.Value(u64) = .init(0),
+
+    /// Which bucket a microsecond sample belongs to. Pure, no state.
+    pub fn bucketIndexFor(us: u64) usize {
+        if (us <= LATENCY_BUCKET_MIN_US) return 0;
+        // floor(log2(us)) == highest set bit. Computed through u32
+        // because @clz(u64) returns a u7 and mixing that with the
+        // literal 63 needs a common type.
+        const clz: u32 = @intCast(@clz(us));
+        const idx: usize = @intCast(63 - clz);
+        return @min(idx, LATENCY_BUCKET_COUNT - 1);
+    }
+
+    /// Inclusive upper edge of bucket `index`, in microseconds.
+    /// Saturates rather than overflowing on the top buckets.
+    pub fn bucketUpperBound(index: usize) u64 {
+        var bound: u64 = LATENCY_BUCKET_MIN_US;
+        var i: usize = 0;
+        while (i <= index) : (i += 1) {
+            if (bound > std.math.maxInt(u64) / LATENCY_BUCKET_GROWTH) return std.math.maxInt(u64);
+            bound *= LATENCY_BUCKET_GROWTH;
+        }
+        return bound - 1;
+    }
+
+    /// Record one sample. No allocator, no error — this runs on the
+    /// query hot path and must not be able to fail.
+    pub fn record(self: *LatencyHistogram, us: u64) void {
+        _ = self.buckets[bucketIndexFor(us)].fetchAdd(1, .monotonic);
+        _ = self.samples.fetchAdd(1, .monotonic);
+    }
+
+    pub fn sampleCount(self: *const LatencyHistogram) u64 {
+        return self.samples.load(.monotonic);
+    }
+
+    /// Conservative percentile over the recorded samples, as
+    /// `num/den` (50/100, 95/100, 99/100).
+    ///
+    /// Walks buckets low to high and returns the upper bound of the
+    /// first bucket whose cumulative count reaches
+    /// `ceil(total * num / den)`. An empty histogram returns 0 — the
+    /// division below is guarded, so "no traffic yet" reports a zero
+    /// rather than a NaN.
+    pub fn percentile(self: *const LatencyHistogram, num: u32, den: u32) u64 {
+        const total = self.samples.load(.monotonic);
+        if (total == 0 or den == 0) return 0;
+        // ceil(total * num / den), integer arithmetic only: a float
+        // rank would make this harder to hand-verify in a test.
+        const rank: u64 = @max(1, (total * num + den - 1) / den);
+        var cumulative: u64 = 0;
+        for (&self.buckets, 0..) |*bucket, i| {
+            cumulative += bucket.load(.monotonic);
+            if (cumulative >= rank) return bucketUpperBound(i);
+        }
+        // Unreachable while `samples` is maintained alongside the
+        // buckets; the fallback keeps the function total rather than
+        // returning an under-counted rank.
+        return bucketUpperBound(LATENCY_BUCKET_COUNT - 1);
+    }
+};
+
 const Metrics = struct {
     requests_total: std.atomic.Value(u64) = .init(0),
     queries_total: std.atomic.Value(u64) = .init(0),
@@ -95,30 +232,192 @@ const Metrics = struct {
     /// Bumped by the maintenance thread on each completed pass.
     maintenance_passes: std.atomic.Value(u64) = .init(0),
 
-    fn render(self: *const Metrics, alloc: Allocator, boot_time_ns: u128) ![]u8 {
-        const uptime_s = @divTrunc(nowNs() - boot_time_ns, std.time.ns_per_s);
-        return std.fmt.allocPrint(alloc,
+    /// Distribution of `/api/query` latency. Lives inside `Metrics` by
+    /// value and must never be copied out of it: `std.atomic.Value` is
+    /// a plain struct wrapping its number, so a copy is a snapshot,
+    /// not a shared cell (the same trap is documented on
+    /// `maintenance_passes`).
+    latency: LatencyHistogram = .{},
+
+    /// Cells the forgetting sweep has moved to the fuzzy store, and
+    /// cells it has examined, both cumulative since boot. The ratio
+    /// backing `mem3_forgetting_rate` is only auditable with both
+    /// absolute numbers next to it: a rate of 0.5 means "half of what
+    /// we looked at", and "looked at" has to be visible.
+    forgotten_cells_total: std.atomic.Value(u64) = .init(0),
+    forgetting_swept_total: std.atomic.Value(u64) = .init(0),
+
+    /// Render the Prometheus exposition format.
+    ///
+    /// Gauges are read from live store state at scrape time; counters
+    /// accumulate. `store` is passed in rather than reached through
+    /// `Metrics` so that `Metrics` stays a pure counter bag with no
+    /// pointer back into the store — which is what makes it safe to
+    /// declare `self` a `*const` here. Called from `route`, i.e.
+    /// already under `store_mutex`; this adds no lock of its own.
+    fn render(self: *const Metrics, alloc: Allocator, boot_time_ns: u128, store: *Store) ![]u8 {
+        const uptime_s = @divTrunc(nowNs() - boot_time_ns, 1_000_000_000);
+
+        var out = std.ArrayList(u8).empty;
+        errdefer out.deinit(alloc);
+        const w = ListWriter{ .list = &out, .gpa = alloc };
+
+        try w.writeAll(
             \\# mem3 metrics
             \\# HELP mem3_uptime_s Uptime in seconds
-            \\mem3_uptime_s {d}
+            \\# TYPE mem3_uptime_s gauge
+            \\
+        );
+        try w.print("mem3_uptime_s {d}\n", .{uptime_s});
+
+        try w.writeAll(
             \\# HELP mem3_requests_total Total HTTP requests
-            \\mem3_requests_total {d}
+            \\# TYPE mem3_requests_total counter
+            \\
+        );
+        try w.print("mem3_requests_total {d}\n", .{self.requests_total.load(.monotonic)});
+
+        try w.writeAll(
             \\# HELP mem3_queries_total Total query API calls
-            \\mem3_queries_total {d}
+            \\# TYPE mem3_queries_total counter
+            \\
+        );
+        try w.print("mem3_queries_total {d}\n", .{self.queries_total.load(.monotonic)});
+
+        try w.writeAll(
             \\# HELP mem3_inserts_total Total insert API calls
-            \\mem3_inserts_total {d}
-            \\# HELP mem3_last_query_us Last query latency microseconds
-            \\mem3_last_query_us {d}
+            \\# TYPE mem3_inserts_total counter
+            \\
+        );
+        try w.print("mem3_inserts_total {d}\n", .{self.inserts_total.load(.monotonic)});
+
+        try w.writeAll(
+            \\# HELP mem3_last_query_us Last query latency in microseconds (most recent request only)
+            \\# TYPE mem3_last_query_us gauge
+            \\
+        );
+        try w.print("mem3_last_query_us {d}\n", .{self.last_query_us.load(.monotonic)});
+
+        try w.writeAll(
             \\# HELP mem3_maintenance_passes_total Completed maintenance passes
-            \\mem3_maintenance_passes_total {d}
-        , .{
-            uptime_s,
-            self.requests_total.load(.monotonic),
-            self.queries_total.load(.monotonic),
-            self.inserts_total.load(.monotonic),
-            self.last_query_us.load(.monotonic),
-            self.maintenance_passes.load(.monotonic),
-        });
+            \\# TYPE mem3_maintenance_passes_total counter
+            \\
+        );
+        try w.print("mem3_maintenance_passes_total {d}\n", .{self.maintenance_passes.load(.monotonic)});
+
+        // Retrieval latency percentiles. Conservative by construction:
+        // each is the upper bound of its containing bucket, so it never
+        // under-reports. See `LatencyHistogram` for the formula.
+        try w.writeAll(
+            \\# HELP mem3_retrieval_latency_p50_us Retrieval latency p50 in microseconds, upper bound of the containing bucket
+            \\# TYPE mem3_retrieval_latency_p50_us gauge
+            \\
+        );
+        try w.print("mem3_retrieval_latency_p50_us {d}\n", .{self.latency.percentile(50, 100)});
+
+        try w.writeAll(
+            \\# HELP mem3_retrieval_latency_p95_us Retrieval latency p95 in microseconds, upper bound of the containing bucket
+            \\# TYPE mem3_retrieval_latency_p95_us gauge
+            \\
+        );
+        try w.print("mem3_retrieval_latency_p95_us {d}\n", .{self.latency.percentile(95, 100)});
+
+        try w.writeAll(
+            \\# HELP mem3_retrieval_latency_p99_us Retrieval latency p99 in microseconds, upper bound of the containing bucket
+            \\# TYPE mem3_retrieval_latency_p99_us gauge
+            \\
+        );
+        try w.print("mem3_retrieval_latency_p99_us {d}\n", .{self.latency.percentile(99, 100)});
+
+        // Sample count, because a percentile over three samples is
+        // noise and an operator cannot tell that from the number alone.
+        try w.writeAll(
+            \\# HELP mem3_retrieval_latency_samples_total Query latency samples recorded since boot, the basis for the percentiles above
+            \\# TYPE mem3_retrieval_latency_samples_total counter
+            \\
+        );
+        try w.print("mem3_retrieval_latency_samples_total {d}\n", .{self.latency.sampleCount()});
+
+        // Live store state — gauges, read at scrape time.
+        try w.writeAll(
+            \\# HELP mem3_memstore_cells Cells currently in the active memstore (excludes fuzzy)
+            \\# TYPE mem3_memstore_cells gauge
+            \\
+        );
+        try w.print("mem3_memstore_cells {d}\n", .{store.cellCount()});
+
+        // One line per MemorySource variant, iterated over the enum
+        // itself rather than a hand-written list: a fourth source
+        // cannot be added without the metric following it.
+        try w.writeAll(
+            \\# HELP mem3_memstore_cells_by_source Cells in the active memstore per MemorySource
+            \\# TYPE mem3_memstore_cells_by_source gauge
+            \\
+        );
+        for (std.enums.values(MemorySource)) |src| {
+            try w.print("mem3_memstore_cells_by_source{{source=\"{s}\"}} {d}\n", .{ @tagName(src), store.cellCountBySource(src) });
+        }
+
+        try w.writeAll(
+            \\# HELP mem3_hyperedges Hyperedges currently in the hypergraph
+            \\# TYPE mem3_hyperedges gauge
+            \\
+        );
+        try w.print("mem3_hyperedges {d}\n", .{store.hyperedgeCount()});
+
+        try w.writeAll(
+            \\# HELP mem3_vector_index_depth Deepest occupied HNSW layer, -1 when the index is empty
+            \\# TYPE mem3_vector_index_depth gauge
+            \\
+        );
+        try w.print("mem3_vector_index_depth {d}\n", .{store.hnsw.maxOccupiedLevel()});
+
+        try w.writeAll(
+            \\# HELP mem3_vector_index_nodes Vectors in the HNSW index
+            \\# TYPE mem3_vector_index_nodes gauge
+            \\
+        );
+        try w.print("mem3_vector_index_nodes {d}\n", .{store.hnsw.nodeCount()});
+
+        // Forgetting. The rate is a ratio, not a rate per second: a sweep
+        // is a full pass over the corpus on a slow schedule
+        // (hourly by default), so "how much of what we looked at did we
+        // drop" is the honest question. The two counters are published
+        // next to it so the ratio can be recomputed from the exposition
+        // text by anyone auditing it.
+        //
+        // Preview sweeps (`dry_run`) are deliberately absent from these
+        // counters: they moved nothing, so counting them would publish
+        // cells as forgotten that the daemon is still serving.
+        const forgotten = self.forgotten_cells_total.load(.monotonic);
+        const swept = self.forgetting_swept_total.load(.monotonic);
+        const forget_rate: f64 = if (swept == 0)
+            0.0
+        else
+            @as(f64, @floatFromInt(forgotten)) / @as(f64, @floatFromInt(swept));
+
+        try w.writeAll(
+            \\# HELP mem3_forgetting_rate Cells forgotten per cell swept by forgetting sweeps since boot, 0 before any sweep has run
+            \\# TYPE mem3_forgetting_rate gauge
+            \\
+        );
+        try w.print("mem3_forgetting_rate {d:.6}\n", .{forget_rate});
+
+        try w.writeAll(
+            \\# HELP mem3_forgotten_cells_total Cells moved to the fuzzy store by forgetting sweeps since boot
+            \\# TYPE mem3_forgotten_cells_total counter
+            \\
+        );
+        try w.print("mem3_forgotten_cells_total {d}\n", .{forgotten});
+
+        try w.writeAll(
+            \\# HELP mem3_forgetting_swept_total Cells examined by forgetting sweeps since boot
+            \\# TYPE mem3_forgetting_swept_total counter
+            \\
+        );
+        try w.print("mem3_forgetting_swept_total {d}\n", .{swept});
+
+        return out.toOwnedSlice(alloc);
     }
 };
 
@@ -170,6 +469,29 @@ const Mutex = struct {
     }
 };
 
+/// Default cadence for the daemon's scheduled forgetting sweep.
+///
+/// **Why hourly, and not the 60s maintenance cadence.** The existence-gain
+/// rule scores a cell as `importance * exp(-decay_rate * age_days)` and
+/// forgets it below `forgetting_threshold` (0.1). With the configured decay
+/// rates (matter 0.05/day, form 0.03/day, spirit 0.01/day) even the
+/// fastest source needs `ln(importance/0.1)/0.05` ≈ 46 days to cross the
+/// threshold from a perfect importance of 1.0 — and any cell already close
+/// to 0.1 crosses it in hours, which is still far longer than a minute.
+/// So the *decision* barely changes inside a minute, while the sweep itself
+/// is an O(cells) walk under `store_mutex`, i.e. time every HTTP request is
+/// blocked. Once an hour is frequent enough that an operator watching
+/// `mem3_forgotten_cells_total` sees movement within the hour, and rare
+/// enough that the daemon is not walking its whole corpus 1440 times a day
+/// to learn the same thing.
+///
+/// Deliberately NOT derived from `--maint-interval`: a test (or an operator)
+/// tuning the goal-maintenance cadence to 1s must not silently inherit a
+/// 1-second forgetting sweep, which would fuzz a freshly seeded corpus
+/// mid-assertion. The two cadences are separate counters over separate
+/// deadlines in the same thread.
+pub const DEFAULT_FORGET_INTERVAL_SEC: u32 = 3600;
+
 pub const Server = struct {
     alloc: Allocator,
     bind: []const u8,
@@ -198,6 +520,17 @@ pub const Server = struct {
     maint_running: std.atomic.Value(bool) = .init(false),
     /// Seconds between maintenance passes.
     maint_interval_sec: u32 = 60,
+    /// Seconds between scheduled forgetting sweeps; 0 = off.
+    ///
+    /// Zero until `serve` opts in, so embedding `Server` directly (tests,
+    /// a future SDK) never starts deleting memories because someone forgot
+    /// to configure it. `serve` sets it to
+    /// `DEFAULT_FORGET_INTERVAL_SEC` unless the operator says otherwise.
+    forget_interval_sec: u32 = 0,
+    /// Daemon-wide preview mode for the scheduled sweep (`--dry-run`).
+    /// The sweep still runs and still reports what it would drop, but no
+    /// cell moves to the fuzzy store and the counters stay put.
+    forget_dry_run: bool = false,
 
     /// `data_dir` is `null` for an in-memory server: no WAL, no snapshot,
     /// nothing written to disk. Tests that are not about persistence must
@@ -237,7 +570,10 @@ pub const Server = struct {
     ///
     /// `interval_sec == 0` disables it, which is what the tests use: a
     /// background thread racing a test's assertions is a flaky test waiting
-    /// to be written.
+    /// to be written. Note the consequence for the scheduled sweep: there
+    /// is exactly one background thread, so `--maint-interval=0` stops
+    /// scheduled forgetting too. That is stated in `--help` rather than
+    /// papered over with a second thread.
     pub fn startMaintenance(self: *Server, interval_sec: u32) !void {
         if (interval_sec == 0) return;
         if (self.maint_thread != null) return; // already running
@@ -247,6 +583,18 @@ pub const Server = struct {
         // would then be clearing a "running" state with no thread behind it.
         errdefer self.maint_running.store(false, .release);
         self.maint_thread = try std.Thread.spawn(.{}, maintenanceLoop, .{self});
+    }
+
+    /// Configure the scheduled forgetting sweep. Call before
+    /// `startMaintenance`; `interval_sec == 0` means "never sweep".
+    ///
+    /// `dry_run` is the daemon-wide preview switch (`mem3 serve
+    /// --dry-run`): the periodic sweep reports what it would drop without
+    /// dropping it. A system that deletes memories should be runnable in a
+    /// mode where it only ever previews.
+    pub fn setForgetSchedule(self: *Server, interval_sec: u32, dry_run: bool) void {
+        self.forget_interval_sec = interval_sec;
+        self.forget_dry_run = dry_run;
     }
 
     fn stopMaintenance(self: *Server) void {
@@ -264,39 +612,61 @@ pub const Server = struct {
         const slice_ms: u32 = 100;
         // u64 arithmetic: `interval_sec * 1000` overflows u32 above ~4.29e6
         // seconds, which is a typo away from a nonsense slice count.
-        const slices: u64 = @max(@as(u64, srv.maint_interval_sec) * 1000 / slice_ms, 1);
+        const maint_slices: u64 = @max(@as(u64, srv.maint_interval_sec) * 1000 / slice_ms, 1);
+        // Two independent deadlines over one thread. `forget_slices == 0`
+        // is "forgetting is off", and in that case the counter must stop
+        // advancing entirely — incrementing it forever would eventually
+        // wrap a u64 into a panic in the middle of the night.
+        const forget_slices: u64 = if (srv.forget_interval_sec == 0)
+            0
+        else
+            @max(@as(u64, srv.forget_interval_sec) * 1000 / slice_ms, 1);
+
+        var since_maintenance: u64 = 0;
+        var since_forget: u64 = 0;
 
         while (srv.maint_running.load(.acquire)) {
-            var waited: u64 = 0;
-            while (waited < slices and srv.maint_running.load(.acquire)) : (waited += 1) {
-                sleepMs(slice_ms);
-            }
+            sleepMs(slice_ms);
+            since_maintenance += 1;
+            if (forget_slices != 0) since_forget += 1;
             if (!srv.maint_running.load(.acquire)) break;
 
-            // Silent unless something actually changed. A per-pass log line
-            // is how a long-lived daemon fills a disk: launchd/systemd
-            // capture stdout, and one line a minute is 500MB a year for a
-            // daemon that has nothing to say.
-            srv.store_mutex.lock();
-            const res = srv.store.maintain(nowMs()) catch |err| blk: {
-                srv.store_mutex.unlock();
-                if (!builtin.is_test) log.warn("maintenance pass failed: {}", .{err});
-                break :blk null;
-            };
-            srv.store_mutex.unlock();
-
-            if (res) |r| {
-                // Bump the metric that /metrics actually publishes.
-                // `std.atomic.Value` is a plain struct wrapping a u64, so
-                // copying one into another copies the value, not a shared
-                // cell — a second counter field would have read 0 forever.
-                _ = srv.metrics.maintenance_passes.fetchAdd(1, .monotonic);
-                if (r.goals_unrealized > 0 or r.goals_failed > 0) {
-                    // Transitions are rare by construction (7-day rule), so
-                    // logging them unconditionally is safe and useful.
-                    if (!builtin.is_test) log.info("maintenance: {d} goal(s) unrealized, {d} failed", .{ r.goals_unrealized, r.goals_failed });
+            if (since_maintenance >= maint_slices) {
+                since_maintenance = 0;
+                srv.runMaintenancePass();
+            }
+            if (forget_slices != 0 and since_forget >= forget_slices) {
+                since_forget = 0;
+                if (srv.runForgetSweep(srv.forget_dry_run)) |_| {} else |err| {
+                    diag("forgetting sweep failed: {}", .{err});
                 }
             }
+        }
+    }
+
+    /// One maintenance pass from the background thread. Silent unless
+    /// something actually changed: a per-pass log line is how a
+    /// long-lived daemon fills a disk, because launchd/systemd capture
+    /// stdout and one line a minute is ~500MB a year from a daemon that
+    /// has nothing to say.
+    fn runMaintenancePass(self: *Server) void {
+        self.store_mutex.lock();
+        const res = self.store.maintain(nowMs()) catch |err| {
+            self.store_mutex.unlock();
+            diag("maintenance pass failed: {}", .{err});
+            return;
+        };
+        self.store_mutex.unlock();
+
+        // Bump the metric that /metrics actually publishes.
+        // `std.atomic.Value` is a plain struct wrapping a u64, so
+        // copying one into another copies the value, not a shared
+        // cell — a second counter field would have read 0 forever.
+        _ = self.metrics.maintenance_passes.fetchAdd(1, .monotonic);
+        if (res.goals_unrealized > 0 or res.goals_failed > 0) {
+            // Transitions are rare by construction (7-day rule), so
+            // logging them unconditionally is safe and useful.
+            if (!builtin.is_test) log.info("maintenance: {d} goal(s) unrealized, {d} failed", .{ res.goals_unrealized, res.goals_failed });
         }
     }
 
@@ -307,6 +677,75 @@ pub const Server = struct {
         self.store_mutex.lock();
         defer self.store_mutex.unlock();
         return self.store.maintain(nowMs());
+    }
+
+    /// Run one forgetting sweep and fold it into the published counters.
+    ///
+    /// Takes `store_mutex`; for callers that already hold it (every route
+    /// handler — `handleConn` locks around `route`) use `sweepLocked`.
+    ///
+    /// **The single choke point.** The scheduled path (`maintenanceLoop`),
+    /// `POST /api/forget` and any future caller all funnel through one of
+    /// these two, so a sweep is counted exactly once no matter which door it
+    /// came in by. Call `store.forget` directly and you get an unmeasured
+    /// sweep — which is precisely how `mem3_forgotten_cells_total` sat at a
+    /// structural zero for the daemon's whole life while the metric looked
+    /// perfectly healthy.
+    pub fn runForgetSweep(self: *Server, dry_run: bool) !memory.Forgetter.SweepResult {
+        self.store_mutex.lock();
+        defer self.store_mutex.unlock();
+        return self.sweepLocked(dry_run);
+    }
+
+    /// `runForgetSweep` for callers already holding `store_mutex`.
+    ///
+    /// DO NOT call `runForgetSweep` from a route handler. `store_mutex` is a
+    /// plain pthread mutex, so re-entering it from a thread that already
+    /// holds it self-deadlocks: the daemon stops answering every request,
+    /// forever, with no error. That is not hypothetical — the first
+    /// version of `handleForget` did exactly that and hung the whole
+    /// process on the first `POST /api/forget`. The in-process tests could
+    /// not see it, because they call `route` directly and therefore never
+    /// hold the lock; the regression test for it takes the lock the way
+    /// `handleConn` does.
+    fn sweepLocked(self: *Server, dry_run: bool) !memory.Forgetter.SweepResult {
+        const res = try self.store.forget(dry_run);
+        if (!dry_run) self.recordForgetSweep(res);
+
+        // Silent unless the sweep actually moved something. A sweep that
+        // forgets nothing is the normal case on a healthy corpus and must
+        // not produce a log line; per-cycle logging under launchd has
+        // previously cost ~1.5GB/day. Transitions are rare by construction —
+        // the existence-gain rule moves on a days timescale — so one line per
+        // transition is the useful signal, and `diag` keeps it out of the
+        // test runner, which fails any test that logs at any level.
+        //
+        // `diag` rather than `log.info`: `src/main.zig` pins
+        // `log_level = .err`, so an `info` line here would never reach an
+        // operator at all.
+        if (!dry_run and res.fuzzied > 0) {
+            diag("forgetting: {d} cell(s) fuzzied of {d} swept", .{ res.fuzzied, res.fuzzied + res.kept });
+        }
+        return res;
+    }
+
+    /// Fold one forgetting sweep into the cumulative counters behind
+    /// `mem3_forgetting_rate`.
+    ///
+    /// Called by `runForgetSweep` and therefore already counted by the time
+    /// a caller reaches here — do not call it a second time for the same
+    /// sweep. It stays public so a host embedding `Server` can fold in the
+    /// result of a sweep it ran itself, which is the case the counters were
+    /// originally added for.
+    ///
+    /// Counted here rather than inside `Metrics.render` so the numbers are
+    /// monotonic and auditable instead of re-derived per scrape.
+    pub fn recordForgetSweep(self: *Server, res: memory.Forgetter.SweepResult) void {
+        const forgotten: u64 = @intCast(res.fuzzied);
+        _ = self.metrics.forgotten_cells_total.fetchAdd(forgotten, .monotonic);
+        // "Swept" = everything the sweep looked at, kept or not. The
+        // rate is meaningless without it.
+        _ = self.metrics.forgetting_swept_total.fetchAdd(forgotten + @as(u64, @intCast(res.kept)), .monotonic);
     }
 
     pub fn listen(self: *Server) !void {
@@ -427,7 +866,7 @@ pub const Server = struct {
             );
         }
         if (std.mem.eql(u8, path, "/metrics")) {
-            const body = try self.metrics.render(self.alloc, self.boot_time_ns);
+            const body = try self.metrics.render(self.alloc, self.boot_time_ns, self.store);
             return .{ .status = 200, .status_text = "OK", .content_type = "text/plain; charset=utf-8", .body = body };
         }
         if (std.mem.eql(u8, path, "/api/memcells") and std.mem.eql(u8, method, "GET")) {
@@ -449,6 +888,9 @@ pub const Server = struct {
         }
         if (std.mem.eql(u8, path, "/api/sync") and std.mem.eql(u8, method, "POST")) {
             return try self.handleSync();
+        }
+        if (std.mem.eql(u8, path, "/api/forget") and std.mem.eql(u8, method, "POST")) {
+            return try self.handleForget(full_request);
         }
         return try self.textResponse(404, "Not Found", "404 not found\n");
     }
@@ -481,6 +923,49 @@ pub const Server = struct {
         return try self.jsonResponse(503, "Service Unavailable",
             \\{"error":"persistence not enabled (no WAL)","wal":false}
         );
+    }
+
+    /// `POST /api/forget` — run one forgetting sweep on demand.
+    ///
+    /// **Preview by default.** With no body, or without an explicit
+    /// `"dry_run":false`, nothing is deleted: the response reports how many
+    /// cells *would* move to the fuzzy store. Deleting memories is the one
+    /// thing this daemon cannot be asked to undo (the fuzzy store is
+    /// in-process and not WAL-journaled), so the destructive call has to be
+    /// written down in the request rather than inferred from its absence:
+    ///
+    ///     curl -X POST http://127.0.0.1:7777/api/forget                      # preview
+    ///     curl -X POST -d '{"dry_run":false}' .../api/forget                # actually forget
+    ///
+    /// A preview is not counted in `mem3_forgotten_cells_total` — see
+    /// `sweepLocked`. `sweepLocked`, not `runForgetSweep`: `handleConn`
+    /// holds `store_mutex` around `route`, so locking again here would
+    /// deadlock every future request on the first `POST /api/forget`.
+    fn handleForget(self: *Server, full_request: []const u8) !Response {
+        // No "\r\n\r\n" means no request block at all (an in-process caller
+        // passing a bare body, or an empty POST) — the body is then empty,
+        // not `full_request[4..]`, which would slice past the end.
+        const body = if (std.mem.indexOf(u8, full_request, "\r\n\r\n")) |at|
+            full_request[at + 4 ..]
+        else
+            "";
+
+        const dry_run = extractJsonBool(body, "dry_run") orelse true;
+        const res = self.sweepLocked(dry_run) catch |err| {
+            const msg = @errorName(err);
+            const err_body = try std.fmt.allocPrint(self.alloc, "{{\"error\":\"sweep failed: {s}\"}}", .{msg});
+            defer self.alloc.free(err_body);
+            return try self.jsonResponse(500, "Internal Server Error", err_body);
+        };
+
+        // `jsonResponse` copies, so the formatted body is ours to free.
+        const out = try std.fmt.allocPrint(
+            self.alloc,
+            "{{\"dry_run\":{s},\"fuzzied\":{d},\"kept\":{d},\"archived\":{d}}}",
+            .{ if (dry_run) "true" else "false", res.fuzzied, res.kept, res.archived },
+        );
+        defer self.alloc.free(out);
+        return try self.jsonResponse(200, "OK", out);
     }
 
     fn handleListMemcells(self: *Server) !Response {
@@ -722,6 +1207,11 @@ pub const Server = struct {
         const t1 = nowNs();
         const us: u64 = @intCast(@divTrunc(t1 - t0, 1000));
         _ = self.metrics.last_query_us.store(us, .monotonic);
+        // Alongside the single-value gauge: the gauge says what the
+        // last request cost, the histogram says what the distribution
+        // looks like. No allocator on this path — `record` is two
+        // atomic increments.
+        self.metrics.latency.record(us);
 
         return self.rawJson(200, try out.toOwnedSlice(self.alloc));
     }
@@ -945,6 +1435,20 @@ fn extractJsonFloat(body: []const u8, key: []const u8) ?f32 {
         body[pos] == 'e' or body[pos] == 'E')) : (pos += 1) {}
     if (start == pos) return null;
     return std.fmt.parseFloat(f32, body[start..pos]) catch null;
+}
+
+/// Parse a JSON boolean. Mirrors `extractJsonInt`: find the key, skip
+/// whitespace, match the literal. Anything else (`"dry_run":1`, a string,
+/// a missing key) returns null, and the caller decides the default.
+fn extractJsonBool(body: []const u8, key: []const u8) ?bool {
+    const needle = std.fmt.allocPrint(std.heap.page_allocator, "\"{s}\":", .{key}) catch return null;
+    defer std.heap.page_allocator.free(needle);
+    const idx = std.mem.findPos(u8, body, 0, needle) orelse return null;
+    var pos = idx + needle.len;
+    while (pos < body.len and (body[pos] == ' ' or body[pos] == '\t')) : (pos += 1) {}
+    if (std.mem.startsWith(u8, body[pos..], "true")) return true;
+    if (std.mem.startsWith(u8, body[pos..], "false")) return false;
+    return null;
 }
 
 /// JSON-escaped string field (used by WAL payload encoding).
@@ -1521,4 +2025,666 @@ test "Server: a fresh daemon does not mark its own built-in goals unrealized" {
         }
         try std.testing.expect(found);
     }
+}
+
+// =============================================================================
+// Metrics — Constitution Principle VII observability
+// =============================================================================
+
+/// Pull the numeric value of `name` out of a Prometheus exposition
+/// body; `null` when the metric is absent. Test helper only.
+///
+/// Matches the name as a whole token, so asking for
+/// `mem3_memstore_cells` does not answer with the value of
+/// `mem3_memstore_cells_by_source`, and skips `# HELP` / `# TYPE`
+/// lines rather than parsing them as samples.
+fn metricValue(body: []const u8, name: []const u8) ?f64 {
+    var it = std.mem.splitScalar(u8, body, '\n');
+    while (it.next()) |line| {
+        if (line.len == 0 or line[0] == '#') continue;
+        if (!std.mem.startsWith(u8, line, name)) continue;
+        var rest = line[name.len..];
+        if (rest.len == 0) continue;
+        if (rest[0] != ' ' and rest[0] != '{') continue;
+        // Step over a label set if one is present.
+        if (rest[0] == '{') {
+            const close = std.mem.indexOfScalar(u8, rest, '}') orelse continue;
+            rest = rest[close + 1 ..];
+        }
+        return std.fmt.parseFloat(f64, std.mem.trim(u8, rest, " \r")) catch null;
+    }
+    return null;
+}
+
+test "Metrics: histogram buckets are half-open and land on the right index" {
+    // The classic off-by-one lives here: if the boundary lands in the
+    // bucket below, every percentile silently halves.
+    //
+    // Bucket i covers [2^i, 2^(i+1) - 1]. Both edges are asserted for
+    // several i, because the lower edge and the upper edge are the two
+    // places an off-by-one can hide.
+    try std.testing.expectEqual(@as(usize, 0), LatencyHistogram.bucketIndexFor(0));
+    try std.testing.expectEqual(@as(usize, 0), LatencyHistogram.bucketIndexFor(1));
+    try std.testing.expectEqual(@as(usize, 1), LatencyHistogram.bucketIndexFor(2)); // first µs of bucket 1
+    try std.testing.expectEqual(@as(usize, 1), LatencyHistogram.bucketIndexFor(3)); // last µs of bucket 1
+    try std.testing.expectEqual(@as(usize, 2), LatencyHistogram.bucketIndexFor(4)); // first µs of bucket 2
+    try std.testing.expectEqual(@as(usize, 6), LatencyHistogram.bucketIndexFor(100));
+    try std.testing.expectEqual(@as(usize, 6), LatencyHistogram.bucketIndexFor(127)); // last µs of bucket 6
+    try std.testing.expectEqual(@as(usize, 7), LatencyHistogram.bucketIndexFor(128)); // first µs of bucket 7
+
+    // Upper bounds, hand-computed: 2^(i+1) - 1.
+    try std.testing.expectEqual(@as(u64, 1), LatencyHistogram.bucketUpperBound(0));
+    try std.testing.expectEqual(@as(u64, 3), LatencyHistogram.bucketUpperBound(1));
+    try std.testing.expectEqual(@as(u64, 127), LatencyHistogram.bucketUpperBound(6));
+    try std.testing.expectEqual(@as(u64, 8388607), LatencyHistogram.bucketUpperBound(22)); // 16.8s-ish
+    // 10s = 1e7µs must be representable inside the histogram: it is
+    // bucket 23, which tops out at 33.5s.
+    try std.testing.expect(LatencyHistogram.bucketIndexFor(10_000_000) <= LATENCY_BUCKET_COUNT - 1);
+    try std.testing.expect(LatencyHistogram.bucketUpperBound(LatencyHistogram.bucketIndexFor(10_000_000)) >= 10_000_000);
+
+    // The top bucket saturates instead of overflowing: an absurd sample
+    // is clamped into it, and the bound is representable.
+    try std.testing.expectEqual(LATENCY_BUCKET_COUNT - 1, LatencyHistogram.bucketIndexFor(std.math.maxInt(u64)));
+    try std.testing.expectEqual(std.math.maxInt(u64), LatencyHistogram.bucketUpperBound(LATENCY_BUCKET_COUNT - 1));
+}
+
+test "Metrics: percentile returns the containing bucket's upper bound" {
+    // Hand-computed against the bucket layout, not a golden string.
+    //
+    // Samples → bucket: 1→0 [1], 2→1 [2,3], 3→1, 100→6 [64,127],
+    // 101→6, 5000→12 [4096,8191], 8000000→22 [4194304,8388607].
+    // n = 7.
+    //   p50: rank = ceil(7·0.50) = 4 → cumulative 1, 3, 5 at b6 → 127.
+    //   p95: rank = ceil(7·0.95) = 7 → only the last sample → 8388607.
+    //   p99: same, 8388607.
+    var h: LatencyHistogram = .{};
+    for ([_]u64{ 1, 2, 3, 100, 101, 5000, 8_000_000 }) |us| h.record(us);
+
+    try std.testing.expectEqual(@as(u64, 7), h.sampleCount());
+    try std.testing.expectEqual(@as(u64, 127), h.percentile(50, 100));
+    try std.testing.expectEqual(@as(u64, 8388607), h.percentile(95, 100));
+    try std.testing.expectEqual(@as(u64, 8388607), h.percentile(99, 100));
+
+    // Conservative means never under-reported: p50 of these samples is
+    // ~100µs, and what comes back is the containing bucket's ceiling.
+    try std.testing.expect(h.percentile(50, 100) >= 100);
+
+    // p0 (rank 1) is the first sample's bucket, i.e. the fast path is
+    // reported as its own bucket rather than collapsing to 0.
+    try std.testing.expectEqual(@as(u64, 1), h.percentile(0, 100));
+
+    // One sample: every percentile collapses onto that sample's bucket.
+    var one: LatencyHistogram = .{};
+    one.record(64); // first µs of bucket 6
+    try std.testing.expectEqual(@as(u64, 127), one.percentile(50, 100));
+    try std.testing.expectEqual(@as(u64, 127), one.percentile(99, 100));
+}
+
+test "Metrics: an empty histogram reports zero instead of dividing by zero" {
+    var h: LatencyHistogram = .{};
+    try std.testing.expectEqual(@as(u64, 0), h.sampleCount());
+    try std.testing.expectEqual(@as(u64, 0), h.percentile(50, 100));
+    try std.testing.expectEqual(@as(u64, 0), h.percentile(95, 100));
+    try std.testing.expectEqual(@as(u64, 0), h.percentile(99, 100));
+    // A zero denominator is the same failure from the other side.
+    try std.testing.expectEqual(@as(u64, 0), h.percentile(50, 0));
+}
+
+test "Metrics: /metrics publishes all six constitutional families" {
+    // Constitution Principle VII names six things the daemon must
+    // publish: request count, retrieval P50/P95/P99, memstore size,
+    // vector index depth, hyperedge count, forgetting rate. This
+    // asserts the names exist and each is documented — a metric
+    // without HELP/TYPE is half-published.
+    const alloc = std.testing.allocator;
+    var srv = try Server.init(alloc, "127.0.0.1", 0, null);
+    defer srv.deinit();
+
+    const resp = try srv.route("GET", "/metrics", "");
+    defer resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), resp.status);
+
+    const required = [_][]const u8{
+        "mem3_requests_total",
+        "mem3_retrieval_latency_p50_us",
+        "mem3_retrieval_latency_p95_us",
+        "mem3_retrieval_latency_p99_us",
+        "mem3_retrieval_latency_samples_total",
+        "mem3_memstore_cells",
+        "mem3_memstore_cells_by_source",
+        "mem3_hyperedges",
+        "mem3_vector_index_depth",
+        "mem3_forgetting_rate",
+    };
+    for (required) |name| {
+        try std.testing.expect(std.mem.indexOf(u8, resp.body, name) != null);
+        // HELP line present.
+        var help_buf: [160]u8 = undefined;
+        const help_line = std.fmt.bufPrint(&help_buf, "# HELP {s} ", .{name}) catch return error.NoSpaceLeft;
+        try std.testing.expect(std.mem.indexOf(u8, resp.body, help_line) != null);
+        // TYPE line present and correctly typed.
+        var type_buf: [160]u8 = undefined;
+        const type_line = std.fmt.bufPrint(&type_buf, "# TYPE {s} ", .{name}) catch return error.NoSpaceLeft;
+        const at = std.mem.indexOf(u8, resp.body, type_line) orelse return error.MissingMetricType;
+        const kind = std.mem.trim(u8, resp.body[at + type_line.len ..][0..7], "\r\n");
+        const is_counter = std.mem.eql(u8, kind, "counter");
+        // Convention: anything named `_total` is a counter, everything
+        // else is a gauge. A regression here would make a scraper
+        // alert on a rate() over a gauge that only moves while the
+        // process lives.
+        const should_be_counter = std.mem.endsWith(u8, name, "_total");
+        try std.testing.expectEqual(should_be_counter, is_counter);
+    }
+
+    // One line per MemorySource variant, not a hand-maintained subset.
+    for (std.enums.values(MemorySource)) |src| {
+        var label_buf: [128]u8 = undefined;
+        const line = std.fmt.bufPrint(&label_buf, "mem3_memstore_cells_by_source{{source=\"{s}\"}} ", .{@tagName(src)}) catch return error.NoSpaceLeft;
+        try std.testing.expect(std.mem.indexOf(u8, resp.body, line) != null);
+    }
+
+    // A fresh daemon has served no queries: the percentiles must read
+    // zero, not garbage from an empty histogram.
+    try std.testing.expectEqual(@as(f64, 0), metricValue(resp.body, "mem3_retrieval_latency_p50_us").?);
+    try std.testing.expectEqual(@as(f64, 0), metricValue(resp.body, "mem3_retrieval_latency_samples_total").?);
+    // No sweep has run, so the rate is a defined zero rather than a
+    // division by zero.
+    try std.testing.expectEqual(@as(f64, 0), metricValue(resp.body, "mem3_forgetting_rate").?);
+    // Empty HNSW index: -1, distinct from "a node on the base layer".
+    try std.testing.expectEqual(@as(f64, -1), metricValue(resp.body, "mem3_vector_index_depth").?);
+    try std.testing.expectEqual(@as(f64, 0), metricValue(resp.body, "mem3_vector_index_nodes").?);
+}
+
+test "Metrics: live gauges track the store, not a constant" {
+    // The failure mode this guards is a metric wired to a literal: it
+    // renders, it parses, it is always the same number. So capture the
+    // exposition, mutate the store through the documented HTTP route,
+    // capture again, and assert the numbers moved.
+    const alloc = std.testing.allocator;
+    var srv = try Server.init(alloc, "127.0.0.1", 0, null);
+    defer srv.deinit();
+
+    const before = try srv.route("GET", "/metrics", "");
+    defer before.deinit(alloc);
+    const cells_before = metricValue(before.body, "mem3_memstore_cells").?;
+    const form_before = metricValue(before.body, "mem3_memstore_cells_by_source{source=\"form\"}").?;
+    const nodes_before = metricValue(before.body, "mem3_vector_index_nodes").?;
+
+    // `handleAddMemcell` slices the body off at "\r\n\r\n"; with no
+    // header block it falls back to offset 0 and drops the first 4
+    // bytes, so a bare JSON body would arrive corrupted. Same trick as
+    // the maxHops query test.
+    var req: [256]u8 = undefined;
+    const post = std.fmt.bufPrint(&req, "\r\n\r\n{{\"source\":\"form\",\"episode\":\"metrics wiring probe\",\"facts\":\"\",\"goalId\":1,\"relevance\":0.5}}", .{}) catch unreachable;
+    const inserted = try srv.route("POST", "/api/memcells", post);
+    defer inserted.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 201), inserted.status);
+
+    const after = try srv.route("GET", "/metrics", "");
+    defer after.deinit(alloc);
+
+    try std.testing.expectEqual(cells_before + 1, metricValue(after.body, "mem3_memstore_cells").?);
+    try std.testing.expectEqual(form_before + 1, metricValue(after.body, "mem3_memstore_cells_by_source{source=\"form\"}").?);
+    // Other sources are untouched, so the total cannot be coming from a
+    // single hardcoded line.
+    try std.testing.expectEqual(@as(f64, 0), metricValue(after.body, "mem3_memstore_cells_by_source{source=\"spirit\"}").?);
+    // The insert also goes into the vector index.
+    try std.testing.expect(nodes_before + 1 <= metricValue(after.body, "mem3_vector_index_nodes").?);
+    try std.testing.expect(metricValue(after.body, "mem3_vector_index_depth").? >= 0);
+
+    // Hyperedge count is live too: an insert adds none, and adding one
+    // through the store moves the gauge.
+    try std.testing.expectEqual(@as(f64, 0), metricValue(after.body, "mem3_hyperedges").?);
+    const pair = try alloc.dupe(u64, &[_]u64{ 1, 2 });
+    defer alloc.free(pair);
+    _ = try srv.store.addHyperedge(.{
+        .id = 0,
+        .edge_type = .associative,
+        .nodes = pair,
+        .weight = 0.5,
+        .source_weights = .{ 1.0, 0.0, 0.0 },
+        .confidence = 1.0,
+        .created_at = 0,
+        .metadata = null,
+    });
+    const after_edge = try srv.route("GET", "/metrics", "");
+    defer after_edge.deinit(alloc);
+    try std.testing.expectEqual(@as(f64, 1), metricValue(after_edge.body, "mem3_hyperedges").?);
+}
+
+test "Metrics: forgetting counters accumulate and the rate follows them" {
+    const alloc = std.testing.allocator;
+    var srv = try Server.init(alloc, "127.0.0.1", 0, null);
+    defer srv.deinit();
+
+    srv.recordForgetSweep(.{ .fuzzied = 3, .kept = 7, .archived = 0 });
+    srv.recordForgetSweep(.{ .fuzzied = 5, .kept = 5, .archived = 0 });
+
+    const resp = try srv.route("GET", "/metrics", "");
+    defer resp.deinit(alloc);
+    try std.testing.expectEqual(@as(f64, 8), metricValue(resp.body, "mem3_forgotten_cells_total").?);
+    try std.testing.expectEqual(@as(f64, 20), metricValue(resp.body, "mem3_forgetting_swept_total").?);
+    try std.testing.expectEqual(@as(f64, 0.4), metricValue(resp.body, "mem3_forgetting_rate").?);
+}
+
+test "Metrics: query latency is recorded into the histogram" {
+    const alloc = std.testing.allocator;
+    var srv = try Server.init(alloc, "127.0.0.1", 0, null);
+    defer srv.deinit();
+
+    _ = try srv.store.addRaw(.matter, "latency probe corpus entry about shipbuilding", "", 0, 0.0);
+
+    var req: [256]u8 = undefined;
+    const body = std.fmt.bufPrint(&req, "\r\n\r\n{{\"text\":\"shipbuilding\",\"maxHops\":0}}", .{}) catch unreachable;
+    const resp = try srv.route("POST", "/api/query", body);
+    defer resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), resp.status);
+
+    // The histogram saw exactly the one query. Zero queries before
+    // this is what makes the count meaningful rather than incidental.
+    try std.testing.expectEqual(@as(u64, 1), srv.metrics.latency.sampleCount());
+    try std.testing.expect(srv.metrics.latency.percentile(99, 100) > 0);
+}
+
+// =============================================================================
+// Scheduled forgetting — Constitution Principle III, actually running
+// =============================================================================
+
+/// Seed `n` cells whose existence contribution is below
+/// `forgetting_threshold` (0.1), so the very first sweep drops them.
+///
+/// The contribution is `importance * exp(-decay_rate * age_days)`; with a
+/// brand-new cell the decay term is 1.0, so setting importance is enough
+/// and the test does not have to backdate anything.
+fn seedForgettable(srv: *Server, n: usize) !void {
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        var buf: [64]u8 = undefined;
+        const episode = try std.fmt.bufPrint(&buf, "ephemeral observation {d}", .{i});
+        const id = try srv.store.addRaw(.matter, episode, "", 1, 0.1);
+        srv.store.getCell(id).?.metadata.importance_score = 0.001;
+    }
+}
+
+/// Seed `n` cells at the encoder's default importance (above 0.3), which
+/// the existence-gain rule keeps. These are the cells a sweep must NOT
+/// touch.
+fn seedDurable(srv: *Server, n: usize) !void {
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        var buf: [64]u8 = undefined;
+        const episode = try std.fmt.bufPrint(&buf, "durable observation {d}", .{i});
+        _ = try srv.store.addRaw(.form, episode, "", 1, 0.5);
+    }
+}
+
+test "Server: the scheduled sweep forgets, and mem3_forgotten_cells_total moves" {
+    // This is the test that was impossible before the daemon had a call
+    // site for `store.forget`: the three forgetting metrics were
+    // published, HELP-documented and structurally pinned at zero for the
+    // whole life of the process. A metric that can never be non-zero is
+    // worse than an absent one — it reads as a healthy memory system.
+    const alloc = std.testing.allocator;
+    var srv = try Server.init(alloc, "127.0.0.1", 0, null);
+    defer srv.deinit();
+
+    try seedForgettable(srv, 3);
+    try seedDurable(srv, 2);
+    try std.testing.expectEqual(@as(usize, 5), srv.store.cellCount());
+
+    // Forget interval is its own knob, independent of the maintenance
+    // cadence — here both are 1s only because the test wants both to fire
+    // quickly.
+    srv.setForgetSchedule(1, false);
+    try srv.startMaintenance(1);
+
+    var waited_ms: u32 = 0;
+    while (waited_ms < 6000 and srv.metrics.forgotten_cells_total.load(.monotonic) == 0) : (waited_ms += 10) {
+        sleepMs(10);
+    }
+
+    const forgotten = srv.metrics.forgotten_cells_total.load(.monotonic);
+    const swept = srv.metrics.forgetting_swept_total.load(.monotonic);
+    // 3 exactly: the scheduled sweep dropped the three qualifying cells.
+    // Later sweeps see only the two durable cells and can add nothing, so
+    // this stays exact however long the test takes to notice.
+    try std.testing.expectEqual(@as(u64, 3), forgotten);
+    try std.testing.expect(swept >= 5);
+    try std.testing.expectEqual(@as(usize, 2), srv.store.cellCount());
+
+    // And the published rate agrees with the published counters.
+    const resp = try srv.route("GET", "/metrics", "");
+    defer resp.deinit(alloc);
+    const rate = metricValue(resp.body, "mem3_forgetting_rate").?;
+    const pub_forgotten = metricValue(resp.body, "mem3_forgotten_cells_total").?;
+    const pub_swept = metricValue(resp.body, "mem3_forgetting_swept_total").?;
+    try std.testing.expectEqual(@as(f64, @floatFromInt(forgotten)), pub_forgotten);
+    try std.testing.expectApproxEqAbs(pub_forgotten / pub_swept, rate, 1e-6);
+    try std.testing.expect(rate > 0);
+}
+
+test "Server: forgetting rate is cumulative forgotten over cumulative swept" {
+    // The definition, pinned against the existing render(): the rate is a
+    // ratio over everything since boot, not a per-sweep rate and not a
+    // per-second rate.
+    const alloc = std.testing.allocator;
+    var srv = try Server.init(alloc, "127.0.0.1", 0, null);
+    defer srv.deinit();
+
+    try seedForgettable(srv, 4);
+    try seedDurable(srv, 1);
+
+    // Sweep 1: 4 of 5 examined cells drop.
+    const first = try srv.runForgetSweep(false);
+    try std.testing.expectEqual(@as(usize, 4), first.fuzzied);
+    try std.testing.expectEqual(@as(usize, 1), first.kept);
+
+    // Sweep 2: only the durable cell is left, so it is examined and kept.
+    const second = try srv.runForgetSweep(false);
+    try std.testing.expectEqual(@as(usize, 0), second.fuzzied);
+    try std.testing.expectEqual(@as(usize, 1), second.kept);
+
+    const resp = try srv.route("GET", "/metrics", "");
+    defer resp.deinit(alloc);
+    // 4 forgotten, (4 + 5) examined across the two sweeps.
+    try std.testing.expectEqual(@as(f64, 4), metricValue(resp.body, "mem3_forgotten_cells_total").?);
+    try std.testing.expectEqual(@as(f64, 6), metricValue(resp.body, "mem3_forgetting_swept_total").?);
+    // 4/6, not 4/5 (last sweep only) and not 0.8 — a ratio that silently
+    // changed denominator would still look plausible in a dashboard.
+    try std.testing.expectApproxEqAbs(@as(f64, 4) / @as(f64, 6), metricValue(resp.body, "mem3_forgetting_rate").?, 1e-6);
+}
+
+test "Server: a sweep over a fresh store forgets nothing" {
+    // Off-by-one guard on the threshold. A sweep that fires one interval
+    // too early, or compares with `<=` instead of `<`, wipes a brand-new
+    // corpus — and the daemon now does this on a schedule with nobody
+    // watching. A default-importance cell scores ~0.5 against a
+    // threshold of 0.1 and must survive.
+    const alloc = std.testing.allocator;
+    var srv = try Server.init(alloc, "127.0.0.1", 0, null);
+    defer srv.deinit();
+
+    // A brand-new daemon has an empty corpus: a zero sweep, and the
+    // counters stay at zero rather than reporting a ratio of nothing.
+    const empty = try srv.runForgetSweep(false);
+    try std.testing.expectEqual(@as(usize, 0), empty.fuzzied);
+    try std.testing.expectEqual(@as(usize, 0), empty.kept);
+    try std.testing.expectEqual(@as(u64, 0), srv.metrics.forgotten_cells_total.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 0), srv.metrics.forgetting_swept_total.load(.monotonic));
+
+    try seedDurable(srv, 1);
+    const before = srv.store.cellCount();
+
+    const res = try srv.runForgetSweep(false);
+    try std.testing.expectEqual(@as(usize, 0), res.fuzzied);
+    try std.testing.expectEqual(@as(usize, 1), res.kept);
+    try std.testing.expectEqual(before, srv.store.cellCount());
+
+    // Examined but not forgotten: swept moves, rate stays zero.
+    const resp = try srv.route("GET", "/metrics", "");
+    defer resp.deinit(alloc);
+    try std.testing.expectEqual(@as(f64, 0), metricValue(resp.body, "mem3_forgotten_cells_total").?);
+    try std.testing.expectEqual(@as(f64, 1), metricValue(resp.body, "mem3_forgetting_swept_total").?);
+    try std.testing.expectEqual(@as(f64, 0), metricValue(resp.body, "mem3_forgetting_rate").?);
+
+    // A second sweep over what is left is a no-op: nothing new qualifies, so
+    // no cell is deleted and no cell is spuriously swept either.
+    _ = try srv.runForgetSweep(false);
+    const res2 = try srv.runForgetSweep(false);
+    try std.testing.expectEqual(@as(usize, 0), res2.fuzzied);
+    try std.testing.expectEqual(@as(usize, 1), res2.kept);
+    try std.testing.expectEqual(@as(usize, 1), srv.store.cellCount());
+}
+
+test "Server: a dry run previews the sweep and changes nothing" {
+    const alloc = std.testing.allocator;
+    var srv = try Server.init(alloc, "127.0.0.1", 0, null);
+    defer srv.deinit();
+
+    try seedForgettable(srv, 2);
+    try seedDurable(srv, 1);
+    const before = srv.store.cellCount();
+
+    // In-process preview.
+    const preview = try srv.runForgetSweep(true);
+    try std.testing.expectEqual(@as(usize, 2), preview.fuzzied);
+    try std.testing.expectEqual(before, srv.store.cellCount());
+    try std.testing.expectEqual(@as(u64, 0), srv.metrics.forgotten_cells_total.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 0), srv.metrics.forgetting_swept_total.load(.monotonic));
+
+    // Same through HTTP, with no body at all: preview is the default,
+    // because an unauthenticated POST that deletes is not something to
+    // infer from silence.
+    const http_preview = try srv.route("POST", "/api/forget", "");
+    defer http_preview.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), http_preview.status);
+    try std.testing.expect(std.mem.indexOf(u8, http_preview.body, "\"dry_run\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, http_preview.body, "\"fuzzied\":2") != null);
+    try std.testing.expectEqual(before, srv.store.cellCount());
+    try std.testing.expectEqual(@as(u64, 0), srv.metrics.forgotten_cells_total.load(.monotonic));
+
+    // The destructive call has to be written down explicitly.
+    const live = try srv.route("POST", "/api/forget", "\r\n\r\n{\"dry_run\":false}");
+    defer live.deinit(alloc);
+    try std.testing.expect(std.mem.indexOf(u8, live.body, "\"dry_run\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, live.body, "\"fuzzied\":2") != null);
+    try std.testing.expectEqual(@as(usize, 1), srv.store.cellCount());
+
+    // Counted exactly once, by the one real sweep: the two previews above
+    // contributed nothing to either counter.
+    try std.testing.expectEqual(@as(u64, 2), srv.metrics.forgotten_cells_total.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 3), srv.metrics.forgetting_swept_total.load(.monotonic));
+}
+
+test "Server: deinit joins the thread with forgetting enabled" {
+    // A thread that outlives its store is a use-after-free that happens to
+    // work until it doesn't, and the sweep makes the window wide: it holds
+    // `store_mutex` while walking every cell.
+    const alloc = std.testing.allocator;
+    var srv = try Server.init(alloc, "127.0.0.1", 0, null);
+    // From here on the server is owned by this test and MUST be torn down on
+    // every exit path. An early `return` between here and the explicit
+    // `deinit` would leave the maintenance thread running against a store
+    // nothing will ever free — which does not fail this test, it segfaults
+    // whichever test runs next. (Observed, not theorised: this test
+    // asserted before it cleaned up, and a failing assertion cascaded into
+    // a segfault one test later.)
+    var teardown_pending = true;
+    errdefer if (teardown_pending) srv.deinit();
+
+    try seedForgettable(srv, 2);
+    srv.setForgetSchedule(1, false);
+    try srv.startMaintenance(1);
+
+    var waited_ms: u32 = 0;
+    while (waited_ms < 6000 and srv.metrics.forgotten_cells_total.load(.monotonic) == 0) : (waited_ms += 10) {
+        sleepMs(10);
+    }
+    const moved = srv.metrics.forgotten_cells_total.load(.monotonic);
+
+    // Joins, then frees the store. Any leak or double free here is the
+    // testing allocator's job to report.
+    teardown_pending = false;
+    srv.deinit();
+
+    // Asserted after the teardown so a regression reports itself instead of
+    // poisoning the rest of the binary.
+    try std.testing.expect(moved > 0);
+}
+
+test "Server: a scheduled dry run forgets nothing" {
+    // `mem3 serve --dry-run`: the daemon reports what it would drop and
+    // drops nothing, on the schedule, unattended.
+    const alloc = std.testing.allocator;
+    var srv = try Server.init(alloc, "127.0.0.1", 0, null);
+    defer srv.deinit();
+
+    try seedForgettable(srv, 2);
+    try seedDurable(srv, 1);
+    const before = srv.store.cellCount();
+
+    srv.setForgetSchedule(1, true);
+    try srv.startMaintenance(1);
+
+    // Wait for at least two sweeps to have been due.
+    var waited_ms: u32 = 0;
+    while (waited_ms < 4000 and srv.metrics.maintenance_passes.load(.monotonic) < 3) : (waited_ms += 10) {
+        sleepMs(10);
+    }
+    try std.testing.expectEqual(before, srv.store.cellCount());
+    try std.testing.expectEqual(@as(u64, 0), srv.metrics.forgotten_cells_total.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 0), srv.metrics.forgetting_swept_total.load(.monotonic));
+}
+
+// =============================================================================
+// Daemon forgetting flags
+// =============================================================================
+//
+// The CLI parser tests live in this file rather than next to the flag they
+// test. `src/main.zig` names `server/http_server.zig` directly in its
+// comptime import block, so tests here are collected by `zig build test`;
+// `cli.zig` and `cli_commands/serve.zig` are not named there, and Zig
+// registers `test` blocks only for files named directly in the root's
+// import graph. A parser test in either of those files compiles, looks
+// responsible, and never runs — the exact trap documented at
+// `src/main.zig`'s import block. The proper long-term home is
+// `tests/unit/cli.zig`, which needs a build.zig module and is not this
+// file's to change.
+
+test "cli: daemon forgetting is on by default, hourly" {
+    // The default is the whole point. The daemon had no call site for
+    // `store.forget`, so every forgetting metric was pinned at zero for the
+    // life of the process; defaulting this to "off" would preserve that bug
+    // permanently and make it look like a deliberate configuration.
+    const alloc = std.testing.allocator;
+    var p = try cli.parseSlice(alloc, &[_][]const u8{"serve"});
+    defer p.deinit(alloc);
+    try std.testing.expectEqual(cli.Subcommand.serve, p.cmd);
+    try std.testing.expectEqual(@as(u32, 3600), p.forget_interval_sec);
+    try std.testing.expectEqual(DEFAULT_FORGET_INTERVAL_SEC, p.forget_interval_sec);
+    try std.testing.expect(!p.dry_run);
+}
+
+test "cli: --forget-interval=0 opts out without touching maintenance" {
+    const alloc = std.testing.allocator;
+    {
+        var p = try cli.parseSlice(alloc, &[_][]const u8{ "serve", "--forget-interval=0" });
+        defer p.deinit(alloc);
+        try std.testing.expectEqual(@as(u32, 0), p.forget_interval_sec);
+        try std.testing.expectEqual(@as(u32, 60), p.maint_interval_sec);
+    }
+    // Space form resolves to the same field.
+    {
+        var p = try cli.parseSlice(alloc, &[_][]const u8{ "serve", "--forget-interval", "900" });
+        defer p.deinit(alloc);
+        try std.testing.expectEqual(@as(u32, 900), p.forget_interval_sec);
+    }
+    // A bad value is an error, never a silent fallback to the default.
+    {
+        const bad = cli.parseSlice(alloc, &[_][]const u8{ "serve", "--forget-interval=abc" });
+        if (bad) |parsed| {
+            var leaked = parsed;
+            defer leaked.deinit(alloc);
+            return error.ExpectedInvalidFlagValue;
+        } else |err| {
+            try std.testing.expectEqual(@as(anyerror, error.InvalidFlagValue), err);
+        }
+    }
+}
+
+test "cli: the forget cadence does not follow --maint-interval" {
+    // The failure this pins: turning maintenance down to 1s must not
+    // silently produce a 1s forgetting sweep, which walks the whole corpus
+    // under the store lock and deletes freshly seeded cells mid-assertion.
+    const alloc = std.testing.allocator;
+    {
+        var p = try cli.parseSlice(alloc, &[_][]const u8{ "serve", "--maint-interval=1", "--forget-interval=3600" });
+        defer p.deinit(alloc);
+        try std.testing.expectEqual(@as(u32, 1), p.maint_interval_sec);
+        try std.testing.expectEqual(@as(u32, 3600), p.forget_interval_sec);
+    }
+    // `--maint-interval=0` disables the one background thread, which stops
+    // the sweep too. The forget field keeps its own value — it is not
+    // dragged to 0 — and `--help` says the sweep stops with the thread.
+    {
+        var p = try cli.parseSlice(alloc, &[_][]const u8{"serve", "--maint-interval=0"});
+        defer p.deinit(alloc);
+        try std.testing.expectEqual(@as(u32, 0), p.maint_interval_sec);
+        try std.testing.expectEqual(@as(u32, 3600), p.forget_interval_sec);
+    }
+    // Neither flag inverts the other.
+    {
+        var p = try cli.parseSlice(alloc, &[_][]const u8{"serve", "--forget-interval=0", "--maint-interval=5"});
+        defer p.deinit(alloc);
+        try std.testing.expectEqual(@as(u32, 0), p.forget_interval_sec);
+        try std.testing.expectEqual(@as(u32, 5), p.maint_interval_sec);
+    }
+}
+
+test "cli: --dry-run makes daemon forgetting a preview" {
+    const alloc = std.testing.allocator;
+    var p = try cli.parseSlice(alloc, &[_][]const u8{ "serve", "--dry-run" });
+    defer p.deinit(alloc);
+    try std.testing.expect(p.dry_run);
+    // The flag is orthogonal: it does not change the cadence.
+    try std.testing.expectEqual(@as(u32, 3600), p.forget_interval_sec);
+}
+
+test "cli: --forget-interval is documented in help" {
+    // An undocumented default-on flag that deletes memories is a trap with
+    // no off switch on paper.
+    try std.testing.expect(std.mem.indexOf(u8, cli.HELP_TEXT, "--forget-interval") != null);
+}
+
+test "Server: /api/forget does not re-enter the store lock it is already holding" {
+    // Regression guard for a real hang, found by running the daemon rather
+    // than by a test. `handleConn` takes `store_mutex` around `route`, so a
+    // handler that takes it again self-deadlocks on a plain pthread mutex:
+    // the first `POST /api/forget` froze the process with every subsequent
+    // request queued behind it. Every other in-process test here calls
+    // `route` directly and therefore never holds the lock — which is
+    // exactly why they all passed while the daemon hung.
+    //
+    // So this one holds the lock the way the accept loop does and calls the
+    // handler from another thread. Bounded wait rather than a bare call: if
+    // the bug ever comes back the test must FAIL, not hang the runner.
+    const alloc = std.testing.allocator;
+    var srv = try Server.init(alloc, "127.0.0.1", 0, null);
+    defer srv.deinit();
+
+    try seedForgettable(srv, 2);
+    try seedDurable(srv, 1);
+
+    const Finished = struct {
+        done: std.atomic.Value(bool) = .init(false),
+        body: [256]u8 = undefined,
+        body_len: usize = 0,
+
+        fn call(s: *Server, target: *@This()) void {
+            const resp = s.route("POST", "/api/forget", "\r\n\r\n{\"dry_run\":false}") catch {
+                target.done.store(true, .release);
+                return;
+            };
+            defer resp.deinit(s.alloc);
+            @memcpy(target.body[0..resp.body.len], resp.body);
+            target.body_len = resp.body.len;
+            target.done.store(true, .release);
+        }
+    };
+    var finished = Finished{};
+    srv.store_mutex.lock();
+    const t = try std.Thread.spawn(.{}, Finished.call, .{ srv, &finished });
+
+    var waited_ms: u32 = 0;
+    while (waited_ms < 3000 and !finished.done.load(.acquire)) : (waited_ms += 10) {
+        sleepMs(10);
+    }
+    const completed = finished.done.load(.acquire);
+    srv.store_mutex.unlock();
+    t.join();
+
+    if (!completed) return error.ForgetHandlerDeadlockedOnStoreLock;
+    try std.testing.expect(std.mem.indexOf(u8, finished.body[0..finished.body_len], "\"fuzzied\":2") != null);
+    // The sweep still happened, under the lock the accept loop already held.
+    try std.testing.expectEqual(@as(u64, 2), srv.metrics.forgotten_cells_total.load(.monotonic));
 }

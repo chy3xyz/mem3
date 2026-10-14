@@ -153,24 +153,6 @@ const Params = struct {
 // Small POSIX helpers (Zig 0.17 removed most of the std.fs conveniences)
 // ============================================================================
 
-fn openZ(alloc: Allocator, path: []const u8, oflag: std.c.O, mode: std.c.mode_t) ?std.c.fd_t {
-    const z = std.fmt.allocPrintSentinel(alloc, "{s}\x00", .{path}, 0) catch return null;
-    defer alloc.free(z);
-    // MUST test the return value explicitly. `std.c.open` yields a plain
-    // c_int, and returning it as `?fd_t` under Zig 0.17 does NOT null-ify a
-    // negative result — measured: opening a missing file returned the *value*
-    // -1, not null. So an earlier `orelse { exit }` here was dead code: a
-    // failed open fell through with fd = -1, every subsequent write to it
-    // failed, and the old silent `break` in writeAll swallowed that, letting
-    // the harness run to completion having written nothing at all.
-    const rc = std.c.open(z.ptr, oflag, mode);
-    if (rc < 0) return null;
-    return rc;
-}
-
-fn closeFd(fd: std.c.fd_t) void {
-    _ = std.c.close(fd);
-}
 
 /// Write every byte, or fail.
 ///
@@ -197,9 +179,26 @@ fn writeAll(fd: std.c.fd_t, bytes: []const u8) error{WriteFailed}!void {
 
 /// True if `path` can be opened for reading. Used as an existence probe
 /// without depending on a stat wrapper this codebase may not target.
-fn fileExists(alloc: Allocator, path: []const u8) bool {
-    const fd = openZ(alloc, path, .{ .ACCMODE = .RDONLY }, 0) orelse return false;
-    closeFd(fd);
+/// Open for writing, truncating any existing file.
+///
+/// These two functions are all that remains of this example's private copy
+/// of the POSIX file primitives. They are thin delegates onto
+/// `src/platform/fs.zig`, which is what makes the example cross-compile:
+/// the layer's `OpenMode` is identical on every target, whereas a
+/// `std.c.O` literal has a different shape per platform.
+fn openOut(path: []const u8) ?mem3.platform.fs.Fd {
+    const z = mem3.platform.fs.SentinelBuffer.init(path);
+    return mem3.platform.fs.open(z.ptr(), .{ .access = .write_only, .create = .truncate }) catch null;
+}
+
+fn closeFd(fd: mem3.platform.fs.Fd) void {
+    mem3.platform.fs.close(fd);
+}
+
+fn fileExists(path: []const u8) bool {
+    const z = mem3.platform.fs.SentinelBuffer.init(path);
+    const probe = mem3.platform.fs.open(z.ptr(), .{ .access = .read_only }) catch return false;
+    mem3.platform.fs.close(probe);
     return true;
 }
 
@@ -216,33 +215,32 @@ fn rssKb() u64 {
     };
 }
 
-fn fileSizeKb(alloc: Allocator, path: []const u8) u64 {
-    var st: std.c.Stat = undefined;
-    const z = std.fmt.allocPrintSentinel(alloc, "{s}\x00", .{path}, 0) catch return 0;
-    defer alloc.free(z);
-    if (std.c.stat(z.ptr, &st) != 0) return 0;
-    const bytes: u64 = @intCast(@max(0, st.size));
+fn fileSizeKb(path: []const u8) u64 {
+    // No `std.c.Stat` — `void` on Linux and Windows in Zig 0.17. Seek to
+    // the end instead; `sizeOf` restores the read position afterwards.
+    const z = mem3.platform.fs.SentinelBuffer.init(path);
+    const fd = mem3.platform.fs.open(z.ptr(), .{ .access = .read_only }) catch return 0;
+    defer mem3.platform.fs.close(fd);
+    const bytes = mem3.platform.fs.sizeOf(fd) catch return 0;
     return bytes / 1024;
 }
 
 const ClockFn = struct {
     fn nowNs() i128 {
-        var ts: std.c.timespec = .{ .sec = 0, .nsec = 0 };
-        _ = std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &ts);
-        return @as(i128, ts.sec) * 1_000_000_000 + @as(i128, ts.nsec);
+        return mem3.platform.clock.monotonicNs();
     }
 };
 
 fn out(comptime fmt: []const u8, args: anytype) void {
     var buf: [4096]u8 = undefined;
     const s = std.fmt.bufPrint(&buf, fmt, args) catch return;
-    _ = std.c.write(std.c.STDOUT_FILENO, s.ptr, s.len);
+    _ = mem3.platform.stdio.writeOut(s);
 }
 
 fn err(comptime fmt: []const u8, args: anytype) void {
     var buf: [2048]u8 = undefined;
     const s = std.fmt.bufPrint(&buf, fmt, args) catch return;
-    _ = std.c.write(std.c.STDERR_FILENO, s.ptr, s.len);
+    _ = mem3.platform.stdio.writeErr(s);
 }
 
 // ============================================================================
@@ -459,17 +457,12 @@ pub fn main(init: std.process.Init.Minimal) !void {
     });
     defer store.deinit();
 
-    if (!p.append and !p.force and fileExists(alloc, p.out_path)) {
+    if (!p.append and !p.force and fileExists(p.out_path)) {
         err("longrun: {s} already exists — pass --append to extend it, --force to overwrite, or --out=PATH\n", .{p.out_path});
         std.process.exit(2);
     }
 
-    const out_fd = openZ(alloc, p.out_path, .{
-        .ACCMODE = .WRONLY,
-        .CREAT = true,
-        .APPEND = p.append,
-        .TRUNC = !p.append,
-    }, 0o644) orelse {
+    const out_fd = openOut(p.out_path) orelse {
         err("longrun: cannot open {s}\n", .{p.out_path});
         std.process.exit(2);
     };
@@ -618,8 +611,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
             defer alloc.free(wal_path);
             const snap_path = try std.fmt.allocPrint(alloc, "{s}/snapshot.bin", .{p.data_dir});
             defer alloc.free(snap_path);
-            wal_kb = fileSizeKb(alloc, wal_path);
-            snap_kb = fileSizeKb(alloc, snap_path);
+            wal_kb = fileSizeKb(wal_path);
+            snap_kb = fileSizeKb(snap_path);
         }
         const t_ms: u64 = @intCast(@max(0, mem3.utils.time.nowMs() - start_ms));
 

@@ -10,6 +10,7 @@ pub fn build(b: *std.Build) void {
     // Main executable: `mem3`
     // =========================================================================
     const mem3_module = b.createModule(.{
+        .link_libc = true,
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
@@ -49,6 +50,7 @@ pub fn build(b: *std.Build) void {
     // Static library (for C ABI, future use)
     // =========================================================================
     const lib_module = b.createModule(.{
+        .link_libc = true,
         .root_source_file = b.path("src/lib.zig"),
         .target = target,
         .optimize = optimize,
@@ -62,11 +64,13 @@ pub fn build(b: *std.Build) void {
 
     // Expose modules for example/test imports.
     const ghw_module = b.createModule(.{
+        .link_libc = true,
         .root_source_file = b.path("src/ghw/mod.zig"),
         .target = target,
         .optimize = optimize,
     });
     const memory_module = b.createModule(.{
+        .link_libc = true,
         .root_source_file = b.path("src/memory/mod.zig"),
         .target = target,
         .optimize = optimize,
@@ -76,6 +80,7 @@ pub fn build(b: *std.Build) void {
 
     // The lib.zig-based "libmem3" module that examples can import.
     const libmem3_module = b.createModule(.{
+        .link_libc = true,
         .root_source_file = b.path("src/lib.zig"),
         .target = target,
         .optimize = optimize,
@@ -91,6 +96,7 @@ pub fn build(b: *std.Build) void {
     // Example: `zig build example-notebook`
     // =========================================================================
     const notebook_module = b.createModule(.{
+        .link_libc = true,
         .root_source_file = b.path("examples/notebook.zig"),
         .target = target,
         .optimize = optimize,
@@ -111,6 +117,7 @@ pub fn build(b: *std.Build) void {
     // Example: `zig build example-loadtest`
     // =========================================================================
     const loadtest_module = b.createModule(.{
+        .link_libc = true,
         .root_source_file = b.path("examples/loadtest.zig"),
         .target = target,
         .optimize = .ReleaseFast,
@@ -135,6 +142,7 @@ pub fn build(b: *std.Build) void {
     //   ./zig-out/bin/mem3-longrun --duration-sec=86400 --data-dir=/tmp/mem3_lr
     // =========================================================================
     const longrun_module = b.createModule(.{
+        .link_libc = true,
         .root_source_file = b.path("examples/longrun.zig"),
         .target = target,
         .optimize = .ReleaseFast,
@@ -159,6 +167,7 @@ pub fn build(b: *std.Build) void {
     // oracle corpus the unit tests assert against.
     // =========================================================================
     const hnsw_recall_module = b.createModule(.{
+        .link_libc = true,
         .root_source_file = b.path("examples/hnsw_recall.zig"),
         .target = target,
         .optimize = .ReleaseFast,
@@ -186,6 +195,7 @@ pub fn build(b: *std.Build) void {
     //   ./zig-out/bin/mem3-forgetting-eval --data-dir=/tmp/mem3_fe
     // =========================================================================
     const forgetting_eval_module = b.createModule(.{
+        .link_libc = true,
         .root_source_file = b.path("examples/forgetting_eval.zig"),
         .target = target,
         .optimize = .ReleaseFast,
@@ -216,6 +226,7 @@ fn addAllTests(
     //      integration/property tests in tests/ (catches correctness
     //      regressions in algorithms the Store itself doesn't run).
     const libmem3_module = b.createModule(.{
+        .link_libc = true,
         .root_source_file = b.path("src/lib.zig"),
         .target = target,
         .optimize = optimize,
@@ -223,6 +234,7 @@ fn addAllTests(
 
     const main_tests = b.addTest(.{
         .root_module = b.createModule(.{
+            .link_libc = true,
             .root_source_file = b.path("src/main.zig"),
             .target = target,
             .optimize = optimize,
@@ -233,6 +245,7 @@ fn addAllTests(
 
     const e2e_tests = b.addTest(.{
         .root_module = b.createModule(.{
+            .link_libc = true,
             .root_source_file = b.path("tests/main.zig"),
             .target = target,
             .optimize = optimize,
@@ -254,11 +267,13 @@ fn addBench(
     // CLI and the daemon run. Built optimised: an unoptimised bench would
     // report numbers nobody ships.
     const bench_lib = b.createModule(.{
+        .link_libc = true,
         .root_source_file = b.path("src/lib.zig"),
         .target = target,
         .optimize = .ReleaseFast,
     });
     const bench_module = b.createModule(.{
+        .link_libc = true,
         .root_source_file = b.path("bench/main.zig"),
         .target = target,
         .optimize = .ReleaseFast,
@@ -283,12 +298,14 @@ fn addConstitutionChecks(
     optimize: std.builtin.OptimizeMode,
 ) void {
     const mem3_module = b.createModule(.{
+        .link_libc = true,
         .root_source_file = b.path("src/lib.zig"),
         .target = target,
         .optimize = optimize,
     });
     const constitution_tests = b.addTest(.{
         .root_module = b.createModule(.{
+            .link_libc = true,
             .root_source_file = b.path("tests/constitution/main.zig"),
             .target = target,
             .optimize = optimize,

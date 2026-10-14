@@ -54,11 +54,20 @@ pub const Harness = struct {
 pub const HarnessRegistry = struct {
     alloc: Allocator,
     harnesses: std.AutoHashMap(u64, *Harness),
+    /// Goal id → the harness that realises it. The GHW traversal is
+    /// keyed by goal, so this is what keeps a store with N goals holding
+    /// exactly N harnesses no matter how many memories are encoded.
+    by_goal: std.AutoHashMap(u64, u64),
+    /// The reverse edge, so retrieval can walk Harness → Goal without
+    /// scanning every harness.
+    goal_of: std.AutoHashMap(u64, u64),
 
     pub fn init(alloc: Allocator) HarnessRegistry {
         return .{
             .alloc = alloc,
             .harnesses = std.AutoHashMap(u64, *Harness).init(alloc),
+            .by_goal = std.AutoHashMap(u64, u64).init(alloc),
+            .goal_of = std.AutoHashMap(u64, u64).init(alloc),
         };
     }
 
@@ -69,6 +78,54 @@ pub const HarnessRegistry = struct {
             self.alloc.destroy(entry.value_ptr.*);
         }
         self.harnesses.deinit();
+        self.by_goal.deinit();
+        self.goal_of.deinit();
+    }
+
+    /// Fetch a harness by id, or null.
+    pub fn get(self: *const HarnessRegistry, id: u64) ?*Harness {
+        return self.harnesses.get(id);
+    }
+
+    /// The harness bound to `goal_id`, registering one on first use.
+    ///
+    /// Idempotent by construction: encoding N memories for one goal
+    /// yields one harness, with `recordExecution` carrying the per-memory
+    /// evidence. That is what keeps the encode path O(1) in both time
+    /// and memory — a per-cell harness would grow the registry forever
+    /// and make `findBestForTask` a full scan on the hot path.
+    pub fn ensureForGoal(
+        self: *HarnessRegistry,
+        goal_id: u64,
+        name: []const u8,
+        description: []const u8,
+        capabilities: []const u8,
+        version: []const u8,
+        now_ms: i64,
+        next_id: *std.atomic.Value(u64),
+    ) errors.Error!u64 {
+        if (self.by_goal.get(goal_id)) |existing| return existing;
+        const id = try self.register(name, description, capabilities, version, now_ms, next_id);
+        // `getPtr` yields `**Harness`: a pointer to the map's value slot,
+        // which itself holds the `*Harness`. Deref twice to reach the
+        // struct. This was never compiled before — nothing in `src/`
+        // called into this file — so the one-deref version compiled as
+        // soon as the store's encode path called it.
+        errdefer _ = self.harnesses.remove(id);
+        try self.by_goal.put(goal_id, id);
+        errdefer _ = self.by_goal.remove(goal_id);
+        try self.goal_of.put(id, goal_id);
+        return id;
+    }
+
+    /// Which goal a harness realises, or null when it is not goal-bound.
+    pub fn goalOf(self: *const HarnessRegistry, harness_id: u64) ?u64 {
+        return self.goal_of.get(harness_id);
+    }
+
+    /// Which harness a goal is bound to, or null.
+    pub fn harnessForGoal(self: *const HarnessRegistry, goal_id: u64) ?u64 {
+        return self.by_goal.get(goal_id);
     }
 
     /// Register a new harness. Returns the assigned id.
@@ -104,9 +161,10 @@ pub const HarnessRegistry = struct {
         duration_ms: u64,
     ) errors.Error!void {
         const h = self.harnesses.getPtr(id) orelse return errors.Error.GoalNotFound;
-        h.execution_count += 1;
-        if (success) h.success_count += 1;
-        h.total_duration_ms += duration_ms;
+        const harness: *Harness = h.*;
+        harness.execution_count += 1;
+        if (success) harness.success_count += 1;
+        harness.total_duration_ms += duration_ms;
     }
 
     /// Find the best harness for a task description. Naive keyword match on
@@ -201,4 +259,24 @@ test "HarnessRegistry: findBestForTask uses capabilities" {
     const best = reg.findBestForTask("I want to compile my zig project");
     try std.testing.expect(best != null);
     try std.testing.expectEqualStrings("compile", best.?.name);
+}
+
+test "HarnessRegistry: ensureForGoal binds one harness per goal" {
+    var reg = HarnessRegistry.init(std.testing.allocator);
+    defer reg.deinit();
+    var next: std.atomic.Value(u64) = .init(1);
+
+    const a = try reg.ensureForGoal(11, "compile", "d1", "compile;zig", "0", 0, &next);
+    const b = try reg.ensureForGoal(11, "compile", "d1", "compile;zig", "0", 0, &next);
+    const c = try reg.ensureForGoal(12, "deploy", "d2", "net;ship", "0", 0, &next);
+
+    try std.testing.expectEqual(a, b);
+    try std.testing.expect(a != c);
+    try std.testing.expectEqual(@as(usize, 2), reg.count());
+
+    // Both directions of the index agree, so retrieval can walk back up.
+    try std.testing.expectEqual(@as(u64, a), reg.harnessForGoal(11).?);
+    try std.testing.expectEqual(@as(u64, 11), reg.goalOf(a).?);
+    try std.testing.expectEqual(@as(u64, 12), reg.goalOf(c).?);
+    try std.testing.expectEqual(@as(?u64, null), reg.goalOf(9999));
 }

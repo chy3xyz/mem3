@@ -424,3 +424,82 @@ test "E2E: hyperedges survive a restart (hyperedge_add is WAL-journaled)" {
         try testing.expect(store.hyperedgeCount() >= 1);
     }
 }
+
+test "E2E: forgetting survives restart WITHOUT a snapshot (WAL-only path)" {
+    // The test above already covered "forget then restart", but it called
+    // `sync()` in between — which writes a snapshot of the post-sweep state
+    // and therefore masked the missing journal entirely. The forget sweep
+    // emitted no WAL record at all, so on the pure-WAL path the
+    // `memcell_insert` record replayed and every forgotten cell came back,
+    // while `mem3_forgotten_cells_total` still reported the sweep.
+    //
+    // This is that scenario, with no snapshot in the way.
+    const alloc = testing.allocator;
+    const data_dir = try makeDataDir(alloc, "forget_wal");
+    defer alloc.free(data_dir);
+
+    var fuzzed_id: u64 = 0;
+    {
+        wipeDataDir(data_dir);
+        var store = try mem3.Store.init(alloc, .{ .data_dir = data_dir });
+        defer store.deinit();
+
+        _ = try store.addRaw(.matter, "important", "u|knows|things", 1, 0.9);
+        _ = try store.addRaw(.matter, "ephemeral", "u|forgot|something", 1, 0.5);
+        fuzzed_id = try store.addRaw(.matter, "low-quality", "u|whispers|maybe", 1, 0.1);
+        if (store.getCell(fuzzed_id)) |c| c.metadata.importance_score = 0.001;
+
+        const result = try store.forget(false);
+        try testing.expect(result.fuzzied >= 1);
+
+        // `getCell` reads `cell_index`. `Lifecycle.forget` only removed the
+        // cell from the TriSourceManager, so the index kept handing back
+        // memories the system had just declared not worth keeping.
+        try testing.expect(store.getCell(fuzzed_id) == null);
+
+        // Deliberately NO sync() — no snapshot on disk.
+    }
+
+    {
+        var store = try mem3.Store.init(alloc, .{ .data_dir = data_dir });
+        defer store.deinit();
+
+        try testing.expect(store.getCell(fuzzed_id) == null);
+
+        const cells = try store.allCells(alloc);
+        defer alloc.free(cells);
+        for (cells) |c| {
+            try testing.expect(!std.mem.eql(u8, c.episode, "low-quality"));
+        }
+        var saw_important = false;
+        for (cells) |c| {
+            if (std.mem.eql(u8, c.episode, "important")) saw_important = true;
+        }
+        try testing.expect(saw_important);
+    }
+    wipeDataDir(data_dir);
+}
+
+test "E2E: a dry-run sweep changes nothing, including the index" {
+    const alloc = testing.allocator;
+    const data_dir = try makeDataDir(alloc, "forget_dry");
+    defer alloc.free(data_dir);
+    wipeDataDir(data_dir);
+
+    var store = try mem3.Store.init(alloc, .{ .data_dir = data_dir });
+    defer store.deinit();
+    defer wipeDataDir(data_dir);
+
+    const keep_id = try store.addRaw(.matter, "important", "u|knows|things", 1, 0.9);
+    const low_id = try store.addRaw(.matter, "low-quality", "u|whispers|maybe", 1, 0.1);
+    if (store.getCell(low_id)) |c| c.metadata.importance_score = 0.001;
+
+    const before = store.cellCount();
+    const result = try store.forget(true);
+    try testing.expect(result.fuzzied >= 1);
+
+    // A preview that actually deletes is worse than no preview at all.
+    try testing.expectEqual(before, store.cellCount());
+    try testing.expect(store.getCell(low_id) != null);
+    try testing.expect(store.getCell(keep_id) != null);
+}
