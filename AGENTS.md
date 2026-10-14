@@ -10,12 +10,12 @@
 |---|---|
 | Project | `mem3` = **TriSource-EverOS** |
 | Type | Memory operating system, single-binary CLI + HTTP daemon |
-| Language | Zig 0.17 (dev branch, ≥ 0.17.0-dev.3000) |
+| Language | Zig 0.17.0 (released). The 0.17 point releases disagree on `@typeInfo` payload shapes and `OptimizeMode` literal names, so this is pinned rather than "dev ≥ ...". `./scripts/verify.sh` prints the toolchain it actually used. |
 | Build | `zig build` → one binary, < 10MB, zero external runtime deps |
 | Theory | 三源合恰论 (物/象/性) + GHW 范式 (Goal/Harness/World) |
 | Spec-kit | Initialized; spec at `specs/001-trisource-everos-mvp/` |
 | Platforms | **macOS and Linux only** — Windows and WASM refused at compile time (see [Platforms](#platforms)) |
-| Status | **v0.1.0-alpha** (CLI + persistence + 276 tests + 12 constitution invariants, all measured). All 7 constitutional principles active. |
+| Status | **v0.1.0-alpha** (CLI + persistence + 300 tests + 12 constitution invariants, all measured). All 7 constitutional principles active. |
 
 ## Read Order for New Agents
 
@@ -123,8 +123,8 @@ tests/
 | `mem3 bench` | ✅ | Fast in-process smoke suite; the release gate is `zig build bench` |
 | `mem3 serve` | ✅ | HTTP daemon with /healthz /metrics /api/sync /api/memcells /api/memcells/:id |
 | Persistence | ✅ | WAL-first + snapshot. WAL truncated on sync. |
-| Tests | ✅ | 276: 193 (`src/main.zig`-rooted) + 83 (`tests/main.zig`-rooted), plus 12 constitution invariants as a separate gate, 0 leaks |
-| Binary | ✅ | 798,904 bytes `ReleaseFast` / 4,030,824 bytes Debug, only links libSystem |
+| Tests | ✅ | 300: 217 (`src/main.zig`-rooted) + 83 (`tests/main.zig`-rooted), plus 12 constitution invariants as a separate gate, 0 leaks |
+| Binary | ✅ | 798,904 bytes `ReleaseFast` / 4,092,632 bytes Debug, only links libSystem |
 | Toolchain | ✅ | Pinned via `.zigversion` (Zig 0.17.0) |
 | Platforms | ✅ | macOS + Linux (x86_64 and aarch64). Windows/WASM refused at compile time — see [Platforms](#platforms) |
 
@@ -141,9 +141,11 @@ tests/
   cell is written without it, so a foresight-only cell loses its spirit
   dimension across a restart.
 - Write throughput is ~5× short of the 10,000 cells/sec release target: 192
-  cells/sec Debug, 1,810 cells/sec ReleaseFast on a 600-cell in-memory corpus.
-  The cause is `hnsw.insert` (~1.06 ms/op amortised), not the WAL fsync
-  (~828 µs/record).
+  cells/sec ReleaseFast on the durable path (fsync per record), across four
+  `./scripts/verify.sh` runs: 2,779 / 3,028 / 3,800 / 3,898 cells/sec. Report
+  the range, not the best run. The cause is `hnsw.insert` (~899 µs/op), not the
+  WAL fsync (~1.2 ms/record), and it was measured by phase profile: ~55% of the
+  write pipeline is `hnsw.insert`, ~42% the embedder, under 3% the `Store`.
 - LongMemEval offline reimplementation: 0.646 on the core set, 0.000 padded,
   against a ≥80% target. `exhaustive_nn_hit_rate` is 0.604 and invariant across
   configurations, so `lexical_hash` — not the HNSW retrieval layer — is the
@@ -189,7 +191,7 @@ real gap, not a rounding error.
 
 | Metric | Target | Measured | |
 |---|---|---|---|
-| MemCell write throughput | ≥ 1K/sec MVP / 10K/sec release | 192/sec Debug, 1,810/sec ReleaseFast | **MISS** |
+| MemCell write throughput | ≥ 1K/sec MVP / 10K/sec release | 2,779–3,898/sec ReleaseFast, durable path | **MISS** |
 | Top-10 query P95 | < 50ms MVP / < 10ms release (100K corpus) | 0.624 ms p95 (600-cell corpus) | not comparable — wrong corpus size |
 | HNSW build 100K vectors | < 30s | not measured at 100K | **UNVERIFIED** |
 | 3-hop traversal | < 5ms (1K seeds) | 0.000 ms/seed | pass |
@@ -200,7 +202,7 @@ real gap, not a rounding error.
 | LongMemEval accuracy | ≥ 80% | 0.646 core / 0.000 padded (offline reimplementation) | **MISS** |
 
 The write-throughput miss is **HNSW insert**, not fsync: `hnsw.insert` is
-~1.06 ms/op amortised, above the ~828 µs WAL fsync and above the whole
+~899 µs/op, comparable to the ~1.2 ms WAL fsync and above the whole
 `store.addRaw_durable` pipeline. Group commit would not move it.
 
 The LongMemEval miss is **`lexical_hash`**, not retrieval:
@@ -258,7 +260,7 @@ The current spec-kit artifacts:
 ## Testing
 
 ```bash
-# All tests: 276 (193 src/main.zig-rooted + 83 tests/main.zig-rooted)
+# All tests: 300 (217 src/main.zig-rooted + 83 tests/main.zig-rooted)
 zig build test
 
 # Just the constitution invariants (12, separate root)
@@ -278,7 +280,7 @@ without re-executing**. When you need a count you can trust, drive the roots
 directly:
 
 ```bash
-zig test --dep mem3 -Mroot=src/main.zig  -Mmem3=src/lib.zig   # All 193 tests passed.
+zig test --dep mem3 -Mroot=src/main.zig  -Mmem3=src/lib.zig   # All 217 tests passed.
 zig test --dep mem3 -Mroot=tests/main.zig -Mmem3=src/lib.zig   # All 83 tests passed.
 zig test --dep mem3 -Mroot=tests/constitution/main.zig -Mmem3=src/lib.zig  # All 12 tests passed.
 ```

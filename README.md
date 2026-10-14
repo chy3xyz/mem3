@@ -45,8 +45,8 @@ zig build            # binaries land in zig-out/bin/
 
 `zig build` produces `mem3` (the CLI + daemon), `mem3-bench`, `mem3-longrun`,
 `mem3-hnsw-recall`, `mem3-forgetting-eval`, `notebook`, and `loadtest`. The
-default Debug build of `mem3` is **4,030,824 bytes** and `-Doptimize=ReleaseFast`
-is **798,904 bytes**; both link only `libSystem` (all measured on this tree,
+default Debug build of `mem3` is **4,092,632 bytes** and `-Doptimize=ReleaseFast`
+is **798,904 bytes**; both link only `libSystem` (both measured on this tree,
 Apple M1 Pro / arm64).
 
 Artifacts:
@@ -324,15 +324,21 @@ alongside the params and timestamp.
 | Benchmark | median | p95 |
 |---|---|---|
 | `hashing.combine` | 1.0 ns/op | 1.0 ns |
-| `hashing.xxh3_64bits` | 6.0 ns/op | 6.0 ns |
-| `encoder.encode` | 30.0 ns/op | 35.0 ns |
-| `time.formatIso8601` | 33.0 ns/op | 35.0 ns |
-| `serializer.roundtrip` | 25.4 µs | 26.7 µs |
-| `store.addRaw_memory` | 485.8 µs | 613.6 µs |
-| `store.addRaw_durable` | 576.6 µs | 658.1 µs |
-| `hnsw.insert` | 1.06 ms/op | 1.29 ms |
-| `hnsw.search` | 890.5 µs/op | 901.6 µs |
-| `wal.append_durable` | 828.0 µs/record | 969.0 µs |
+| `hashing.xxh3_64bits` | 6.0 ns/op | 18.0 ns |
+| `time.formatIso8601` | 33.0 ns/op | 69.0 ns |
+| `serializer.roundtrip` | 27.7 µs | 64.2 µs |
+| `encoder.encode` | 35.0 ns/op | 35.0 ns |
+| `hnsw.insert` | 899 µs/op | 1,166 µs |
+| `hnsw.search` | 748 µs/op | 1,161 µs |
+| `wal.append_durable` | 1,232 µs/record | 2,861 µs |
+| `store.addRaw_memory` | 239 µs/op | 323 µs |
+| `store.addRaw_durable` | 322 µs/op | 437 µs |
+
+**Read the median, distrust the p95.** On this machine p95 for the same binary
+and the same input varies by more than an order of magnitude between runs; only
+the median is reproducible to within a couple of percent. That is also why the
+constitutional benchmarks below report a worst window alongside the mean — a
+sustained writer has to keep up with the slow window, not the fast one.
 
 These are single-run figures on one machine, not regression gates. Re-run them
 before quoting.
@@ -362,7 +368,7 @@ Two caveats the benchmark states itself: `wal.append_durable` fsyncs on every
 record, which is what sets the write floor; and `hnsw.search` grows with the
 corpus, so do not quote it as graph-index performance.
 
-`hnsw.insert` at ~1.06 ms/op amortised is the dominant cost in the write path —
+`hnsw.insert` at ~899 µs/op is the dominant cost in the write path —
 larger than the WAL fsync, and larger than the whole `store.addRaw_durable`
 pipeline it sits inside. See [Known misses](#known-misses).
 
@@ -429,26 +435,40 @@ extends the file on the next run.
 ## Testing
 
 ```bash
-zig build test                # 276 tests (193 + 83), 0 leaks
+./scripts/verify.sh           # everything below, plus provenance and a not-verified list
+zig build test                # 300 tests (217 + 83)
 zig build check-constitution  # 12 constitution invariants
 zig build bench
 ```
 
-`zig build test` runs two binaries — one rooted at `src/main.zig` (transitively
-collects Store and CLI tests) and one at `tests/main.zig` (unit, integration and
-property tests under `tests/`). The counts above are what the two binaries
-actually report: `All 193 tests passed.` and `All 83 tests passed.`
-`zig build check-constitution` is a separate root, `tests/constitution/main.zig`,
-and reports `All 12 tests passed.`
+`zig build test` runs two binaries — one rooted at `src/main.zig` and one at
+`tests/main.zig` (unit, integration and property tests under `tests/`). The
+counts above are what the two binaries actually report: `217/217` and `83/83`,
+for `300/300 tests passed` overall.
+
+**Zig collects `test` blocks only from files named directly in a root source
+file's `comptime { _ = @import(...) }` block, exactly one level deep.** A file
+reached through `lib.zig` is compiled into the build and looks tested while its
+tests register with nobody. Nineteen files and 87 test blocks were sitting
+outside the gate that way, including everything in `ghw/goal_tree.zig` — the
+goal-poset invariants. Naming them surfaced three real defects on the spot (a
+logger that emitted malformed JSON, and two files that did not compile at all).
+If you add a `test` block, add the file to the root block too, and check it
+actually runs: break a call inside it and confirm `zig build test` goes red.
 
 Because `zig build test` re-runs are served from the build cache and report green
 without re-executing, drive the roots directly when you need a real count:
 
 ```bash
-zig test --dep mem3 -Mroot=src/main.zig  -Mmem3=src/lib.zig   # -> All 193 tests passed.
+zig test --dep mem3 -Mroot=src/main.zig  -Mmem3=src/lib.zig   # -> All 217 tests passed.
 zig test --dep mem3 -Mroot=tests/main.zig -Mmem3=src/lib.zig   # -> All 83 tests passed.
 zig test --dep mem3 -Mroot=tests/constitution/main.zig -Mmem3=src/lib.zig  # -> All 12 tests passed.
 ```
+
+Every test scratch path under `/tmp` is pid-scoped. That is not tidiness: a
+fixed path plus cleanup that only runs on completion means a run that dies
+part-way leaves a WAL or snapshot behind and the *next* run inherits it, so the
+same command gave different answers depending on what ran before it.
 
 ### Test-suite rules
 
@@ -491,7 +511,7 @@ Known and measured, not discovered after the fact:
   level 1: 34 nodes; level 2: 4 nodes), so the hierarchy is real but two levels
   deep, and recall has not saturated at the default `ef`. Say nothing about a
   large index.
-- **The WAL fsyncs on every record**, costing ~828 µs per durable append. There
+- **The WAL fsyncs on every record**, costing ~1.2 ms per durable append. There
   is no group commit.
 - **The daemon's HTTP stack is POSIX-only.** Raw `socket`/`bind`/`listen`/
   `accept` and a libc `pthread_mutex_t`; this is the stated reason Windows is
@@ -514,13 +534,23 @@ Known and measured, not discovered after the fact:
 Two constitutional targets are not met. They are stated here because a document
 that hides them is worse than one that publishes them.
 
-**Write throughput is ~5× short of target.** The release target is 10,000
-cells/sec. Measured `memcell_write_throughput` on a 600-cell in-memory corpus:
-**192.1 cells/sec** in the default Debug build, **1,810.5 cells/sec**
-`ReleaseFast`. The cause is **HNSW insert, not fsync**: `hnsw.insert` costs
-~1.06 ms/op amortised, which is larger than the ~828 µs WAL fsync and larger than
-the whole `store.addRaw_durable` pipeline. Group commit would not move this
-number; a cheaper insert path would.
+**Write throughput is ~3× short of target.** The release target is 10,000
+cells/sec sustained. Measured on the durable path (every write encoded,
+WAL-journalled with an fsync per record, and indexed), across four runs of
+`./scripts/verify.sh`: **2,779 / 3,028 / 3,800 / 3,898 cells/sec**. Report the
+range, not the best one — the spread is nearly 40% run to run.
+
+The cause is **HNSW insert, not fsync**, and that attribution has been measured
+rather than assumed: a phase profile of the write pipeline puts `hnsw.insert` at
+~55% of the cost and the embedder at ~42%, with the `Store`'s own code under 3%.
+Group commit would not move this number. A cheaper insert path would.
+
+The embedder share is also smaller than it looks. Its cost is flat with respect
+to corpus size and, at realistic episode lengths (94–384 bytes), **about 97% of
+it is the 384-dimension f32 allocation and the memset, not hashing.** Hoisting
+the per-position hash seed there — a change that is provably bit-identical and
+strictly less work — measured 13–40% *slower* at those lengths and was reverted.
+Only at 4 KB inputs, which this product never sees, does that loop dominate.
 
 **LongMemEval is 0.646 core / 0.000 padded, and the embedder is the ceiling.**
 Run `./zig-out/bin/mem3-bench longmemeval`. This is an **offline

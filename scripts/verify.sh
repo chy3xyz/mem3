@@ -303,8 +303,11 @@ else
 	if [ "$MICRO_RC" -ne 0 ]; then
 		record micro-suite fail "bench exited $MICRO_RC" log="$(basename "$MICRO_LOG")"
 	elif jq -e . "$SCRATCH/bench-results.json" >/dev/null 2>&1; then
-		record micro-suite pass "wrote bench-results.json ($(wc -c < "$SCRATCH/bench-results.json" | tr -d ' ') bytes)" \
-			log="$(basename "$MICRO_LOG")"
+		# Keep it: the README's micro-benchmark table cites this file, and a
+		# number in the docs that cannot be traced back to a run is a guess.
+		cp "$SCRATCH/bench-results.json" "$OUTDIR/micro-bench-results.json"
+		record micro-suite pass "wrote micro-bench-results.json ($(wc -c < "$SCRATCH/bench-results.json" | tr -d ' ') bytes)" \
+			result="verify-artifacts/micro-bench-results.json" log="$(basename "$MICRO_LOG")"
 	else
 		record micro-suite fail "bench exited 0 but wrote no valid bench-results.json" log="$(basename "$MICRO_LOG")"
 	fi

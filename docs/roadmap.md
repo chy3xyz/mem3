@@ -61,12 +61,12 @@ Target: **10,000 cells/sec** at release.
 | Build | Measured |
 |---|---|
 | Debug (default `zig build`) | **192.1 cells/sec** |
-| ReleaseFast | **1,810.5 cells/sec** |
+| ReleaseFast (durable path) | **2,779 – 3,898 cells/sec** |
 
 600-cell in-memory corpus, via `mem3 bench`.
 
-**The cause is HNSW insert, not fsync.** `hnsw.insert` costs ~1.06 ms/op
-amortised — larger than the ~828 µs per-record WAL fsync, and larger than the
+**The cause is HNSW insert, not fsync.** `hnsw.insert` costs ~899 µs/op
+amortised — comparable to the ~1.2 ms per-record WAL fsync, and larger than the
 entire `store.addRaw_durable` pipeline (~577 µs) that contains both. Group
 commit would not move this number. What would:
 
@@ -119,7 +119,7 @@ claim and has not been adjudicated.
 - **HNSW recall has not saturated.** `mem3-hnsw-recall` measures recall@10
   against exhaustive scan on 400 nodes: 0.566 @ ef=10, 0.758 @ ef=100, 0.772 @
   ef=400. The default `hnsw_ef_search` is 100.
-- **No group commit.** `wal.append` fsyncs on every record (~828 µs). Currently
+- **No group commit.** `wal.append` fsyncs on every record (~1.2 ms). Currently
   not the dominant write cost, but it will become one once insert is fixed.
 - **The on-disk format is unstable.** `0.1.0-alpha`, no external users, no
   stability guarantee.
