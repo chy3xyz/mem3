@@ -367,3 +367,60 @@ test "E2E: non-default goal status survives snapshot truncation" {
         try testing.expect(found);
     }
 }
+
+test "E2E: hyperedges survive a restart (hyperedge_add is WAL-journaled)" {
+    // `Store.addHyperedge` used to insert straight into the in-memory
+    // hypergraph with no journal, even though `mem3 hyperedge add`'s own
+    // doc comment promised "durable (snapshot+wal) when --data-dir is
+    // set". The whole graph — and therefore every `multiHop` answer —
+    // vanished on restart.
+    const alloc = testing.allocator;
+    const data_dir = try makeDataDir(alloc, "edge");
+    defer alloc.free(data_dir);
+    defer wipeDataDir(data_dir);
+
+    var first_id: u64 = 0;
+    var second_id: u64 = 0;
+    var edge_id: u64 = 0;
+    {
+        wipeDataDir(data_dir);
+        var store = try mem3.Store.init(alloc, .{ .data_dir = data_dir });
+        defer store.deinit();
+
+        first_id = try store.addRaw(.matter, "persistence layer uses a WAL", "a=b", 1, 0.5);
+        second_id = try store.addRaw(.form, "the WAL is truncated at snapshot", "c=d", 1, 0.5);
+
+        const nodes = try alloc.dupe(u64, &[_]u64{ first_id, second_id });
+        defer alloc.free(nodes);
+        edge_id = try store.addHyperedge(.{
+            .id = 0,
+            .edge_type = .causal,
+            .nodes = nodes,
+            .weight = 0.8,
+            .source_weights = .{ 0.5, 0.3, 0.2 },
+            .confidence = 0.7,
+            .created_at = 1_700_000_000_000,
+        });
+        try store.sync();
+    }
+
+    {
+        var store = try mem3.Store.init(alloc, .{ .data_dir = data_dir });
+        defer store.deinit();
+
+        const edges = try store.allHyperedges(alloc);
+        defer alloc.free(edges);
+
+        try testing.expect(edges.len >= 1);
+        var found = false;
+        for (edges) |e| {
+            if (e.id != edge_id) continue;
+            found = true;
+            try testing.expectEqual(@as(usize, 2), e.nodes.len);
+            try testing.expectEqual(mem3.EdgeType.causal, e.edge_type);
+            try testing.expectEqual(@as(f32, 0.8), e.weight);
+        }
+        try testing.expect(found);
+        try testing.expect(store.hyperedgeCount() >= 1);
+    }
+}

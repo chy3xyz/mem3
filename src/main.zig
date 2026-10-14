@@ -67,6 +67,11 @@ comptime {
     // is how a whole CLI module could sit outside the gate without
     // anyone noticing. Import the ones that now carry tests.
     _ = @import("cli_commands/goal.zig");
+    // Same trap, different victim: `lib.zig` re-exports
+    // `retrieval.RerankContext`, but a re-export does not pull a
+    // module's `test` blocks into the test binary — verified: with
+    // only this file listed, the reranker's tests ran in zero binaries.
+    _ = @import("retrieval/reranker.zig");
 }
 
 const log = std.log.scoped(.mem3_main);

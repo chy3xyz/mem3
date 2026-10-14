@@ -22,7 +22,7 @@
 //!    timestamp, so a number can be traced back to the run that produced it.
 //!
 //! Scope limits worth stating plainly: the HNSW corpus is `--cells`
-//! (default 2 000) and `hnsw.search` is the shipped brute-force TopK
+//! (default 2 000) and `hnsw.search` is the shipped beam search
 //! implementation. These numbers say nothing about a 10M-vector corpus and
 //! must not be quoted as if they did.
 
@@ -522,7 +522,9 @@ const HnswSearchCtx = struct {
     next: usize = 0,
     acc: u64 = 0,
     ops: usize = 0,
-    // Correctness accumulator: hits against brute-force ground truth.
+    // Repeat-vs-repeat accumulator. NOTE: the "ground truth" below is the
+    // SAME function under test, so this measures run-to-run stability, not
+    // recall. True recall needs an exhaustive scan; see hnsw.zig.
     truth_hits: u64 = 0,
     truth_total: u64 = 0,
 };
@@ -543,9 +545,9 @@ fn hnswSearchBody(c: *anyopaque, _: usize) void {
         defer s.alloc.free(got);
         for (got) |r| s.acc +%= r.id;
 
-        // Ground truth is computed with the same code path, so this checks
-        // result stability and the shape of the result set rather than
-        // comparing two independent implementations.
+        // Deliberately the same code path. Do NOT read the resulting
+        // ratio as correctness: it is 1.0 by construction. It only shows
+        // the result set is stable across identical calls.
         const truth = s.hnsw.search(s.alloc, q, s.k) catch continue;
         defer s.alloc.free(truth);
         for (got) |g| {
@@ -589,7 +591,7 @@ fn benchHnswSearch(alloc: Allocator, reps: usize, corpus_size: usize, query_coun
         alloc,
         "hnsw.search",
         "ns/op",
-        "top-10 cosine search over the index; the shipped implementation is brute-force TopK, so latency scales with the corpus",
+        "top-10 cosine search over the shipped HNSW beam search (greedy descent + ef-bounded expansion)",
         1,
         20,
         reps,
@@ -953,7 +955,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     writeOut(
         \\
         \\Scope: these are the shipped code paths, measured on this machine.
-        \\hnsw.search is brute-force TopK in this version, so its latency
+        \\hnsw.search is an HNSW beam search with ef-bounded expansion;
         \\grows with the corpus; do not quote it as graph-index performance.
         \\WAL.append fsyncs on every record — see wal.append_durable.
         \\

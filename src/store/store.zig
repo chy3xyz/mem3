@@ -448,6 +448,29 @@ pub const Store = struct {
         try self.goals.updateStatus(id, status, now_ms);
     }
 
+    /// Free-standing form of `encodeGoalUpdatePayload`, same reason as
+    /// `encodeGoalWALPayloadRaw`: the daemon has its own Store type and
+    /// must not grow a second copy of the goal_status wire format.
+    pub fn encodeGoalUpdatePayloadRaw(
+        alloc: Allocator,
+        id: u64,
+        status: core.GoalStatus,
+        updated_at: i64,
+    ) ![]u8 {
+        var out = std.ArrayList(u8).empty;
+        errdefer out.deinit(alloc);
+        try out.append(alloc, '{');
+        try jsonFieldUintRaw(alloc, &out, "id", id);
+        try out.append(alloc, ',');
+        try jsonFieldStringRaw(alloc, &out, "status", @tagName(status));
+        try out.append(alloc, ',');
+        var num_buf: [24]u8 = undefined;
+        try out.appendSlice(alloc, "\"updated_at\":");
+        try out.appendSlice(alloc, try std.fmt.bufPrint(&num_buf, "{d}", .{updated_at}));
+        try out.append(alloc, '}');
+        return out.toOwnedSlice(alloc);
+    }
+
     /// `{"id":N,"status":"<tag>","updated_at":MS}`
     fn encodeGoalUpdatePayload(
         self: *Store,
@@ -455,20 +478,7 @@ pub const Store = struct {
         status: core.GoalStatus,
         updated_at: i64,
     ) ![]u8 {
-        var out = std.ArrayList(u8).empty;
-        errdefer out.deinit(self.alloc);
-        try out.append(self.alloc, '{');
-        try jsonFieldUintRaw(self.alloc, &out, "id", id);
-        try out.append(self.alloc, ',');
-        // `status` is a fixed enum tag, so escaping is overkill but
-        // harmless and keeps this consistent with encodeGoalWALPayload.
-        try jsonFieldStringRaw(self.alloc, &out, "status", @tagName(status));
-        try out.append(self.alloc, ',');
-        var num_buf: [24]u8 = undefined;
-        try out.appendSlice(self.alloc, "\"updated_at\":");
-        try out.appendSlice(self.alloc, try std.fmt.bufPrint(&num_buf, "{d}", .{updated_at}));
-        try out.append(self.alloc, '}');
-        return out.toOwnedSlice(self.alloc);
+        return encodeGoalUpdatePayloadRaw(self.alloc, id, status, updated_at);
     }
 
     // =================================================================
@@ -476,8 +486,81 @@ pub const Store = struct {
     // =================================================================
 
     /// Add a hyperedge connecting 2+ existing MemCells.
+    /// WAL-first, like `addRaw` and `createGoal`.
+    ///
+    /// This used to insert straight into the in-memory hypergraph with no
+    /// journal, while `mem3 hyperedge add`'s own doc comment promised
+    /// "durable (snapshot+wal) when --data-dir is set". The whole
+    /// hypergraph therefore vanished on restart, taking every
+    /// `multiHop` answer with it.
     pub fn addHyperedge(self: *Store, edge: HyperEdge) !u64 {
-        return self.hymem.addEdge(edge);
+        // Validate before journaling: an invalid edge must not become
+        // durable, or replay would fail on a record that could never
+        // have been created.
+        try edge.validate();
+
+        // Reserve the id BEFORE journaling. `HyMem.addEdge` mints its
+        // own id internally, so journal-then-insert would have recorded
+        // the caller's placeholder (usually 0) and the replayed edge
+        // would land under a different id than the live one. The id
+        // counter is shared with cells and goals, so a failure here
+        // simply leaves a gap — harmless, because ids are only required
+        // to be unique, not dense.
+        const id = self.ids.fetchAdd(1, .monotonic);
+        var journaled = edge;
+        journaled.id = id;
+
+        if (self.wal) |wal| {
+            const payload = try self.encodeHyperedgePayload(journaled);
+            defer self.alloc.free(payload);
+            try wal.append(.{
+                .record_type = .hyperedge_add,
+                .payload = payload,
+                .timestamp = wallClockSec(),
+            });
+        }
+        return self.hymem.addEdgeWithId(id, journaled);
+    }
+
+    /// `{"id":N,"edge_type":"..","nodes":[..],"weight":F,
+    ///  "source_weights":[F,F,F],"confidence":F,"created_at":MS,
+    ///  "metadata":".."|null}`
+    fn encodeHyperedgePayload(self: *Store, edge: HyperEdge) ![]u8 {
+        var out = std.ArrayList(u8).empty;
+        errdefer out.deinit(self.alloc);
+        var num_buf: [32]u8 = undefined;
+        try out.append(self.alloc, '{');
+        try jsonFieldUintRaw(self.alloc, &out, "id", edge.id);
+        try out.append(self.alloc, ',');
+        try jsonFieldStringRaw(self.alloc, &out, "edge_type", @tagName(edge.edge_type));
+        try out.append(self.alloc, ',');
+        try out.appendSlice(self.alloc, "\"nodes\":[");
+        for (edge.nodes, 0..) |nid, i| {
+            if (i > 0) try out.append(self.alloc, ',');
+            try out.appendSlice(self.alloc, try std.fmt.bufPrint(&num_buf, "{d}", .{nid}));
+        }
+        try out.append(self.alloc, ']');
+        try out.append(self.alloc, ',');
+        try out.appendSlice(self.alloc, "\"weight\":");
+        try out.appendSlice(self.alloc, try std.fmt.bufPrint(&num_buf, "{d:.4}", .{edge.weight}));
+        try out.appendSlice(self.alloc, ",\"source_weights\":[");
+        for (edge.source_weights, 0..) |w, i| {
+            if (i > 0) try out.append(self.alloc, ',');
+            try out.appendSlice(self.alloc, try std.fmt.bufPrint(&num_buf, "{d:.4}", .{w}));
+        }
+        try out.append(self.alloc, ']');
+        try out.appendSlice(self.alloc, ",\"confidence\":");
+        try out.appendSlice(self.alloc, try std.fmt.bufPrint(&num_buf, "{d:.4}", .{edge.confidence}));
+        try out.appendSlice(self.alloc, ",\"created_at\":");
+        try out.appendSlice(self.alloc, try std.fmt.bufPrint(&num_buf, "{d}", .{edge.created_at}));
+        try out.appendSlice(self.alloc, ",\"metadata\":");
+        if (edge.metadata) |m| {
+            try jsonStringRawBody(self.alloc, &out, m);
+        } else {
+            try out.appendSlice(self.alloc, "null");
+        }
+        try out.append(self.alloc, '}');
+        return out.toOwnedSlice(self.alloc);
     }
 
     /// Snapshot of every hyperedge (caller frees).
@@ -745,24 +828,42 @@ pub const Store = struct {
         deadline: ?i64,
         now_ms: i64,
     ) ![]u8 {
+        return encodeGoalWALPayloadRaw(self.alloc, id, name, description, parent_id, priority, deadline, now_ms);
+    }
+
+/// Free-standing form of `Store.encodeGoalWALPayload`.
+///
+/// Public so the daemon's duplicate `Store` can re-journal goals with the
+/// exact same encoder instead of growing a third hand-written copy of the
+/// wire format. Only an allocator is needed.
+pub fn encodeGoalWALPayloadRaw(
+    alloc: Allocator,
+    id: u64,
+    name: []const u8,
+    description: []const u8,
+    parent_id: ?u64,
+    priority: u8,
+    deadline: ?i64,
+    now_ms: i64,
+) ![]u8 {
         var out = std.ArrayList(u8).empty;
-        defer out.deinit(self.alloc);
-        try out.append(self.alloc, '{');
-        try jsonFieldUintRaw(self.alloc, &out, "id", id);
-        try out.append(self.alloc, ',');
-        try jsonFieldStringRaw(self.alloc, &out, "name", name);
-        try out.append(self.alloc, ',');
-        try jsonFieldStringRaw(self.alloc, &out, "description", description);
-        try out.append(self.alloc, ',');
-        try jsonFieldIntRaw(self.alloc, &out, "parent_id", if (parent_id) |p| @as(i64, @intCast(p)) else -1);
-        try out.append(self.alloc, ',');
-        try jsonFieldUintRaw(self.alloc, &out, "priority", priority);
-        try out.append(self.alloc, ',');
-        try jsonFieldIntRaw(self.alloc, &out, "deadline", deadline orelse -1);
-        try out.append(self.alloc, ',');
-        try jsonFieldIntRaw(self.alloc, &out, "created_at", now_ms);
-        try out.append(self.alloc, '}');
-        return out.toOwnedSlice(self.alloc);
+        defer out.deinit(alloc);
+        try out.append(alloc, '{');
+        try jsonFieldUintRaw(alloc, &out, "id", id);
+        try out.append(alloc, ',');
+        try jsonFieldStringRaw(alloc, &out, "name", name);
+        try out.append(alloc, ',');
+        try jsonFieldStringRaw(alloc, &out, "description", description);
+        try out.append(alloc, ',');
+        try jsonFieldIntRaw(alloc, &out, "parent_id", if (parent_id) |p| @as(i64, @intCast(p)) else -1);
+        try out.append(alloc, ',');
+        try jsonFieldUintRaw(alloc, &out, "priority", priority);
+        try out.append(alloc, ',');
+        try jsonFieldIntRaw(alloc, &out, "deadline", deadline orelse -1);
+        try out.append(alloc, ',');
+        try jsonFieldIntRaw(alloc, &out, "created_at", now_ms);
+        try out.append(alloc, '}');
+        return out.toOwnedSlice(alloc);
     }
 
     fn cloneFacts(self: *Store, src: []const Fact) ![]Fact {
@@ -880,6 +981,7 @@ pub const Store = struct {
             // carry goals, so re-journal the whole poset into the
             // fresh file — otherwise every user goal dies here.
             self.rejournalGoals(wal_ptr);
+            self.rejournalHyperedges(wal_ptr);
         }
     }
 
@@ -982,6 +1084,7 @@ pub const Store = struct {
         var replay_count: u64 = 0;
         var max_replayed_id: u64 = 0;
         var replayed_goals: u64 = 0;
+        var replayed_edges: u64 = 0;
         var synthetic_id_seq: u64 = 0;
         const SYNTHETIC_ID_BASE: u64 = 1_000_000_000;
         const Ctx = struct {
@@ -990,6 +1093,7 @@ pub const Store = struct {
             max_id: *u64,
             synthetic_seq: *u64,
             goals: *u64,
+            edges: *u64,
         };
         var ctx = Ctx{
             .store = self,
@@ -997,6 +1101,7 @@ pub const Store = struct {
             .max_id = &max_replayed_id,
             .synthetic_seq = &synthetic_id_seq,
             .goals = &replayed_goals,
+            .edges = &replayed_edges,
         };
         wal_ptr.replay(existing.items, &ctx, struct {
             fn cb(ctx_ptr: *Ctx, rec: WALRecord) anyerror!void {
@@ -1009,6 +1114,10 @@ pub const Store = struct {
                 }
                 if (rec.record_type == .goal_update) {
                     ctx_ptr.store.applyGoalStatusRecord(rec.payload, ctx_ptr.goals);
+                    return;
+                }
+                if (rec.record_type == .hyperedge_add) {
+                    ctx_ptr.store.applyHyperedgeRecord(rec.payload, ctx_ptr.edges, ctx_ptr.max_id);
                     return;
                 }
                 if (rec.record_type != .memcell_insert) return;
@@ -1091,6 +1200,40 @@ fn applyGoalStatusRecord(self: *Store, payload: []const u8, count: *u64) void {
         if (self.goals.get(@intCast(id)).?.status != before) count.* += 1;
     }
 
+    /// Replay one `hyperedge_add` record. Idempotent: a re-journalled
+    /// or already-present id is skipped rather than duplicated.
+    fn applyHyperedgeRecord(self: *Store, payload: []const u8, count: *u64, max_id: *u64) void {
+        const e = parseHyperedgePayload(self.alloc, payload) catch |err| {
+            log.warn("WAL: skipping hyperedge_add (parse failed: {})", .{err});
+            return;
+        };
+        defer e.deinit(self.alloc);
+
+        if (e.id > max_id.*) max_id.* = e.id;
+        if (self.hymem.edges.contains(e.id)) return;
+
+        // The edge must reference cells that actually exist, otherwise
+        // multiHop would hand back ids that resolve to nothing.
+        for (e.nodes) |nid| {
+            if (!self.cell_index.contains(nid)) {
+                log.warn("WAL: hyperedge_add id={d} dropped — node {d} not in cell_index", .{ e.id, nid });
+                return;
+            }
+        }
+        // `addEdgeWithId`, not `addEdge`: the id in the record is the
+        // one the edge was created under, and re-minting it here would
+        // land the replayed edge under a different key than the live
+        // one it replaced.
+        _ = self.hymem.addEdgeWithId(e.id, e.asEdge() catch |err| {
+            log.warn("WAL: hyperedge_add id={d} invalid: {}", .{ e.id, err });
+            return;
+        }) catch |err| {
+            log.warn("WAL: hyperedge_add id={d} failed: {}", .{ e.id, err });
+            return;
+        };
+        count.* += 1;
+    }
+
     /// Replay one `goal_create` record back into the poset, with the
     /// same id it was created under. Idempotent by construction: a
     /// record whose id is already present (re-seeded goal, or a WAL
@@ -1142,6 +1285,51 @@ fn applyGoalStatusRecord(self: *Store, payload: []const u8, count: *u64) void {
     /// Walks breadth-first from ⊥ so a parent is always journaled
     /// before its children; replay would otherwise drop a child whose
     /// parent has not been materialised yet.
+    /// Re-emit every hyperedge into a freshly truncated WAL.
+    ///
+    /// Same failure class as goals, found by the regression test: the
+    /// snapshot carries (counter, cells, fuzzy) and goals-via-rejournal
+    /// but **no** hyperedges at all — `snapshot.zig` does not even
+    /// mention the type. So truncating the WAL deleted the entire
+    /// hypergraph, and every `multiHop` answer with it.
+    fn rejournalHyperedges(self: *Store, wal: *WAL) void {
+        var written: usize = 0;
+        var it = self.hymem.edges.iterator();
+        while (it.next()) |entry| {
+            const e = entry.value_ptr.*;
+            // A hyperedge whose endpoint cells are gone would be
+            // dropped on the next replay anyway; do not resurrect it.
+            var endpoints_present = true;
+            for (e.nodes) |nid| {
+                if (!self.cell_index.contains(nid)) {
+                    endpoints_present = false;
+                    break;
+                }
+            }
+            if (!endpoints_present) {
+                log.warn("rejournalHyperedges: edge {d} dropped — an endpoint cell is missing", .{e.id});
+                continue;
+            }
+            const payload = self.encodeHyperedgePayload(e.*) catch |err| {
+                log.warn("rejournalHyperedges: encode failed for edge {d}: {}", .{ e.id, err });
+                continue;
+            };
+            defer self.alloc.free(payload);
+            wal.append(.{
+                .record_type = .hyperedge_add,
+                .payload = payload,
+                .timestamp = wallClockSec(),
+            }) catch |err| {
+                log.warn("rejournalHyperedges: append failed for edge {d}: {}", .{ e.id, err });
+                return;
+            };
+            written += 1;
+        }
+        if (written > 0) {
+            log.info("rejournalHyperedges: re-emitted {d} hyperedge records into the fresh WAL", .{written});
+        }
+    }
+
     fn rejournalGoals(self: *Store, wal: *WAL) void {
         var queue: std.ArrayList(u64) = .empty;
         defer queue.deinit(self.alloc);
@@ -1215,6 +1403,18 @@ fn wallClockSec() i64 {
     var ts: std.c.timespec = .{ .sec = 0, .nsec = 0 };
     _ = std.c.clock_gettime(std.c.CLOCK.REALTIME, &ts);
     return @intCast(ts.sec);
+}
+
+/// Write a bare JSON string (no key) — used where the key was already
+/// emitted by the caller.
+pub fn jsonStringRawBody(alloc: Allocator, out: *std.ArrayList(u8), value: []const u8) !void {
+    var scratch = std.ArrayList(u8).empty;
+    defer scratch.deinit(alloc);
+    try jsonFieldStringRaw(alloc, &scratch, "", value);
+    // strip the leading `"":` the key form leaves behind
+    const full = scratch.items;
+    const colon = std.mem.indexOfScalar(u8, full, ':') orelse full.len;
+    try out.appendSlice(alloc, full[colon + 1 ..]);
 }
 
 pub fn jsonFieldStringRaw(alloc: Allocator, out: *std.ArrayList(u8), key: []const u8, value: []const u8) !void {
@@ -1768,4 +1968,93 @@ test "Store: createGoal is WAL-journaled and survives restart" {
         defer alloc.free(goals);
         try std.testing.expectEqual(@as(usize, 0), goals.len);
     }
+}
+
+/// Replay-side parse of a `hyperedge_add` payload, mirroring
+/// `encodeHyperedgePayload` field for field.
+const ParsedEdge = struct {
+    id: u64,
+    edge_type: core.EdgeType,
+    nodes: []u64,
+    weight: f32,
+    source_weights: [3]f32,
+    confidence: f32,
+    created_at: i64,
+    metadata: ?[]u8,
+
+    fn asEdge(self: ParsedEdge) !HyperEdge {
+        return .{
+            .id = self.id,
+            .edge_type = self.edge_type,
+            .nodes = self.nodes,
+            .weight = self.weight,
+            .source_weights = self.source_weights,
+            .confidence = self.confidence,
+            .created_at = self.created_at,
+            .metadata = self.metadata,
+        };
+    }
+
+    pub fn deinit(self: *const ParsedEdge, alloc: Allocator) void {
+        alloc.free(self.nodes);
+        if (self.metadata) |m| alloc.free(m);
+    }
+};
+
+/// Parse the `[a,b,c]` id list without pulling in std.json reflection.
+fn parseIdList(comptime key: []const u8, body: []const u8, alloc: Allocator) ![]u64 {
+    const key_pos = std.mem.indexOf(u8, body, "\"" ++ key ++ "\"") orelse return error.ParseFailed;
+    const open = std.mem.indexOfScalarPos(u8, body, key_pos, '[') orelse return error.ParseFailed;
+    const close = std.mem.indexOfScalarPos(u8, body, open, ']') orelse return error.ParseFailed;
+    var out = std.ArrayList(u64).empty;
+    errdefer out.deinit(alloc);
+    var it = std.mem.splitScalar(u8, body[open + 1 .. close], ',');
+    while (it.next()) |part| {
+        const t = std.mem.trim(u8, part, " \t\r\n");
+        if (t.len == 0) continue;
+        try out.append(alloc, std.fmt.parseInt(u64, t, 10) catch return error.ParseFailed);
+    }
+    return out.toOwnedSlice(alloc);
+}
+
+fn parseFloatList3(comptime key: []const u8, body: []const u8) ![3]f32 {
+    const key_pos = std.mem.indexOf(u8, body, "\"" ++ key ++ "\"") orelse return error.ParseFailed;
+    const open = std.mem.indexOfScalarPos(u8, body, key_pos, '[') orelse return error.ParseFailed;
+    const close = std.mem.indexOfScalarPos(u8, body, open, ']') orelse return error.ParseFailed;
+    var out: [3]f32 = undefined;
+    var n: usize = 0;
+    var it = std.mem.splitScalar(u8, body[open + 1 .. close], ',');
+    while (it.next()) |part| {
+        if (n >= 3) break;
+        const t = std.mem.trim(u8, part, " \t\r\n");
+        if (t.len == 0) continue;
+        out[n] = std.fmt.parseFloat(f32, t) catch return error.ParseFailed;
+        n += 1;
+    }
+    if (n != 3) return error.ParseFailed;
+    return out;
+}
+
+fn parseHyperedgePayload(alloc: Allocator, payload: []const u8) !ParsedEdge {
+    const id_i = extractJsonInt(payload, "id") orelse return error.ParseFailed;
+    if (id_i < 0) return error.ParseFailed;
+    const type_str = extractJsonStringOrOwned(alloc, payload, "edge_type", "") catch return error.ParseFailed;
+    defer alloc.free(type_str);
+    const edge_type = std.meta.stringToEnum(core.EdgeType, type_str) orelse return error.ParseFailed;
+
+    const nodes = try parseIdList("nodes", payload, alloc);
+    errdefer alloc.free(nodes);
+    const source_weights = try parseFloatList3("source_weights", payload);
+    const meta_owned: ?[]u8 = extractJsonStringOrOwned(alloc, payload, "metadata", "") catch null;
+
+    return .{
+        .id = @intCast(id_i),
+        .edge_type = edge_type,
+        .nodes = nodes,
+        .weight = extractJsonFloat(payload, "weight") orelse 0.0,
+        .source_weights = source_weights,
+        .confidence = extractJsonFloat(payload, "confidence") orelse 0.0,
+        .created_at = extractJsonInt(payload, "created_at") orelse 0,
+        .metadata = meta_owned,
+    };
 }

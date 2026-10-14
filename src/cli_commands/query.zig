@@ -30,6 +30,7 @@ const cli_common = @import("cli_common.zig");
 const core = @import("../core/mod.zig");
 const MemorySource = core.MemorySource;
 const MemCell = core.MemCell;
+const RerankContext = @import("../retrieval/reranker.zig").RerankContext;
 
 /// A ranked hit. Score is cosine similarity after GHW-prioritised
 /// re-ranking; see `rerank`.
@@ -94,22 +95,33 @@ pub fn run(alloc: Allocator, p: cli.Parsed) !void {
         if (dense.len > 0) alloc.free(dense);
     }
 
-    var ranked = std.ArrayList(Hit).empty;
-    defer ranked.deinit(alloc);
-
+    // Candidates after filtering, before GHW re-ranking.
+    var cands = std.ArrayList(RerankContext.Pair).empty;
+    defer cands.deinit(alloc);
     for (dense) |r| {
         const cell = store.getCell(r.id) orelse continue;
         if (source_filter.items.len > 0 and !matchesSource(source_filter.items, cell.source)) continue;
         if (goal_ids.items.len > 0 and !matchesGoal(cell, goal_ids.items)) continue;
-        try ranked.append(alloc, .{ .id = r.id, .score = rerank(r.score, cell) });
+        try cands.append(alloc, .{ .id = r.id, .score = r.score, .cell = cell });
     }
 
-    // Highest score first.
-    std.mem.sort(@TypeOf(ranked.items[0]), ranked.items, {}, struct {
-        fn lt(_: void, a: Hit, b: Hit) bool {
-            return a.score > b.score;
-        }
-    }.lt);
+    // The real GHW re-ranker (goal bonus x existence x recency), not the
+    // two-factor inline copy this used to carry. `--goal-ids` becomes
+    // the query's goal scope, so the bonus is now query-specific.
+    var rr = RerankContext{
+        .alloc = alloc,
+        .cfg = store.lc.cfg,
+        .goals = store.goals,
+        .query_goal_ids = goal_ids.items,
+    };
+    const reranked = try rr.rerankPairs(alloc, cands.items);
+    defer alloc.free(reranked);
+
+    var ranked = std.ArrayList(Hit).empty;
+    defer ranked.deinit(alloc);
+    for (reranked) |sc| {
+        try ranked.append(alloc, .{ .id = sc.cell.id, .score = sc.final_score });
+    }
 
     const shown = ranked.items[0..@min(topk, ranked.items.len)];
 
@@ -134,17 +146,6 @@ pub fn run(alloc: Allocator, p: cli.Parsed) !void {
             cli_common.println(buf.items);
         }
     }
-}
-
-/// GHW-prioritised re-rank: cosine similarity scaled by the cell's
-/// strongest goal relevance and by its importance score. Matches the
-/// server's `POST /api/query` weighting.
-fn rerank(score: f32, cell: *const MemCell) f32 {
-    var goal_bonus: f32 = 0.0;
-    for (cell.goal_associations) |ga| {
-        if (ga.relevance > goal_bonus) goal_bonus = ga.relevance;
-    }
-    return score * (1.0 + 0.4 * goal_bonus) * (1.0 + 0.3 * cell.metadata.importance_score);
 }
 
 fn matchesSource(filter: []const MemorySource, source: MemorySource) bool {

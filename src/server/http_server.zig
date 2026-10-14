@@ -28,6 +28,7 @@ const ghw = @import("../ghw/mod.zig");
 const ghw_goal_tree = @import("../ghw/goal_tree.zig");
 const jsonl = @import("../utils/jsonl.zig");
 const mem3_store = @import("../store/store.zig");
+const RerankContext = @import("../retrieval/reranker.zig").RerankContext;
 const memory = @import("../memory/mod.zig");
 const retrieval = @import("../retrieval/mod.zig");
 const HNSW = retrieval.HNSW;
@@ -350,7 +351,100 @@ const Store = struct {
                 return;
             };
             self.wal = wal_ptr;
+            // Truncating the WAL deletes every `goal_create` record it
+            // held, and the snapshot carries only (counter, cells,
+            // fuzzy) — see the `collectGoals` TODO in snapshot.zig. So
+            // without this the daemon silently deletes every user goal
+            // on the first `POST /api/sync`. Reproduced end to end: a
+            // goal created by `mem3 goal add` was present in the API,
+            // vanished from disk after one sync, and stayed gone for
+            // the CLI too because both share the data dir.
+            self.rejournalGoals(wal_ptr);
         }
+    }
+
+    /// Re-emit every non-synthetic goal into a freshly truncated WAL.
+    ///
+    /// Walks breadth-first from ⊥ so a parent is always journaled before
+    /// its children; replay drops a child whose parent is absent.
+    /// Mirrors `Store.rejournalGoals`, which cannot be called directly
+    /// because this file carries its own duplicate `Store` type — but
+    /// the wire format comes from the shared encoder, so the two cannot
+    /// drift.
+    fn rejournalGoals(self: *Store, wal: *WAL) void {
+        var queue = std.ArrayList(u64).empty;
+        defer queue.deinit(self.alloc);
+        queue.append(self.alloc, ghw_goal_tree.ROOT_GOAL_ID) catch {
+            log.warn("rejournalGoals: out of memory — goals not carried into the new WAL", .{});
+            return;
+        };
+        var head: usize = 0;
+        var written: usize = 0;
+        while (head < queue.items.len) : (head += 1) {
+            for (self.goals.childrenOf(queue.items[head])) |child_id| {
+                if (child_id == ghw_goal_tree.ROOT_GOAL_ID or child_id == ghw_goal_tree.TOP_GOAL_ID) continue;
+                const node = self.goals.get(child_id) orelse continue;
+                // `GoalPoset.create` stores ⊥ as a concrete parent;
+                // write back the API's "absent" form.
+                const parent_id: ?u64 = if (node.parent_id) |p|
+                    (if (p == ghw_goal_tree.ROOT_GOAL_ID) null else p)
+                else
+                    null;
+                {
+                    const payload = mem3_store.Store.encodeGoalWALPayloadRaw(
+                        self.alloc,
+                        child_id,
+                        node.name,
+                        node.description,
+                        parent_id,
+                        node.priority,
+                        node.deadline,
+                        node.created_at,
+                    ) catch |err| {
+                        log.warn("rejournalGoals: encode failed for goal {d}: {}", .{ child_id, err });
+                        continue;
+                    };
+                    defer self.alloc.free(payload);
+                    wal.append(.{
+                        .record_type = .goal_create,
+                        .payload = payload,
+                        .timestamp = wallClockSec(),
+                    }) catch |err| {
+                        log.warn("rejournalGoals: append failed for goal {d}: {}", .{ child_id, err });
+                        return;
+                    };
+                }
+                written += 1;
+                // `goal_create` carries no status and `GoalPoset.create`
+                // always starts at `.pending`; re-emit a status record
+                // for anything the user actually changed.
+                if (node.status != .pending) {
+                    const st = mem3_store.Store.encodeGoalUpdatePayloadRaw(
+                        self.alloc,
+                        child_id,
+                        node.status,
+                        node.updated_at,
+                    ) catch |err| {
+                        log.warn("rejournalGoals: status encode failed for goal {d}: {}", .{ child_id, err });
+                        continue;
+                    };
+                    defer self.alloc.free(st);
+                    wal.append(.{
+                        .record_type = .goal_update,
+                        .payload = st,
+                        .timestamp = wallClockSec(),
+                    }) catch |err| {
+                        log.warn("rejournalGoals: status append failed for goal {d}: {}", .{ child_id, err });
+                        return;
+                    };
+                }
+                queue.append(self.alloc, child_id) catch {
+                    log.warn("rejournalGoals: out of memory at depth {d} — subtree dropped", .{head});
+                    return;
+                };
+            }
+        }
+        log.info("rejournalGoals: re-emitted {d} goal records into the fresh WAL", .{written});
     }
 
     fn cloneFacts(self: *Store, src: []const core.Fact) ![]core.Fact {
@@ -723,6 +817,10 @@ const Store = struct {
                     applyGoalRecord(ctx_ptr.store, rec.payload, ctx_ptr.goal_count, ctx_ptr.max_id);
                     return;
                 }
+                if (rec.record_type == .goal_update) {
+                    applyGoalStatusRecord(ctx_ptr.store, rec.payload);
+                    return;
+                }
                 if (rec.record_type != .memcell_insert) return;
                 const synthetic_id = SYNTHETIC_ID_BASE + @atomicRmw(u64, ctx_ptr.synthetic_seq, .Add, 1, .seq_cst);
                 const parsed = parseInsertPayload(
@@ -775,6 +873,34 @@ const Store = struct {
     /// WAL on top of a snapshot is a no-op rather than a duplicate. Logs
     /// are gated on `builtin.is_test` because the Zig 0.17 test runner
     /// fails any test that emits a log line.
+    /// Replay one `goal_update` record into the daemon's poset.
+    ///
+    /// Without this the daemon's in-memory status stayed at whatever
+    /// `goal_create` produced (always `.pending`), and the next
+    /// `POST /api/sync` faithfully re-journalled that wrong state —
+    /// destroying the user's real status along with the original
+    /// `goal_update` record it truncated away.
+    fn applyGoalStatusRecord(store_self: *Store, payload: []const u8) void {
+        const id_i = extractJsonInt(payload, "id") orelse return;
+        if (id_i < 0) return;
+        const id: u64 = @intCast(id_i);
+        const status_str = extractJsonStringOrOwned(store_self.alloc, payload, "status", "") catch return;
+        defer store_self.alloc.free(status_str);
+        const status = std.meta.stringToEnum(core.GoalStatus, status_str) orelse {
+            if (!builtin.is_test) log.warn("WAL: goal_update id={d} has unknown status '{s}', skipped", .{ id, status_str });
+            return;
+        };
+        if (!store_self.goals.nodes.contains(id)) {
+            if (!builtin.is_test) log.warn("WAL: goal_update id={d} skipped — goal not in poset", .{id});
+            return;
+        }
+        const updated_at = extractJsonInt(payload, "updated_at") orelse 0;
+        store_self.goals.updateStatus(id, status, updated_at) catch |err| {
+            if (!builtin.is_test) log.warn("WAL: goal_update id={d} failed: {}", .{ id, err });
+            return;
+        };
+    }
+
     fn applyGoalRecord(store_self: *Store, payload: []const u8, count: *u64, max_id: *u64) void {
         const g = mem3_store.parseGoalPayload(store_self.alloc, payload) catch |err| {
             if (!builtin.is_test) log.warn("WAL: skipping goal_create record (parse failed: {})", .{err});
@@ -1137,8 +1263,17 @@ pub const Server = struct {
         const dense = self.store.hnsw.search(self.alloc, qvec, topk * 3) catch &.{};
         defer self.alloc.free(dense);
 
-        var ranked = std.ArrayList(struct { id: u64, score: f32 }).empty;
-        defer ranked.deinit(self.alloc);
+        var cands = std.ArrayList(RerankContext.Pair).empty;
+        defer cands.deinit(self.alloc);
+        // GHW re-rank via the shared reranker so the daemon and
+        // `mem3 query` cannot drift apart. This path previously carried
+        // its own two-factor copy with no recency term.
+        var rr = RerankContext{
+            .alloc = self.alloc,
+            .cfg = self.store.lc.cfg,
+            .goals = self.store.goals,
+            .query_goal_ids = &.{},
+        };
         var it = self.store.cell_index.iterator();
         while (it.next()) |entry| {
             const cell = entry.value_ptr.*;
@@ -1152,36 +1287,34 @@ pub const Server = struct {
                 }
             }
             if (!found) continue;
-            var goal_bonus: f32 = 0.0;
-            for (cell.goal_associations) |ga| {
-                if (ga.relevance > goal_bonus) goal_bonus = ga.relevance;
-            }
-            const importance = cell.metadata.importance_score;
-            score = score * (1.0 + 0.4 * goal_bonus) * (1.0 + 0.3 * importance);
-            try ranked.append(self.alloc, .{ .id = cell.id, .score = score });
+                try cands.append(self.alloc, .{
+                .id = cell.id,
+                .score = score,
+                .cell = cell,
+            });
         }
 
-        std.mem.sort(@TypeOf(ranked.items[0]), ranked.items, {}, struct {
-            fn lt(_: void, a: @TypeOf(ranked.items[0]), b: @TypeOf(ranked.items[0])) bool {
-                return a.score > b.score;
-            }
-        }.lt);
+        const reranked = rr.rerankPairs(self.alloc, cands.items) catch |err| {
+            const msg = @errorName(err);
+            return try self.jsonResponse(500, "Internal Server Error", try std.fmt.allocPrint(self.alloc, "{{\"error\":\"{s}\"}}", .{msg}));
+        };
+        defer self.alloc.free(reranked);
 
-        const out_n = @min(topk, ranked.items.len);
+        const out_n = @min(topk, reranked.len);
         var out = std.ArrayList(u8).empty;
         defer out.deinit(self.alloc);
         try out.appendSlice(self.alloc, "{\"results\":[");
-        for (ranked.items[0..out_n], 0..) |r, i| {
+        for (reranked[0..out_n], 0..) |r, i| {
             if (i > 0) try out.append(self.alloc, ',');
-            const cell = self.store.cell_index.get(r.id) orelse continue;
+            const cell = r.cell;
             try out.append(self.alloc, '{');
-            try jsonFieldInt(self.alloc, &out, "id", r.id);
+            try jsonFieldInt(self.alloc, &out, "id", cell.id);
             try out.append(self.alloc, ',');
             try jsonFieldString(self.alloc, &out, "source", @tagName(cell.source));
             try out.append(self.alloc, ',');
             try jsonFieldString(self.alloc, &out, "episode", cell.episode);
             try out.append(self.alloc, ',');
-            try jsonFieldFloat(self.alloc, &out, "score", r.score);
+            try jsonFieldFloat(self.alloc, &out, "score", r.final_score);
             try out.append(self.alloc, ',');
             try out.appendSlice(self.alloc, "\"goals\":[");
             for (cell.goal_associations, 0..) |ga, j| {
@@ -1507,6 +1640,51 @@ test "Server: healthz route" {
     const resp = try srv.route("GET", "/healthz", "");
     try std.testing.expectEqual(@as(u16, 200), resp.status);
     try std.testing.expect(std.mem.indexOf(u8, resp.body, "ok") != null);
+}
+
+test "Server: takeSnapshot re-journals goals so a sync cannot delete them" {
+    // Regression guard for a data-destroying bug: `takeSnapshot`
+    // truncates the WAL, the snapshot carries only (counter, cells,
+    // fuzzy), and the daemon had no `rejournalGoals` — so a single
+    // `POST /api/sync` permanently deleted every user goal, for the
+    // CLI on the same data dir too. Reproduced end to end before the
+    // fix; the goal and its non-default status both vanished.
+    const alloc = std.testing.allocator;
+    const dir = "/tmp/mem3_test_rejournal";
+    std.fs.cwd().deleteTree(dir) catch {};
+
+    var srv = try Server.init(alloc, "127.0.0.1", 0, dir);
+    defer {
+        srv.deinit();
+        std.fs.cwd().deleteTree(dir) catch {};
+    }
+
+    const gid = srv.store.goals.create(
+        "rejournal-probe",
+        "must survive a sync",
+        null,
+        6,
+        null,
+        1_700_000_000_000,
+        &srv.store.ids,
+    ) catch |err| {
+        std.log.warn("goal create failed: {s}", .{@errorName(err)});
+        return err;
+    };
+    try srv.store.goals.updateStatus(gid, .completed, 1_700_000_000_000);
+    try srv.store.takeSnapshot();
+
+    // Reopen against the same directory: a fresh process would do
+    // exactly this after a restart.
+    var srv2 = try Server.init(alloc, "127.0.0.1", 0, dir);
+    defer srv2.deinit();
+
+    const resp = try srv2.route("GET", "/api/goals", "");
+    defer alloc.free(resp.body);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "rejournal-probe") != null);
+    // `goal_create` carries no status, so a goal left at .completed
+    // only reads back correctly if the status record was re-emitted too.
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "completed") != null);
 }
 
 test "Server: GET /api/goals reflects the live poset, not a fixed literal" {

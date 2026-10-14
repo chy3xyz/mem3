@@ -63,8 +63,18 @@ pub const HyMem = struct {
 
     /// Add a hyperedge connecting 2+ MemCells.
     pub fn addEdge(self: *HyMem, edge: HyperEdge) !u64 {
-        try edge.validate();
         const id = self.next_id.fetchAdd(1, .monotonic);
+        return self.addEdgeWithId(id, edge);
+    }
+
+    /// Insert with a caller-reserved id.
+    ///
+    /// `addEdge` mints the id internally, which makes WAL-first
+    /// journaling impossible: the journal has to be written *before*
+    /// the insert, but it needs the id, and the id does not exist until
+    /// the insert has happened. Reserving it here closes that gap.
+    pub fn addEdgeWithId(self: *HyMem, id: u64, edge: HyperEdge) !u64 {
+        try edge.validate();
 
         const e_ptr = try self.alloc.create(HyperEdge);
         errdefer self.alloc.destroy(e_ptr);
