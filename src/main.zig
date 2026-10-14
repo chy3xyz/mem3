@@ -72,6 +72,18 @@ comptime {
     // module's `test` blocks into the test binary — verified: with
     // only this file listed, the reranker's tests ran in zero binaries.
     _ = @import("retrieval/reranker.zig");
+    // And again, with the daemon as the victim. `tests/main.zig` reaches
+    // the server through the `mem3` *module*, and Zig does not collect
+    // `test` blocks out of module dependencies — only out of the root
+    // source file's own import graph. `tests/integration/http_server_e2e.zig`
+    // therefore exercised the HTTP surface over a subprocess without ever
+    // compiling the three in-process tests sitting in this file, including
+    // the regression guard for the sync-deletes-goals bug.
+    //
+    // Proven, not assumed: renaming `srv.store.takeSnapshot()` in the test
+    // below to a method that does not exist still gave `zig build test`
+    // exit 0. A green suite that cannot fail is worse than no suite.
+    _ = @import("server/http_server.zig");
 }
 
 const log = std.log.scoped(.mem3_main);

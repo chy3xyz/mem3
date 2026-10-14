@@ -58,18 +58,18 @@ pub fn writeJsonlLine(
 
 test "writeJsonlLine: roundtrip a known message" {
     var buf: [1024]u8 = undefined;
-    var stream = std.io.fixedBufferStream(&buf);
-    try writeJsonlLine(&stream.writer(), "test", .info, "hello world");
-    const out = stream.getWritten();
+    var stream = std.Io.Writer.fixed(&buf);
+    try writeJsonlLine(&stream, "test", .info, "hello world");
+    const out = stream.buffer[0..stream.end];
     try std.testing.expect(std.mem.startsWith(u8, out, "{\"ts\":\""));
     try std.testing.expect(std.mem.endsWith(u8, out, "\"msg\":\"hello world\"}\n"));
 }
 
 test "writeJsonlLine: escapes special characters" {
     var buf: [1024]u8 = undefined;
-    var stream = std.io.fixedBufferStream(&buf);
-    try writeJsonlLine(&stream.writer(), "test", .info, "with \"quotes\" and \\backslash and\nnewline");
-    const out = stream.getWritten();
+    var stream = std.Io.Writer.fixed(&buf);
+    try writeJsonlLine(&stream, "test", .info, "with \"quotes\" and \\backslash and\nnewline");
+    const out = stream.buffer[0..stream.end];
     try std.testing.expect(std.mem.indexOf(u8, out, "\\\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "\\\\") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "\\n") != null);

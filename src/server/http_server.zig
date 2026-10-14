@@ -21,9 +21,6 @@ const builtin = @import("builtin");
 const core = @import("../core/mod.zig");
 const MemCell = core.MemCell;
 const MemorySource = core.MemorySource;
-const fact = @import("../core/types.zig").Fact;
-const foresight_t = @import("../core/types.zig").Foresight;
-const goal_assoc_t = @import("../core/types.zig").GoalAssociation;
 const ghw = @import("../ghw/mod.zig");
 const ghw_goal_tree = @import("../ghw/goal_tree.zig");
 const jsonl = @import("../utils/jsonl.zig");
@@ -31,12 +28,6 @@ const mem3_store = @import("../store/store.zig");
 const RerankContext = @import("../retrieval/reranker.zig").RerankContext;
 const memory = @import("../memory/mod.zig");
 const retrieval = @import("../retrieval/mod.zig");
-const HNSW = retrieval.HNSW;
-const WAL = @import("../storage/wal.zig").WAL;
-const WALRecord = @import("../storage/wal.zig").WALRecord;
-const Snapshot = @import("../storage/snapshot.zig");
-const SnapshotData = Snapshot.SnapshotData;
-const SnapshotWriter = Snapshot.SnapshotWriter;
 
 const log = std.log.scoped(.mem3_server);
 
@@ -81,866 +72,20 @@ fn wallClockSec() i64 {
 }
 
 /// In-process memory store. Lives for the duration of the server.
-const Store = struct {
-    alloc: Allocator,
-    ids: std.atomic.Value(u64),
-    goals: *ghw.GoalPoset,
-    mgr: *memory.TriSourceManager,
-    lc: *memory.Lifecycle,
-    hnsw: *HNSW,
-    emb: retrieval.Embedder,
-    cell_index: std.AutoHashMap(u64, *MemCell),
-    /// WAL for crash-safe persistence. Optional so tests / dry-runs can opt out.
-    wal: ?*WAL,
-    /// Snapshot path (data_dir/snapshot.bin). On boot, if the
-    /// snapshot exists, we read it before replaying the WAL.
-    snapshot_path: []u8,
-
-    fn init(alloc: Allocator, data_dir: []const u8) !*Store {
-        const self = try alloc.create(Store);
-        self.* = .{
-            .alloc = alloc,
-            .ids = .init(1),
-            .goals = undefined,
-            .mgr = undefined,
-            .lc = undefined,
-            .hnsw = undefined,
-            .emb = undefined,
-            .cell_index = std.AutoHashMap(u64, *MemCell).init(alloc),
-            .wal = null,
-            .snapshot_path = undefined,
-        };
-        // Goals
-        var goals = try alloc.create(ghw.GoalPoset);
-        goals.* = ghw.GoalPoset.init(alloc);
-        self.goals = goals;
-        _ = try goals.create("general", "catch-all", null, 5, null, 0, &self.ids);
-        _ = try goals.create("research", "research-related", null, 7, null, 0, &self.ids);
-        _ = try goals.create("system", "system / meta", null, 6, null, 0, &self.ids);
-        // TriSourceManager
-        const mgr = try alloc.create(memory.TriSourceManager);
-        mgr.* = memory.TriSourceManager.init(alloc, &self.ids);
-        self.mgr = mgr;
-        // Lifecycle
-        const lc = try alloc.create(memory.Lifecycle);
-        lc.* = memory.Lifecycle.init(alloc, .{}, mgr);
-        lc.wire();
-        self.lc = lc;
-        // HNSW
-        const hnsw = try alloc.create(HNSW);
-        hnsw.* = HNSW.init(alloc, .{}, 384);
-        self.hnsw = hnsw;
-        self.emb = retrieval.Embedder.init(.lexical_hash, 384);
-        // Compute snapshot path: <data_dir>/snapshot.bin
-        self.snapshot_path = std.fs.path.join(self.alloc, &.{ data_dir, "snapshot.bin" }) catch {
-            log.err("snapshot path too long; persistence disabled", .{});
-            return error.SnapshotPathTooLong;
-        };
-        // Open WAL (best-effort) and replay if data_dir exists.
-        try self.openAndReplayWAL(data_dir);
-        return self;
-    }
-
-    fn deinit(self: *Store) void {
-        if (self.wal) |w| {
-            w.flush() catch {};
-            w.deinit();
-            self.alloc.destroy(w);
-            self.wal = null;
-        }
-        self.alloc.free(self.snapshot_path);
-        var it = self.cell_index.iterator();
-        while (it.next()) |_| {}
-        self.cell_index.deinit();
-        self.hnsw.deinit();
-        self.alloc.destroy(self.hnsw);
-        // Lifecycle wraps mgr + fuzzy; clean fuzzy, then mgr deinit handles lc.
-        self.lc.fuzzy.deinit();
-        self.alloc.destroy(self.lc);
-        self.mgr.deinit();
-        self.alloc.destroy(self.mgr);
-        self.goals.deinit();
-        self.alloc.destroy(self.goals);
-        self.alloc.destroy(self);
-    }
-
-    /// Front-door insert. Pre-assigns an id, journaled to WAL first, then
-    /// committed to in-memory state. If the WAL write fails the in-memory
-    /// store is untouched and the id is returned to the pool. Caller is
-    /// guaranteed: `Ok(id) ⟹ cell is durable on disk AND observable in
-    /// memory`.
-    fn addRaw(
-        self: *Store,
-        source: MemorySource,
-        episode: []const u8,
-        facts: []const u8,
-        goal_id: u64,
-        relevance: f32,
-    ) !u64 {
-        const id = self.ids.fetchAdd(1, .monotonic);
-        errdefer _ = self.ids.fetchSub(1, .monotonic);
-
-        const built = try self.buildCellFromInput(id, source, episode, facts, goal_id, relevance);
-        errdefer built.deinit(self.alloc);
-
-        if (self.wal) |wal| {
-            const payload = try self.encodeWALPayload(
-                id,
-                source,
-                episode,
-                facts,
-                goal_id,
-                relevance,
-                built.cell.metadata,
-            );
-            defer self.alloc.free(payload);
-            try wal.append(.{
-                .record_type = .memcell_insert,
-                .payload = payload,
-                .timestamp = wallClockSec(),
-            });
-        }
-        try self.commitBuiltCell(id, built);
-        return id;
-    }
-
-    /// Replay-side insert. The id + metadata come from the WAL record.
-    fn addRawNoWAL(
-        self: *Store,
-        id: u64,
-        source: MemorySource,
-        episode: []const u8,
-        facts: []const u8,
-        goal_id: u64,
-        relevance: f32,
-        meta: core.Metadata,
-    ) !u64 {
-        const built = try self.buildCellFromParsed(id, source, episode, facts, goal_id, relevance, meta);
-        errdefer built.deinit(self.alloc);
-        try self.commitBuiltCell(id, built);
-        return id;
-    }
-
-    /// A built cell plus the heap-allocated lists it borrows FROM. The
-    /// cell's *internal* slices (episode, atomic_facts, etc.) are still
-    /// borrowed from the caller — this struct does NOT own them.
-    /// Caller must `deinit()` AFTER mgr has duped the slices (i.e.
-    /// after a successful `commitBuiltCell`). On errdefer paths
-    /// (failure before commit) the deinit is still safe because the
-    /// inner slices haven't been duped anywhere; the caller's defer
-    /// owns their lifetime.
-    const BuiltCell = struct {
-        cell: *MemCell,
-        fact_list: *std.ArrayList(fact),
-        goal_list: *std.ArrayList(goal_assoc_t),
-
-        /// Free the heap-allocated containers we own. Does NOT free
-        /// the cell's inner slices — those belong to the caller until
-        /// mgr.addWithId dups them.
-        pub fn deinit(self: *const BuiltCell, alloc: Allocator) void {
-            self.fact_list.deinit(alloc);
-            self.goal_list.deinit(alloc);
-            alloc.destroy(self.fact_list);
-            alloc.destroy(self.goal_list);
-            alloc.destroy(self.cell);
-        }
-    };
-
-    /// Read snapshot (if present) and restore mgr + fuzzy + id counter.
-    /// Called by openAndReplayWAL before the WAL replay pass.
-    fn loadSnapshot(self: *Store) !void {
-        var data = Snapshot.read(self.alloc, self.snapshot_path) catch |err| switch (err) {
-            error.SnapshotOpenFailed,
-            error.SnapshotEmpty,
-            error.SnapshotTruncated,
-            error.SnapshotBadMagic,
-            error.SnapshotBadVersion,
-            => {
-                std.log.info("WAL: no valid snapshot at {s}, starting fresh", .{self.snapshot_path});
-                return;
-            },
-            else => return err,
-        };
-        defer data.deinit();
-        std.log.info("WAL: snapshot has {d} cells, {d} fuzzy, counter={d}", .{
-            data.cells.len,
-            data.fuzzy_cells.len,
-            data.counter,
-        });
-
-        // Restore the id counter so fresh inserts pick up after the snapshot.
-        if (data.counter > 0) {
-            _ = self.ids.fetchMax(data.counter, .monotonic);
-        }
-
-        // Re-insert cells into the manager. Use mgr.addWithId so the
-        // counter is honored (snapshot ids are stable across boots).
-        for (data.cells) |cs| {
-            const cell = try self.alloc.create(MemCell);
-            errdefer self.alloc.destroy(cell);
-            cell.* = .{
-                .id = cs.id,
-                .source = cs.source,
-                .episode = cs.episode, // borrowed; mgr will dup
-                .atomic_facts = cs.facts,
-                .foresight = cs.foresight,
-                .goal_associations = cs.goal_associations,
-                .metadata = cs.metadata,
-            };
-            _ = self.lc.addCell(cs.id, cell.*) catch |err| {
-                std.log.warn("snapshot: addCell failed for id={d}: {}", .{ cs.id, err });
-                return;
-            };
-            if (self.mgr.get(cs.id)) |stored| try self.cell_index.put(cs.id, stored);
-        }
-        for (data.fuzzy_cells) |cs| {
-            // Allocate a fresh MemCell for fuzzy (we want to own the slices).
-            const cell = try self.alloc.create(MemCell);
-            errdefer self.alloc.destroy(cell);
-            cell.* = .{
-                .id = cs.id,
-                .source = cs.source,
-                .episode = try self.alloc.dupe(u8, cs.episode),
-                .atomic_facts = try self.cloneFacts(cs.facts),
-                .foresight = try self.cloneForesights(cs.foresight),
-                .goal_associations = try self.alloc.dupe(core.GoalAssociation, cs.goal_associations),
-                .metadata = cs.metadata,
-            };
-            try self.lc.fuzzy.transfer(cell);
-        }
-    }
-
-    /// Take a snapshot of (counter, mgr, fuzzy) to disk, then truncate
-    /// the WAL. Atomic: snapshot is written to a temp file, fsync'd,
-    /// then renamed over the previous snapshot. After a successful
-    /// snapshot the WAL is truncated because the snapshot now contains
-    /// the full state — no replay needed for any record ≤ snapshot.
-    fn takeSnapshot(self: *Store) !void {
-        var w = SnapshotWriter.init(self.alloc, self.snapshot_path);
-        const bytes = w.write(
-            self.ids.load(.monotonic),
-            self.goals,
-            self.mgr,
-            &self.lc.fuzzy,
-        ) catch |err| {
-            std.log.warn("snapshot: write failed: {}", .{err});
-            return;
-        };
-        std.log.info("snapshot: wrote {d} bytes to {s}", .{ bytes, self.snapshot_path });
-        // Truncate the WAL. Close, delete, reopen as fresh.
-        if (self.wal) |wal| {
-            wal.flush() catch {};
-            wal.deinit();
-            self.alloc.destroy(wal);
-            self.wal = null;
-            // Delete the old WAL file so the new one starts empty.
-            const wal_path = std.fs.path.join(self.alloc, &.{
-                self.snapshot_path[0 .. self.snapshot_path.len - "snapshot.bin".len],
-                "mem3.wal",
-            }) catch return;
-            defer self.alloc.free(wal_path);
-            var zbuf: [std.fs.max_path_bytes + 1]u8 = undefined;
-            const z = std.fmt.bufPrint(&zbuf, "{s}\x00", .{wal_path}) catch return;
-            _ = std.c.unlink(z[0 .. z.len - 1 :0].ptr);
-            // Reopen a fresh WAL.
-            const wal_ptr = self.alloc.create(WAL) catch return;
-            wal_ptr.* = try WAL.init(self.alloc, wal_path);
-            wal_ptr.open() catch {
-                wal_ptr.deinit();
-                self.alloc.destroy(wal_ptr);
-                return;
-            };
-            self.wal = wal_ptr;
-            // Truncating the WAL deletes every `goal_create` record it
-            // held, and the snapshot carries only (counter, cells,
-            // fuzzy) — see the `collectGoals` TODO in snapshot.zig. So
-            // without this the daemon silently deletes every user goal
-            // on the first `POST /api/sync`. Reproduced end to end: a
-            // goal created by `mem3 goal add` was present in the API,
-            // vanished from disk after one sync, and stayed gone for
-            // the CLI too because both share the data dir.
-            self.rejournalGoals(wal_ptr);
-        }
-    }
-
-    /// Re-emit every non-synthetic goal into a freshly truncated WAL.
-    ///
-    /// Walks breadth-first from ⊥ so a parent is always journaled before
-    /// its children; replay drops a child whose parent is absent.
-    /// Mirrors `Store.rejournalGoals`, which cannot be called directly
-    /// because this file carries its own duplicate `Store` type — but
-    /// the wire format comes from the shared encoder, so the two cannot
-    /// drift.
-    fn rejournalGoals(self: *Store, wal: *WAL) void {
-        var queue = std.ArrayList(u64).empty;
-        defer queue.deinit(self.alloc);
-        queue.append(self.alloc, ghw_goal_tree.ROOT_GOAL_ID) catch {
-            log.warn("rejournalGoals: out of memory — goals not carried into the new WAL", .{});
-            return;
-        };
-        var head: usize = 0;
-        var written: usize = 0;
-        while (head < queue.items.len) : (head += 1) {
-            for (self.goals.childrenOf(queue.items[head])) |child_id| {
-                if (child_id == ghw_goal_tree.ROOT_GOAL_ID or child_id == ghw_goal_tree.TOP_GOAL_ID) continue;
-                const node = self.goals.get(child_id) orelse continue;
-                // `GoalPoset.create` stores ⊥ as a concrete parent;
-                // write back the API's "absent" form.
-                const parent_id: ?u64 = if (node.parent_id) |p|
-                    (if (p == ghw_goal_tree.ROOT_GOAL_ID) null else p)
-                else
-                    null;
-                {
-                    const payload = mem3_store.Store.encodeGoalWALPayloadRaw(
-                        self.alloc,
-                        child_id,
-                        node.name,
-                        node.description,
-                        parent_id,
-                        node.priority,
-                        node.deadline,
-                        node.created_at,
-                    ) catch |err| {
-                        log.warn("rejournalGoals: encode failed for goal {d}: {}", .{ child_id, err });
-                        continue;
-                    };
-                    defer self.alloc.free(payload);
-                    wal.append(.{
-                        .record_type = .goal_create,
-                        .payload = payload,
-                        .timestamp = wallClockSec(),
-                    }) catch |err| {
-                        log.warn("rejournalGoals: append failed for goal {d}: {}", .{ child_id, err });
-                        return;
-                    };
-                }
-                written += 1;
-                // `goal_create` carries no status and `GoalPoset.create`
-                // always starts at `.pending`; re-emit a status record
-                // for anything the user actually changed.
-                if (node.status != .pending) {
-                    const st = mem3_store.Store.encodeGoalUpdatePayloadRaw(
-                        self.alloc,
-                        child_id,
-                        node.status,
-                        node.updated_at,
-                    ) catch |err| {
-                        log.warn("rejournalGoals: status encode failed for goal {d}: {}", .{ child_id, err });
-                        continue;
-                    };
-                    defer self.alloc.free(st);
-                    wal.append(.{
-                        .record_type = .goal_update,
-                        .payload = st,
-                        .timestamp = wallClockSec(),
-                    }) catch |err| {
-                        log.warn("rejournalGoals: status append failed for goal {d}: {}", .{ child_id, err });
-                        return;
-                    };
-                }
-                queue.append(self.alloc, child_id) catch {
-                    log.warn("rejournalGoals: out of memory at depth {d} — subtree dropped", .{head});
-                    return;
-                };
-            }
-        }
-        log.info("rejournalGoals: re-emitted {d} goal records into the fresh WAL", .{written});
-    }
-
-    fn cloneFacts(self: *Store, src: []const core.Fact) ![]core.Fact {
-        const out = try self.alloc.alloc(core.Fact, src.len);
-        for (src, 0..) |f, i| {
-            out[i] = .{
-                .subject = try self.alloc.dupe(u8, f.subject),
-                .predicate = try self.alloc.dupe(u8, f.predicate),
-                .object = try self.alloc.dupe(u8, f.object),
-                .confidence = f.confidence,
-                .source = try self.alloc.dupe(u8, f.source),
-            };
-        }
-        return out;
-    }
-
-    fn cloneForesights(self: *Store, src: []const core.Foresight) ![]core.Foresight {
-        const out = try self.alloc.alloc(core.Foresight, src.len);
-        for (src, 0..) |f, i| {
-            out[i] = .{
-                .description = try self.alloc.dupe(u8, f.description),
-                .valid_from = f.valid_from,
-                .valid_until = f.valid_until,
-                .confidence = f.confidence,
-            };
-        }
-        return out;
-    }
-
-    /// Build a fresh MemCell from user input (new insert). Uses the
-    /// encoder to set fresh metadata (created_at = now, etc.). Returns
-    /// a BuiltCell whose lists must outlive the mgr commit; use
-    /// `commitBuiltCell` to commit and then deinit the BuiltCell.
-    fn buildCellFromInput(
-        self: *Store,
-        id: u64,
-        source: MemorySource,
-        episode: []const u8,
-        facts: []const u8,
-        goal_id: u64,
-        relevance: f32,
-    ) !BuiltCell {
-        const fact_list = try self.alloc.create(std.ArrayList(fact));
-        errdefer self.alloc.destroy(fact_list);
-        fact_list.* = .empty;
-
-        const goal_list = try self.alloc.create(std.ArrayList(goal_assoc_t));
-        errdefer self.alloc.destroy(goal_list);
-        goal_list.* = .empty;
-
-        errdefer fact_list.deinit(self.alloc);
-        errdefer goal_list.deinit(self.alloc);
-
-        var it = std.mem.splitScalar(u8, facts, ';');
-        while (it.next()) |part| {
-            if (part.len == 0) continue;
-            var pit = std.mem.splitScalar(u8, part, '|');
-            const s = pit.next() orelse "";
-            const p = pit.next() orelse "";
-            const o = pit.next() orelse "";
-            try fact_list.append(self.alloc, .{
-                .subject = s,
-                .predicate = p,
-                .object = o,
-                .confidence = 1.0,
-                .source = "api",
-            });
-        }
-
-        try goal_list.append(self.alloc, .{
-            .goal_id = goal_id,
-            .relevance = relevance,
-            .priority = 5,
-        });
-
-        const cell_ptr = try self.alloc.create(MemCell);
-        errdefer self.alloc.destroy(cell_ptr);
-        cell_ptr.* = try self.lc.encoder.encode(.{
-            .source = source,
-            .episode = episode,
-            .atomic_facts = fact_list.items,
-            .foresight = &[_]foresight_t{},
-            .goal_associations = goal_list.items,
-        });
-        cell_ptr.id = id;
-        return .{
-            .cell = cell_ptr,
-            .fact_list = fact_list,
-            .goal_list = goal_list,
-        };
-    }
-
-    /// Build a MemCell from a WAL record (replay). Uses the metadata
-    /// that was persisted, NOT fresh timestamps. This is the key to
-    /// Principle III fidelity across boots.
-    fn buildCellFromParsed(
-        self: *Store,
-        id: u64,
-        source: MemorySource,
-        episode: []const u8,
-        facts: []const u8,
-        goal_id: u64,
-        relevance: f32,
-        meta: core.Metadata,
-    ) !BuiltCell {
-        const fact_list = try self.alloc.create(std.ArrayList(fact));
-        errdefer self.alloc.destroy(fact_list);
-        fact_list.* = .empty;
-
-        const goal_list = try self.alloc.create(std.ArrayList(goal_assoc_t));
-        errdefer self.alloc.destroy(goal_list);
-        goal_list.* = .empty;
-
-        errdefer fact_list.deinit(self.alloc);
-        errdefer goal_list.deinit(self.alloc);
-
-        var it = std.mem.splitScalar(u8, facts, ';');
-        while (it.next()) |part| {
-            if (part.len == 0) continue;
-            var pit = std.mem.splitScalar(u8, part, '|');
-            const s = pit.next() orelse "";
-            const p = pit.next() orelse "";
-            const o = pit.next() orelse "";
-            try fact_list.append(self.alloc, .{
-                .subject = s,
-                .predicate = p,
-                .object = o,
-                .confidence = 1.0,
-                .source = "api",
-            });
-        }
-
-        try goal_list.append(self.alloc, .{
-            .goal_id = goal_id,
-            .relevance = relevance,
-            .priority = 5,
-        });
-
-        const cell_ptr = try self.alloc.create(MemCell);
-        errdefer self.alloc.destroy(cell_ptr);
-        cell_ptr.* = .{
-            .id = id,
-            .source = source,
-            .episode = episode, // borrowed; mgr.addWithId will dup
-            .atomic_facts = fact_list.items, // borrowed
-            .foresight = &[_]foresight_t{},
-            .goal_associations = goal_list.items, // borrowed
-            .metadata = meta,
-        };
-        return .{
-            .cell = cell_ptr,
-            .fact_list = fact_list,
-            .goal_list = goal_list,
-        };
-    }
-
-    /// Commit a built cell to mgr + cell_index + hnsw. The lists
-    /// (fact_list, goal_list) are deinited in-place because the mgr
-    /// already duped their contents into its own store.
-    fn commitBuiltCell(self: *Store, id: u64, built: BuiltCell) !void {
-        _ = try self.lc.addCell(id, built.cell.*);
-        // The mgr has now duped all borrowed slices. Free the lists.
-        built.fact_list.deinit(self.alloc);
-        built.goal_list.deinit(self.alloc);
-        self.alloc.destroy(built.fact_list);
-        self.alloc.destroy(built.goal_list);
-        self.alloc.destroy(built.cell);
-
-        if (self.mgr.get(id)) |stored| {
-            try self.cell_index.put(id, stored);
-            const v = try self.emb.embed(self.alloc, stored.episode);
-            defer self.alloc.free(v);
-            self.hnsw.insert(id, v) catch |err| {
-                log.warn("hnsw insert failed: {}", .{err});
-            };
-        }
-    }
-
-    /// Encode a memcell_insert WAL payload as a self-contained JSON document.
-    /// Fields: { id, source, episode, facts, goal_id, relevance, ...meta }.
-    /// The id MUST be the pre-assigned id (same one used to commit the
-    /// cell in memory); replay uses it to keep the WAL→memory contract
-    /// identical across boots. Metadata fields are persisted so Principle
-    /// III (existence-gain-driven) rankings are stable across boots
-    /// instead of being reset to "now".
-    fn encodeWALPayload(
-        self: *Store,
-        id: u64,
-        source: MemorySource,
-        episode: []const u8,
-        facts: []const u8,
-        goal_id: u64,
-        relevance: f32,
-        meta: core.Metadata,
-    ) ![]u8 {
-        var out = std.ArrayList(u8).empty;
-        defer out.deinit(self.alloc);
-        try out.append(self.alloc, '{');
-        try jsonFieldUintRaw(self.alloc, &out, "id", id);
-        try out.append(self.alloc, ',');
-        try jsonFieldStringRaw(self.alloc, &out, "source", source.label());
-        try out.append(self.alloc, ',');
-        try jsonFieldStringRaw(self.alloc, &out, "episode", episode);
-        try out.append(self.alloc, ',');
-        try jsonFieldStringRaw(self.alloc, &out, "facts", facts);
-        try out.append(self.alloc, ',');
-        try jsonFieldUintRaw(self.alloc, &out, "goal_id", goal_id);
-        try out.append(self.alloc, ',');
-        try jsonFieldFloatRaw(self.alloc, &out, "relevance", relevance);
-        try out.append(self.alloc, ',');
-        // Metadata round-trip (Principle III fidelity).
-        try jsonFieldIntRaw(self.alloc, &out, "created_at", meta.created_at);
-        try out.append(self.alloc, ',');
-        try jsonFieldIntRaw(self.alloc, &out, "updated_at", meta.updated_at);
-        try out.append(self.alloc, ',');
-        try jsonFieldIntRaw(self.alloc, &out, "last_accessed_at", meta.last_accessed_at);
-        try out.append(self.alloc, ',');
-        try jsonFieldFloatRaw(self.alloc, &out, "importance_score", meta.importance_score);
-        try out.append(self.alloc, ',');
-        try jsonFieldFloatRaw(self.alloc, &out, "coherence_score", meta.coherence_score);
-        try out.append(self.alloc, ',');
-        try jsonFieldFloatRaw(self.alloc, &out, "decay_rate", meta.decay_rate);
-        try out.append(self.alloc, ',');
-        try jsonFieldFloatRaw(self.alloc, &out, "source_confidence", meta.source_confidence);
-        try out.append(self.alloc, ',');
-        try jsonFieldFloatRaw(self.alloc, &out, "emotional_valence", meta.emotional_valence);
-        try out.append(self.alloc, ',');
-        try jsonFieldUintRaw(self.alloc, &out, "access_count", meta.access_count);
-        try out.append(self.alloc, '}');
-        return out.toOwnedSlice(self.alloc);
-    }
-
-    /// Open the WAL at data_dir/mem3.wal and replay any prior records.
-    /// Creates the directory tree if missing. Returns an error on any
-    /// real filesystem failure (EACCES, ENOSPC, etc.) so the caller can
-    /// refuse to start rather than silently run in-memory.
-    fn openAndReplayWAL(self: *Store, data_dir: []const u8) !void {
-        const dir_path = try self.alloc.dupe(u8, data_dir);
-        defer self.alloc.free(dir_path);
-
-        // Recursive mkdir (mkdir -p). 0.17 std has no public makeDir API,
-        // so we shell out to the C `mkdir` syscall per path component.
-        // A non-zero return is treated as EEXIST *only* if the path already
-        // exists as a directory; otherwise the real error propagates.
-        var it = std.mem.splitScalar(u8, dir_path, '/');
-        var prefix: std.ArrayList(u8) = .empty;
-        defer prefix.deinit(self.alloc);
-        // Absolute path starting with / : add a leading slash.
-        if (dir_path.len > 0 and dir_path[0] == '/') {
-            try prefix.append(self.alloc, '/');
-        }
-        while (it.next()) |component| {
-            if (component.len == 0) continue;
-            if (prefix.items.len > 0 and prefix.items[prefix.items.len - 1] != '/') {
-                try prefix.append(self.alloc, '/');
-            }
-            try prefix.appendSlice(self.alloc, component);
-            var zbuf: [std.fs.max_path_bytes + 1]u8 = undefined;
-            const z = std.fmt.bufPrint(&zbuf, "{s}\x00", .{prefix.items}) catch {
-                return error.DataDirPathTooLong;
-            };
-            const zptr = z[0 .. z.len - 1 :0].ptr;
-            const rc = std.c.mkdir(zptr, 0o755);
-            if (rc == 0) continue;
-            // mkdir returned -1. EEXIST (most common case in dev) is fine
-            // if the path is already a directory. Anything else propagates.
-            var st: std.c.Stat = undefined;
-            if (std.c.stat(zptr, &st) != 0) return error.DataDirStatFailed;
-            const mode_u32: u32 = @intCast(st.mode);
-            if ((mode_u32 & 0xF000) != 0x4000) return error.DataDirNotADirectory;
-        }
-
-        const wal_path = std.fs.path.join(self.alloc, &.{ data_dir, "mem3.wal" }) catch |err| {
-            log.warn("path.join failed: {}; persistence disabled", .{err});
-            return;
-        };
-        defer self.alloc.free(wal_path);
-
-        // Build a NUL-terminated copy for C open() calls.
-        var wal_z_buf: [std.fs.max_path_bytes + 1]u8 = undefined;
-        const wal_z = std.fmt.bufPrint(&wal_z_buf, "{s}\x00", .{wal_path}) catch {
-            log.warn("path too long", .{});
-            return;
-        };
-        const wal_z_slice = wal_z[0 .. wal_z.len - 1 :0];
-
-        // Try to read existing WAL via POSIX open (0.17 has no fs.openFileAbsolute).
-        var existing: std.ArrayList(u8) = .empty;
-        defer existing.deinit(self.alloc);
-
-        const fd = std.c.open(wal_z_slice.ptr, std.c.O{}, @as(c.mode_t, 0));
-        if (fd >= 0) {
-            defer _ = std.c.close(fd);
-            var stat_buf: std.c.Stat = undefined;
-            if (std.c.fstat(fd, &stat_buf) == 0) {
-                const size: usize = @intCast(@max(0, stat_buf.size));
-                if (size > 0) {
-                    const buf = try self.alloc.alloc(u8, size);
-                    defer self.alloc.free(buf);
-                    var got: usize = 0;
-                    while (got < size) {
-                        const n = std.c.read(fd, buf[got..].ptr, size - got);
-                        if (n <= 0) break;
-                        got += @intCast(n);
-                    }
-                    try existing.appendSlice(self.alloc, buf[0..got]);
-                }
-            }
-        }
-        // Now allocate the WAL (it will createFile on open()).
-        const wal_ptr = self.alloc.create(WAL) catch |err| {
-            std.log.err("WAL: alloc failed: {s}", .{@errorName(err)});
-            return;
-        };
-        const init_wal = WAL.init(self.alloc, wal_path) catch |err| {
-            std.log.err("WAL: init failed: {s}", .{@errorName(err)});
-            self.alloc.destroy(wal_ptr);
-            return;
-        };
-        wal_ptr.* = init_wal;
-        wal_ptr.open() catch |err| {
-            std.log.err("WAL: open({s}) failed: {s}", .{ wal_path, @errorName(err) });
-            wal_ptr.deinit();
-            self.alloc.destroy(wal_ptr);
-            return;
-        };
-        std.log.info("WAL: opened {s} (replay={d} bytes)", .{ wal_path, existing.items.len });
-        self.wal = wal_ptr;
-        // Read snapshot FIRST (if present), then replay WAL on top.
-        // Snapshot is the "base" state; WAL records are deltas since
-        // the snapshot.
-        try self.loadSnapshot();
-        if (existing.items.len == 0) return;
-
-        // Replay records.
-        var replay_count: u64 = 0;
-        var max_replayed_id: u64 = 0;
-        var replayed_goals: u64 = 0;
-        // Records from before commit 5c3fdb9 (which added the "id" WAL
-        // field) have no id. We synthesize one in a high range
-        // (≥ 1_000_000_000) so they can't collide with fresh inserts. The
-        // ordinal counter resets on every boot, but that's fine — the
-        // SAME record gets the SAME synthetic id on every replay, and
-        // the cell content (episode/facts/etc.) is stable, so external
-        // observers see a stable id.
-        var synthetic_id_seq: u64 = 0;
-        const SYNTHETIC_ID_BASE: u64 = 1_000_000_000;
-        const Ctx = struct {
-            store: *Store,
-            count: *u64,
-            max_id: *u64,
-            synthetic_seq: *u64,
-            goal_count: *u64,
-        };
-        var ctx = Ctx{
-            .store = self,
-            .count = &replay_count,
-            .max_id = &max_replayed_id,
-            .synthetic_seq = &synthetic_id_seq,
-            .goal_count = &replayed_goals,
-        };
-        wal_ptr.replay(existing.items, &ctx, struct {
-            fn cb(ctx_ptr: *Ctx, rec: WALRecord) anyerror!void {
-                // `goal_create` records used to be dropped here entirely,
-                // because this daemon carries its own duplicate `Store`
-                // with its own replay loop. So `mem3 goal add` wrote a
-                // durable goal record that this process never read back,
-                // and `GET /api/goals` disagreed with `mem3 goal list`.
-                if (rec.record_type == .goal_create) {
-                    applyGoalRecord(ctx_ptr.store, rec.payload, ctx_ptr.goal_count, ctx_ptr.max_id);
-                    return;
-                }
-                if (rec.record_type == .goal_update) {
-                    applyGoalStatusRecord(ctx_ptr.store, rec.payload);
-                    return;
-                }
-                if (rec.record_type != .memcell_insert) return;
-                const synthetic_id = SYNTHETIC_ID_BASE + @atomicRmw(u64, ctx_ptr.synthetic_seq, .Add, 1, .seq_cst);
-                const parsed = parseInsertPayload(
-                    ctx_ptr.store.alloc,
-                    rec.payload,
-                    synthetic_id,
-                ) catch |err| {
-                    if (err == error.ParseFailed) {
-                        std.log.warn("WAL: skipping corrupt record (parse failed)", .{});
-                        return;
-                    }
-                    return err;
-                };
-                defer parsed.deinit(ctx_ptr.store.alloc);
-                if (parsed.id > ctx_ptr.max_id.*) ctx_ptr.max_id.* = parsed.id;
-                _ = ctx_ptr.store.addRawNoWAL(
-                    parsed.id,
-                    parsed.source,
-                    parsed.episode,
-                    parsed.facts,
-                    parsed.goal_id,
-                    parsed.relevance,
-                    parsed.metadata,
-                ) catch |err| {
-                    std.log.warn("replay insert failed: {}", .{err});
-                    return;
-                };
-                ctx_ptr.count.* += 1;
-            }
-        }.cb) catch |err| {
-            log.warn("WAL replay stopped at record {d}: {}", .{ replay_count, err });
-        };
-        // Bump the id counter past the highest replayed id so future
-        // fresh inserts can't collide with a replayed one. fetchMax is
-        // atomic and idempotent: if `ids` is already past, no change.
-        if (max_replayed_id > 0) {
-            _ = self.ids.fetchMax(max_replayed_id + 1, .monotonic);
-        }
-        std.log.info("WAL: replayed {d} memcell_insert + {d} goal_create records from {s}", .{ replay_count, replayed_goals, wal_path });
-    }
-
-    /// Replay one `goal_create` record into the daemon's poset.
-    ///
-    /// Mirrors `store.Store.applyGoalRecord`, which cannot be reused
-    /// directly because this file carries its own duplicate `Store` type.
-    /// The payload parser itself IS shared (`mem3_store.parseGoalPayload`)
-    /// so the two can never drift on the wire format.
-    ///
-    /// Idempotent: an id already in the poset is skipped, so replaying a
-    /// WAL on top of a snapshot is a no-op rather than a duplicate. Logs
-    /// are gated on `builtin.is_test` because the Zig 0.17 test runner
-    /// fails any test that emits a log line.
-    /// Replay one `goal_update` record into the daemon's poset.
-    ///
-    /// Without this the daemon's in-memory status stayed at whatever
-    /// `goal_create` produced (always `.pending`), and the next
-    /// `POST /api/sync` faithfully re-journalled that wrong state —
-    /// destroying the user's real status along with the original
-    /// `goal_update` record it truncated away.
-    fn applyGoalStatusRecord(store_self: *Store, payload: []const u8) void {
-        const id_i = extractJsonInt(payload, "id") orelse return;
-        if (id_i < 0) return;
-        const id: u64 = @intCast(id_i);
-        const status_str = extractJsonStringOrOwned(store_self.alloc, payload, "status", "") catch return;
-        defer store_self.alloc.free(status_str);
-        const status = std.meta.stringToEnum(core.GoalStatus, status_str) orelse {
-            if (!builtin.is_test) log.warn("WAL: goal_update id={d} has unknown status '{s}', skipped", .{ id, status_str });
-            return;
-        };
-        if (!store_self.goals.nodes.contains(id)) {
-            if (!builtin.is_test) log.warn("WAL: goal_update id={d} skipped — goal not in poset", .{id});
-            return;
-        }
-        const updated_at = extractJsonInt(payload, "updated_at") orelse 0;
-        store_self.goals.updateStatus(id, status, updated_at) catch |err| {
-            if (!builtin.is_test) log.warn("WAL: goal_update id={d} failed: {}", .{ id, err });
-            return;
-        };
-    }
-
-    fn applyGoalRecord(store_self: *Store, payload: []const u8, count: *u64, max_id: *u64) void {
-        const g = mem3_store.parseGoalPayload(store_self.alloc, payload) catch |err| {
-            if (!builtin.is_test) log.warn("WAL: skipping goal_create record (parse failed: {})", .{err});
-            return;
-        };
-        defer g.deinit(store_self.alloc);
-
-        if (g.id == ghw_goal_tree.ROOT_GOAL_ID or g.id == ghw_goal_tree.TOP_GOAL_ID) return;
-        // Clear the id even for skipped records, so a later insert can
-        // never mint an id a durable record already claims.
-        if (g.id > max_id.*) max_id.* = g.id;
-        if (store_self.goals.nodes.contains(g.id)) return;
-        if (g.parent_id) |p| {
-            if (!store_self.goals.nodes.contains(p)) {
-                if (!builtin.is_test) log.warn("WAL: goal_create id={d} dropped — parent {d} absent from poset", .{ g.id, p });
-                return;
-            }
-        }
-        // A private counter seeded to the journaled id makes the poset
-        // mint exactly this id, matching how it was first created.
-        var slot: std.atomic.Value(u64) = .init(g.id);
-        const created = store_self.goals.create(g.name, g.description, g.parent_id, g.priority, g.deadline, g.created_at, &slot) catch |err| {
-            if (!builtin.is_test) log.warn("replay: goal_create id={d} failed: {}", .{ g.id, err });
-            return;
-        };
-        if (created != g.id) {
-            if (!builtin.is_test) log.err("replay: goal_create id drift — record {d}, poset {d}", .{ g.id, created });
-            return;
-        }
-        count.* += 1;
-    }
-
-    fn allCells(self: *Store, alloc: Allocator) ![]*MemCell {
-        var out = std.ArrayList(*MemCell).empty;
-        errdefer out.deinit(alloc);
-        var it = self.cell_index.iterator();
-        while (it.next()) |entry| try out.append(alloc, entry.value_ptr.*);
-        return out.toOwnedSlice(alloc);
-    }
-};
+/// The daemon uses the single library `Store`, not a private fork.
+///
+/// This file used to carry its own ~890-line `Store` struct. It was a
+/// strict subset of `src/store/store.zig`: no hypergraph, no `multiHop`,
+/// no `forget`/`consolidate`, no idempotent `deinit`, and an `init` with
+/// no `errdefer` chain at all, so every allocation leaked whenever WAL
+/// replay failed. It had drifted far enough to cost a real bug — `POST
+/// /api/sync` truncated the WAL without replaying `goal_update` records,
+/// permanently destroying goal status, because the fork's replay loop only
+/// knew about `goal_create`.
+///
+/// One implementation is what makes the next bug impossible: there is no
+/// second copy to forget to update.
+const Store = mem3_store.Store;
 
 const Metrics = struct {
     requests_total: std.atomic.Value(u64) = .init(0),
@@ -982,9 +127,16 @@ pub const Server = struct {
     boot_time_ns: u128,
     metrics: Metrics,
 
-    pub fn init(alloc: Allocator, bind: []const u8, port: u16, data_dir: []const u8) !*Server {
+    /// `data_dir` is `null` for an in-memory server: no WAL, no snapshot,
+    /// nothing written to disk. Tests that are not about persistence must
+    /// use it — a fixed `/tmp` path makes a test non-idempotent, because
+    /// the WAL from the previous run is replayed into the next one and the
+    /// corpus quietly doubles. (That is not hypothetical: the `maxHops`
+    /// test passed on a clean `/tmp` and failed on the second run.)
+    pub fn init(alloc: Allocator, bind: []const u8, port: u16, data_dir: ?[]const u8) !*Server {
         const self = try alloc.create(Server);
-        const store = try Store.init(alloc, data_dir);
+        errdefer alloc.destroy(self);
+        const store = try Store.init(alloc, .{ .data_dir = data_dir });
         self.* = .{
             .alloc = alloc,
             .bind = try alloc.dupe(u8, bind),
@@ -1081,6 +233,13 @@ pub const Server = struct {
         status_text: []const u8,
         content_type: []const u8,
         body: []u8,
+
+        /// `body` is allocated per response, so every in-process caller has
+        /// to hand it back. This test never did — the leak only surfaced
+        /// once the file's tests were actually in the gate.
+        pub fn deinit(self: Response, alloc: Allocator) void {
+            alloc.free(self.body);
+        }
     };
 
     fn route(self: *Server, method: []const u8, path: []const u8, full_request: []const u8) !Response {
@@ -1133,7 +292,13 @@ pub const Server = struct {
             // After WAL is durable, take a snapshot + truncate WAL so
             // next boot replays from snapshot (fast) instead of replaying
             // every WAL record (slow for long-lived daemons).
-            self.store.takeSnapshot() catch |err| {
+            //
+            // `sync()` owns the whole tail: snapshot, flush, truncate, and
+            // — the step this handler was missing when it had its own
+            // store — re-journal goals and hyperedges into the fresh WAL.
+            // The snapshot does not carry goals, so skipping that
+            // re-journal is exactly what used to delete every user goal.
+            self.store.sync() catch |err| {
                 return try self.jsonResponse(500, "Internal Server Error",
                     try std.fmt.allocPrint(self.alloc, "{{\"error\":\"snapshot failed: {s}\"}}", .{@errorName(err)}));
             };
@@ -1252,7 +417,19 @@ pub const Server = struct {
         defer self.alloc.free(text);
         if (text.len == 0) return try self.jsonResponse(400, "Bad Request", "{\"error\":\"text required\"}");
         const topk = @as(usize, @intCast(extractJsonInt(body, "topk") orelse 10));
-        _ = extractJsonInt(body, "maxHops") orelse 3;
+        // `maxHops` used to be parsed and thrown away on the floor — the
+        // daemon's private Store had no hypergraph, so there was nothing to
+        // expand. It shares the library Store now, so the parameter means
+        // something. Clamped: the traversal is breadth-first over every edge
+        // of every reachable node, so an unbounded value is a cheap way to
+        // ask the daemon to materialise the whole graph.
+        const hops_raw = extractJsonInt(body, "maxHops") orelse 3;
+        const max_hops: u8 = @intCast(std.math.clamp(hops_raw, 0, 8));
+        // Per-hop relevance decay for graph expansion. Tuned so one hop
+        // keeps a graph hit competitive with a mid-ranked dense hit and
+        // three hops (the default) still surface something, while a cell
+        // four hops out cannot displace a direct semantic match.
+        const graph_decay: f32 = 0.6;
 
         _ = self.metrics.queries_total.fetchAdd(1, .monotonic);
         const t0 = nowNs();
@@ -1287,11 +464,53 @@ pub const Server = struct {
                 }
             }
             if (!found) continue;
-                try cands.append(self.alloc, .{
+            try cands.append(self.alloc, .{
                 .id = cell.id,
                 .score = score,
                 .cell = cell,
             });
+        }
+
+        // Graph expansion. Seeds are the dense hits; a cell reachable over
+        // hyperedges inherits the strongest path's score times
+        // `graph_decay` per hop, so it competes on relevance instead of
+        // arriving at 0.0.
+        //
+        // That distinction is the whole point. An earlier wiring pushed
+        // graph nodes into the pool at score 0, which made `maxHops`
+        // unobservable no matter what: the reranker is a *multiplicative*
+        // bonus on the dense score, and `out_n = min(topk, reranked.len)`
+        // truncates to exactly `topk` whenever the corpus is at least that
+        // big — so a zero-score cell could never reach the response.
+        if (max_hops > 0 and dense.len > 0) {
+            var seeds = std.ArrayList(@import("../hypermem/mod.zig").HyMem.ScoredNode).empty;
+            defer seeds.deinit(self.alloc);
+            try seeds.ensureTotalCapacity(self.alloc, dense.len);
+            for (dense) |r| try seeds.append(self.alloc, .{ .id = r.id, .score = r.score, .hops = 0 });
+
+            const reached = self.store.multiHopScored(self.alloc, seeds.items, max_hops, graph_decay, 0.0, null) catch &.{};
+            // `&.{}` is a static empty slice — never hand that to `free`.
+            defer if (reached.len > 0) self.alloc.free(reached);
+
+            // Bounded so a dense hypergraph cannot turn one query into an
+            // unbounded allocation.
+            const graph_cap = @max(topk * 4, 64);
+            var added: usize = 0;
+            for (reached) |g| {
+                if (g.hops == 0) continue; // already a dense hit
+                if (added >= graph_cap) break;
+                var dup = false;
+                for (cands.items) |existing| {
+                    if (existing.id == g.id) {
+                        dup = true;
+                        break;
+                    }
+                }
+                if (dup) continue;
+                const cell = self.store.getCell(g.id) orelse continue;
+                try cands.append(self.alloc, .{ .id = g.id, .score = g.score, .cell = cell });
+                added += 1;
+            }
         }
 
         const reranked = rr.rerankPairs(self.alloc, cands.items) catch |err| {
@@ -1631,32 +850,39 @@ fn jsonAppendCell(alloc: Allocator, out: *std.ArrayList(u8), cell: *const MemCel
 
 test "Server: healthz route" {
     const alloc = std.testing.allocator;
-    var srv = try Server.init(alloc, "127.0.0.1", 0, "/tmp/mem3_test_server");
-    defer {
-        srv.deinit();
-        // Test cleanup: remove the data dir the test created.
-        std.fs.cwd().deleteTree("/tmp/mem3_test_server") catch {};
-    }
+    var srv = try Server.init(alloc, "127.0.0.1", 0, null);
+    defer srv.deinit();
+    // No directory cleanup: Zig 0.17 moved `std.fs.cwd`/`deleteTree`, and
+    // `/tmp` is the OS's to reap. Matches the convention in store.zig.
     const resp = try srv.route("GET", "/healthz", "");
+    defer resp.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), resp.status);
     try std.testing.expect(std.mem.indexOf(u8, resp.body, "ok") != null);
 }
 
-test "Server: takeSnapshot re-journals goals so a sync cannot delete them" {
-    // Regression guard for a data-destroying bug: `takeSnapshot`
-    // truncates the WAL, the snapshot carries only (counter, cells,
-    // fuzzy), and the daemon had no `rejournalGoals` — so a single
-    // `POST /api/sync` permanently deleted every user goal, for the
-    // CLI on the same data dir too. Reproduced end to end before the
-    // fix; the goal and its non-default status both vanished.
+test "Server: sync re-journals goals so it cannot delete them" {
+    // Regression guard for a data-destroying bug, kept even though the
+    // daemon now shares the library Store and the specific cause is gone.
+    //
+    // What happened: the daemon carried a private ~890-line `Store` fork
+    // whose replay loop knew about `goal_create` but not `goal_update`.
+    // `POST /api/sync` truncated the WAL after snapshotting, and the
+    // snapshot carries only (counter, cells, fuzzy) — no goals — so every
+    // user goal, and its non-default status, was destroyed by one sync.
+    // Reproduced end to end before the fix.
+    //
+    // The fork is gone, so the bug cannot recur in that shape. The guard
+    // stays because the property is real and cheap to hold: the snapshot
+    // format still does not carry goals, so anything that truncates the
+    // WAL still has to re-journal them. `Store.sync()` is the only writer,
+    // and this asserts it end to end through the HTTP handler.
     const alloc = std.testing.allocator;
-    const dir = "/tmp/mem3_test_rejournal";
-    std.fs.cwd().deleteTree(dir) catch {};
+    var dir_buf: [64]u8 = undefined;
+    const dir = try std.fmt.bufPrint(&dir_buf, "/tmp/mem3_rejournal_{d}", .{std.c.getpid()});
 
     var srv = try Server.init(alloc, "127.0.0.1", 0, dir);
     defer {
         srv.deinit();
-        std.fs.cwd().deleteTree(dir) catch {};
     }
 
     const gid = srv.store.goals.create(
@@ -1672,7 +898,7 @@ test "Server: takeSnapshot re-journals goals so a sync cannot delete them" {
         return err;
     };
     try srv.store.goals.updateStatus(gid, .completed, 1_700_000_000_000);
-    try srv.store.takeSnapshot();
+    try srv.store.sync();
 
     // Reopen against the same directory: a fresh process would do
     // exactly this after a restart.
@@ -1689,10 +915,9 @@ test "Server: takeSnapshot re-journals goals so a sync cannot delete them" {
 
 test "Server: GET /api/goals reflects the live poset, not a fixed literal" {
     const alloc = std.testing.allocator;
-    var srv = try Server.init(alloc, "127.0.0.1", 0, "/tmp/mem3_test_server");
+    var srv = try Server.init(alloc, "127.0.0.1", 0, null);
     defer {
         srv.deinit();
-        std.fs.cwd().deleteTree("/tmp/mem3_test_server") catch {};
     }
 
     // Seeded goals must be present.
@@ -1731,6 +956,86 @@ test "Server: GET /api/goals reflects the live poset, not a fixed literal" {
         }
     }
     try std.testing.expect(found);
+}
+
+test "Server: POST /api/query maxHops actually expands over the hypergraph" {
+    // Regression guard for a parameter that was parsed and thrown away:
+    // `extractJsonInt(body, "maxHops") orelse 3` with the result discarded,
+    // because the daemon's private Store carried no hypergraph at all. The
+    // daemon now shares the library Store, so the knob is wired — and this
+    // test exists so "wired" cannot quietly become "parsed and discarded"
+    // a second time.
+    const alloc = std.testing.allocator;
+    var srv = try Server.init(alloc, "127.0.0.1", 0, null);
+    defer srv.deinit();
+
+    const anchor = try srv.store.addRaw(.matter, "kubernetes ingress controller rollout", "", 0, 0.0);
+    const island = try srv.store.addRaw(.matter, "pottery glaze chemistry firing curve", "", 0, 0.0);
+
+    // The corpus has to be big enough that the dense search *cannot* return
+    // everything: `handleQuery` asks for `topk * 3` = 30 candidates, so a
+    // 2-cell store returns both and the test proves nothing. These fillers
+    // are deliberately unrelated to the query text.
+    var filler_i: usize = 0;
+    while (filler_i < 80) : (filler_i += 1) {
+        var buf: [96]u8 = undefined;
+        const text = try std.fmt.bufPrint(&buf, "unrelated filler document number {d} about medieval shipbuilding records", .{filler_i});
+        _ = try srv.store.addRaw(.matter, text, "", 0, 0.0);
+    }
+
+    // The whole point: `island` shares no vocabulary with the query, so the
+    // dense search will not surface it. Only the hyperedge connects them.
+    const nodes = try alloc.dupe(u64, &[_]u64{ anchor, island });
+    _ = try srv.store.addHyperedge(.{
+        .id = 0,
+        .edge_type = .associative,
+        .nodes = nodes,
+        .weight = 0.5,
+        .source_weights = .{ 1.0, 0.0, 0.0 },
+        .confidence = 1.0,
+        .created_at = 0,
+        .metadata = null,
+    });
+    alloc.free(nodes);
+
+    const callQuery = struct {
+        fn f(s: *Server, a: Allocator, hops: i64) ![]i64 {
+            var req: [160]u8 = undefined;
+            // `handleQuery` splits the body off at "\r\n\r\n"; with no
+            // header block it falls back to offset 0 and slices from +4,
+            // so a bare JSON body would arrive missing its first 4 bytes.
+            const body = try std.fmt.bufPrint(&req, "\r\n\r\n{{\"text\":\"kubernetes ingress\",\"maxHops\":{d}}}", .{hops});
+            const resp = try s.route("POST", "/api/query", body);
+            defer a.free(resp.body);
+            if (resp.status != 200) return error.QueryFailed;
+            const parsed = try std.json.parseFromSlice(std.json.Value, a, resp.body, .{});
+            defer parsed.deinit();
+            var ids = std.ArrayList(i64).empty;
+            errdefer ids.deinit(a);
+            for (parsed.value.object.get("results").?.array.items) |item| {
+                try ids.append(a, item.object.get("id").?.integer);
+            }
+            return ids.toOwnedSlice(a);
+        }
+    }.f;
+
+    const zero = try callQuery(srv, alloc, 0);
+    defer alloc.free(zero);
+    const one = try callQuery(srv, alloc, 1);
+    defer alloc.free(one);
+
+    const want: i64 = @intCast(island);
+    var island_in_zero = false;
+    for (zero) |id| {
+        if (id == want) island_in_zero = true;
+    }
+    var island_in_one = false;
+    for (one) |id| {
+        if (id == want) island_in_one = true;
+    }
+
+    try std.testing.expect(!island_in_zero);
+    try std.testing.expect(island_in_one);
 }
 
 // =============================================================================

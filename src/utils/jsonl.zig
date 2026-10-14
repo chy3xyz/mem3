@@ -42,14 +42,14 @@ pub fn writeJsonKey(writer: anytype, key: []const u8) !void {
 
 test "writeJsonString: simple ASCII" {
     var buf: [64]u8 = undefined;
-    var stream = std.io.fixedBufferStream(&buf);
-    try writeJsonString(&stream.writer(), "hello");
-    try std.testing.expectEqualStrings("\"hello\"", stream.getWritten());
+    var stream = std.Io.Writer.fixed(&buf);
+    try writeJsonString(&stream, "hello");
+    try std.testing.expectEqualStrings("\"hello\"", stream.buffer[0..stream.end]);
 }
 
 test "writeJsonString: escapes" {
     var buf: [64]u8 = undefined;
-    var stream = std.io.fixedBufferStream(&buf);
-    try writeJsonString(&stream.writer(), "a\"b\\c\n");
-    try std.testing.expectEqualStrings("\"a\\\"b\\\\c\\n\"", stream.getWritten());
+    var stream = std.Io.Writer.fixed(&buf);
+    try writeJsonString(&stream, "a\"b\\c\n");
+    try std.testing.expectEqualStrings("\"a\\\"b\\\\c\\n\"", stream.buffer[0..stream.end]);
 }

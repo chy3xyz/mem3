@@ -652,6 +652,19 @@ pub const Store = struct {
         return self.hymem.multiHop(alloc, seed_ids, max_hops, confidence_threshold, edge_types_filter);
     }
 
+    /// Relevance-propagating multi-hop: see `HyMem.multiHopScored`.
+    pub fn multiHopScored(
+        self: *Store,
+        alloc: Allocator,
+        seeds: []const HyMem.ScoredNode,
+        max_hops: u8,
+        decay: f32,
+        confidence_threshold: f32,
+        edge_types_filter: ?[]const core.EdgeType,
+    ) ![]HyMem.ScoredNode {
+        return self.hymem.multiHopScored(alloc, seeds, max_hops, decay, confidence_threshold, edge_types_filter);
+    }
+
     // =================================================================
     // Internals
     // =================================================================
@@ -1022,7 +1035,12 @@ pub fn encodeGoalWALPayloadRaw(
             &self.lc.fuzzy,
         ) catch |err| {
             std.log.warn("snapshot: write failed: {}", .{err});
-            return;
+            // Propagate. This used to `return` silently, which let
+            // `POST /api/sync` answer 200 {"status":"synced"} even when no
+            // snapshot reached disk — the caller had no way to tell
+            // "synced" from "tried and failed". The daemon surfaces it as
+            // a 500.
+            return err;
         };
         std.log.info("snapshot: wrote {d} bytes to {s}", .{ bytes, self.snapshot_path });
         if (self.wal) |wal| {
