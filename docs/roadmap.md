@@ -199,6 +199,16 @@ claim and has not been adjudicated.
 - **`abstracts` per pass is flat at 155 from 5k cells on.** That is the
   harness's 5-topic synthetic corpus saturating, not convergence — do not read
   it as evidence.
+- **A monotonic id counter is never rolled back** (fixed 2026-10-15).
+  `Store.ids` is one `std.atomic.Value(u64)` shared by the goal poset, the
+  hypergraph, the tri-source manager and `addRaw`. Both of the `errdefer
+  fetchSub` sites in `store.zig` gave the id back on failure, which under the
+  daemon's concurrency hands the same number to the next caller: A takes 5, B
+  takes 6, A fails and decrements, C takes 6. Nothing is corrupted —
+  `addWithId` rejects the duplicate — but a legitimate write fails, and it can
+  ratchet, since every failure pushes the counter further back over ids that
+  are already committed. `addHyperedge` was already correct here and said why:
+  ids must be unique, not dense. Leaking an id costs nothing.
 - **HNSW recall has not saturated.** `mem3-hnsw-recall` measures recall@10
   against exhaustive scan on 400 nodes: 0.566 @ ef=10, 0.758 @ ef=100, 0.772 @
   ef=400. The default `hnsw_ef_search` is 100.

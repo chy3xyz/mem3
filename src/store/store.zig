@@ -326,7 +326,24 @@ pub const Store = struct {
         relevance: f32,
     ) !u64 {
         const id = self.ids.fetchAdd(1, .monotonic);
-        errdefer _ = self.ids.fetchSub(1, .monotonic);
+        // No errdefer returning the id. `self.ids` is one monotonic counter
+        // shared with the goal poset, the hypergraph and the tri-source
+        // manager, so a rollback here hands the same number to whoever
+        // calls next:
+        //
+        //   thread A: fetchAdd -> 5   (counter 6)
+        //   thread B: fetchAdd -> 6   (counter 7)
+        //   thread A: fails, fetchSub    (counter 6 again)
+        //   thread C: fetchAdd -> 6   <- collides with B's live goal/edge
+        //
+        // Nothing downstream is corrupted — `addWithId` rejects the
+        // duplicate — but a legitimate write fails, and the loop can
+        // ratchet: each failure pushes the counter further back over ids
+        // that are already committed, so under sustained failures every
+        // insert fails and each one pushes it back again.
+        //
+        // Leaking an id costs nothing. `addHyperedge` already takes this
+        // path deliberately and says why: ids must be unique, not dense.
 
         const built = try self.buildCellFromInput(id, source, episode, facts, goal_id, relevance);
         errdefer built.deinit(self.alloc);
@@ -600,8 +617,11 @@ pub const Store = struct {
                 .payload = payload,
                 .timestamp = wallClockSec(),
             }) catch |err| {
-                // Nothing reached the disk, so the id is still ours.
-                _ = self.ids.fetchSub(1, .monotonic);
+                // Nothing reached the disk, so this id was never claimed by
+                // a record. It still must not be given back: `self.ids` is
+                // shared, and a concurrent caller has almost certainly
+                // already taken the next one. See `addRaw` for the
+                // sequence — the id is leaked on purpose.
                 return err;
             };
         }
@@ -3785,4 +3805,39 @@ test "Store: a snapshot restore rebuilds the vector index, not just the cells" {
         }
     }
     try std.testing.expect(saw_coffee);
+}
+
+test "Store: a failed insert leaks its id instead of returning it" {
+    const alloc = std.testing.allocator;
+    var dir_buf: [128]u8 = undefined;
+    const data_dir = testDataDir(&dir_buf, "idcounter");
+    wipeStoreDir(data_dir);
+    defer wipeStoreDir(data_dir);
+
+    var store = try Store.init(alloc, .{ .data_dir = data_dir, .seed_default_goals = false });
+    defer store.deinit();
+
+    // A rejected insert — an empty episode cannot be encoded. It consumes
+    // an id from the shared counter before it fails.
+    const before = store.ids.load(.monotonic);
+    try std.testing.expectError(
+        core.Error.EmptyEpisode,
+        store.addRaw(.matter, "", "", 0, 0.5),
+    );
+    const after_failure = store.ids.load(.monotonic);
+
+    // The counter moved forward and stayed there. Rolling it back would put
+    // the next insert on the exact id this rejected call just took, and in
+    // the daemon that id belongs to whoever called in between.
+    try std.testing.expectEqual(before + 1, after_failure);
+
+    // `addRaw` returns the value `fetchAdd` handed out, which is the
+    // counter as it stood before this call. So the rejected insert above
+    // consumed id `before`, and this one must get a strictly larger one.
+    // With the old errdefer the counter would have returned to `before` and
+    // both inserts would have been handed the same number.
+    const next = try store.addRaw(.matter, "a real episode", "u|has|one", 0, 0.5);
+    try std.testing.expectEqual(before + 2, store.ids.load(.monotonic));
+    try std.testing.expect(next > before);
+    try std.testing.expectEqual(before + 1, next);
 }
