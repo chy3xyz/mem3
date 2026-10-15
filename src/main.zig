@@ -48,13 +48,14 @@ const version = @import("version.zig");
 // the dispatch switch below, and Zig's lazy resolution skips test
 // collection in those branches.
 //
-// We import only the modules whose tests are currently known-good.
-// Modules with latent compilation errors (e.g. `goal_tree.zig` returns
-// ArrayList where []u64 is expected, `hashing.zig` uses std.hash.XxHash3
-// .init() with the wrong arity) are intentionally NOT pulled in here;
-// `zig build test` would otherwise surface those bugs and block the
-// test run. Each of those will be fixed and re-imported in a follow-up
-// PR per the project's "fix in scope, ship it then refine" practice.
+// Every module listed below now compiles and its tests pass. An earlier
+// revision of this block withheld `goal_tree.zig` and `hashing.zig` on the
+// claim that they had latent compilation errors; both were false — they
+// were simply never imported, so the errors described in that comment
+// could not have been observed. Naming them exposed the real defects and
+// both are fixed. Do not re-add an exclusion comment here without a
+// compile error to point at; "not yet tested" is not a reason to stay out
+// of the gate.
 comptime {
     _ = @import("store/store.zig");
     _ = @import("memory/encoder.zig");
