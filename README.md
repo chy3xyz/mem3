@@ -409,6 +409,49 @@ steady-state signal (net cell change per cycle)
   => if the last-decile mean equals the first, it did NOT plateau.
 ```
 
+### The recorded run
+
+This is a real run on this tree, not an illustration. It was stopped at 2,124
+cycles once the trend was unambiguous; the harness writes every line durably
+before the next cycle, so stopping early loses nothing.
+
+```bash
+zig build
+./zig-out/bin/mem3-longrun --cycles=5000 --data-dir=/tmp/mem3_lr --progress-sec=120
+```
+
+| Measurement | Value |
+|---|---|
+| Cycles completed | 2,124 (of 5,000 requested; stopped early) |
+| Wall clock | 397.4 s |
+| Live cells at stop | 46,958 |
+| `d_cells` first decile mean | 21.632 |
+| `d_cells` last decile mean | **21.849 — no plateau** |
+| Total cells fuzzied | **0** |
+| `imp_mean` at last sample | 0.747 (min 0.570, max 0.850) |
+| `coh_mean` at last sample | 0.277 |
+| Consolidation passes | 84 |
+| Total abstracts created | 12,974 (155 per pass, flat from 5k cells on) |
+| Consolidate latency, first pass | 126.9 ms at 518 cells |
+| Consolidate latency, last pass | **20,257.6 ms at 44,909 cells** |
+| RSS at stop | 151 MB |
+
+Two things fall out of this, and both are recorded as misses in
+[Known misses](#known-misses):
+
+1. **`d_cells` does not trend to zero**, and the harness's own arithmetic says
+   why. The closing verdict only prints the forgetting-crossover calculation when
+   `--stats-every=N` is set — without it every `imp_*` field is `null` and the
+   explanation is silently skipped. The crossover is **40–201 days** depending
+   on source; this run was 0.0046 days.
+2. **Consolidation is superlinear.** 89.9× more cells cost 154.6× more time.
+   The pass is all-pairs, so this is O(n²) in the corpus, and the exponent is
+   already 1.12 over the range this run covered.
+
+If you reproduce this, `--stats-every=25` is worth adding: it turns the
+`fuzzied: 0` line from a mystery into a checkable prediction, and it is the
+difference between the harness explaining itself and the harness looking broken.
+
 Flags, as implemented:
 
 | Flag | Meaning |
@@ -436,15 +479,15 @@ extends the file on the next run.
 
 ```bash
 ./scripts/verify.sh           # everything below, plus provenance and a not-verified list
-zig build test                # 300 tests (217 + 83)
+zig build test                # 305 tests (222 + 83)
 zig build check-constitution  # 12 constitution invariants
 zig build bench
 ```
 
 `zig build test` runs two binaries — one rooted at `src/main.zig` and one at
 `tests/main.zig` (unit, integration and property tests under `tests/`). The
-counts above are what the two binaries actually report: `217/217` and `83/83`,
-for `300/300 tests passed` overall.
+counts above are what the two binaries actually report: `222/222` and `83/83`,
+for `305/305 tests passed` overall.
 
 **Zig collects `test` blocks only from files named directly in a root source
 file's `comptime { _ = @import(...) }` block, exactly one level deep.** A file
@@ -520,9 +563,32 @@ Known and measured, not discovered after the fact:
   banner to stderr and then logs nothing per cycle unless a maintenance pass or
   forgetting sweep actually transitions something. This is deliberate: a
   launchd-managed daemon writing per-cycle lines costs ~1.5 GB/day of logs.
-- **Consolidation is not demonstrated to reach steady state.** The harness is
-  built to measure it and reports a first-decile-vs-last-decile verdict, but no
-  long run is recorded here, so no convergence claim is made.
+- **Consolidation does not reach steady state, and cannot in any practical
+  run.** This was measured, not assumed — see [Long-run baseline](#long-run-baseline).
+  Over 2,124 cycles / 397 s / 47k cells the mean net cell change per cycle went
+  from **21.632** (first decile) to **21.849** (last decile): flat, not
+  trending to zero. The reason is structural rather than a short run.
+  `Forgetter.existenceContribution` is `importance × exp(-decay_rate × age_days)`
+  and a cell is only fuzzied once that falls below `forgetting_threshold`, so
+  the crossover is `ln(importance / threshold) / decay_rate`. At the measured
+  `imp_mean = 0.747` with the shipped decay rates that is **40 days (matter),
+  67 days (form), 201 days (spirit)**. The run lasted 0.0046 days. A flat
+  `fuzzied: 0` is the arithmetically correct answer at every run length a human
+  will actually sit through, including the 24 h baseline in the README.
+  Demonstrating convergence needs either a compressed clock or a fixture of
+  pre-aged cells; it does not need a longer run.
+- **Consolidation is all-pairs, so it is superlinear in corpus size.** The same
+  run found something worse than the convergence question.
+  `Consolidator.consolidate` scores every cell pair (single-linkage over packed
+  token bitsets). Corpus growth of **89.9×** produced **154.6×** consolidation
+  latency — exponent **1.12** over the whole range, but the tail is far worse
+  than that number suggests: **8.5 s per pass at 40k cells, 20.3 s at 45k**. At
+  45k cells that is ~1.01 billion pair comparisons per pass; at the
+  constitutional 100k scale it is ~5.0 billion. The pair loop was already made
+  75× faster and bit-identical; the algorithm underneath is still O(n²).
+  Note also that `abstracts` per pass sits flat at 155 from 5k cells onward —
+  that is a property of the harness's 5-topic synthetic corpus saturating, not
+  evidence of convergence.
 - **`mem3 bench` is a fast in-process smoke suite, not the gate.** It is
   implemented (600 cells, 200 hyperedges, in-memory, finishes in ~0.6 s
   optimised). The release-blocking constitutional gates are `zig build bench`.
@@ -531,8 +597,71 @@ Known and measured, not discovered after the fact:
 
 ### Known misses
 
-Two constitutional targets are not met. They are stated here because a document
-that hides them is worse than one that publishes them.
+**Some latency samples are zeros the optimiser manufactured, not measurements
+that took no time.** This is the most serious item here, because it questions
+the foundation every other number in this document stands on.
+
+`platform.clock.Timer` brackets a region with two `clock_gettime` calls. Under
+`-O ReleaseFast` and `-O ReleaseSafe`, LLVM can prove that `clock_gettime` has
+no side effects the program can observe, hoist both calls above the region being
+measured, and subtract two identical readings. The result is a duration of
+**exactly zero** for work that demonstrably ran.
+
+```zig
+var t = clock.Timer.start();
+var x: u64 = 0;
+for (0..20_000_000) |i| x +%= i *% 2654435761;   // provably ~25 ms
+std.debug.print("{d} ns\n", .{t.elapsedNs()});
+```
+
+| build mode | measured |
+|---|---|
+| Debug | 23,951,000 ns |
+| ReleaseSafe | **0 ns** |
+| ReleaseFast | **0 ns** |
+
+This is not confined to a synthetic loop. `./zig-out/bin/mem3-bench multihop`
+reports, over 1,000 real per-seed traversals that each reach ~49 nodes:
+
+```
+"per_seed_latency_ns":{"min_ns":0.000000,"p50_ns":31000.000000, ...}
+```
+
+`min_ns` is exactly `0.000000`. No traversal that reaches 49 nodes takes zero
+nanoseconds, so at least one of those 1,000 samples is a folded measurement.
+
+**What is and is not affected.** Benchmarks that time work with observable heap
+side effects mostly escape this — the p50 above (31 µs) is in the right range,
+and every headline number in this document is non-zero and reproducible across
+runs. But `min`, `p99`, and any tight per-iteration loop are the shapes most
+likely to be folded, and the fold is silent: there is no error, no warning, and
+a zero is a perfectly plausible-looking number to put in a percentile table.
+Until this is fixed, **treat minimum and tail-percentile latencies from this
+build as unreliable, and prefer p50**, which is already the rule elsewhere in
+this document for an unrelated reason.
+
+**Why the existing test does not catch it.** `src/platform/clock.zig` carries
+`Timer measures a non-zero, monotonic duration`, which asserts exactly this. It
+passes — because `zig build test` builds in Debug by default, and the fold only
+happens when optimisation is on. `zig build test -Doptimize=ReleaseFast` would
+catch it, and the build does accept that flag.
+
+**Fixes tried and rejected** (all still fold, all measured, none shipped):
+
+| Approach | Result |
+|---|---|
+| `asm volatile ("" ::: .{ .memory = true })` around each read | 0 ns — a memory clobber does not stop a pure-register CSE |
+| `@call(.never_inline, ...)` wrapper | 0 ns — LLVM infers `readnone` from the body at `-O` |
+| Indirect through a function pointer | 0 ns — the global is never mutated, so it is constant-propagated |
+| `mach_absolute_time` directly | still folds, and the timebase conversion is fragile |
+
+What remains is an architecture-specific non-foldable counter — `rdtsc` on
+x86_64, `cntvct_el0` on aarch64 — read through inline `asm volatile` with an
+output operand, which LLVM cannot fold by construction. That is a real change to
+the platform layer that every benchmark depends on, and **it has not been
+written**: it cannot be validated on Linux from this machine (no qemu, no
+container, no Linux host), and shipping an unverified timing primitive would be
+worse than the bug, because it would fail silently in the same way.
 
 **Write throughput meets its amended target; the old 10,000 figure did not.**
 The release target is now 1,750 cells/sec sustained, judged on the
@@ -548,12 +677,30 @@ rather than assumed: a phase profile of the write pipeline puts `hnsw.insert` at
 ~55% of the cost and the embedder at ~42%, with the `Store`'s own code under 3%.
 Group commit would not move this number. A cheaper insert path would.
 
-The embedder share is also smaller than it looks. Its cost is flat with respect
-to corpus size and, at realistic episode lengths (94–384 bytes), **about 97% of
-it is the 384-dimension f32 allocation and the memset, not hashing.** Hoisting
-the per-position hash seed there — a change that is provably bit-identical and
-strictly less work — measured 13–40% *slower* at those lengths and was reverted.
-Only at 4 KB inputs, which this product never sees, does that loop dominate.
+The embedder share is smaller than it looks, and **an earlier revision of this
+document got the reason wrong by two orders of magnitude.** It claimed that at
+realistic episode lengths (94–384 bytes) "about 97%" of the embedder is the
+384-dimension f32 allocation and the memset. A length sweep from 1 to 384 bytes
+does not support that. Fixed overhead — the 12 KB `TermTable` zero-init, the
+512-slot scan, and the 1,536-byte allocation plus memset — measures **~2 µs**,
+while everything above it is **linear at ~438 ns per input byte**:
+
+| input | 1–4 B | 8 B | 32 B | 94 B | 384 B |
+|---|---|---|---|---|---|
+| `LexicalEmbedder.embed` p50 | ~2,000 ns | 4,000 ns | 15,000 ns | 41,000 ns | 170,000 ns |
+
+So the allocation is ~5% at 94 B and ~1% at 384 B, not 97%. The actual cost is
+`LowerHasher`, which constructs an `XxHash3` per character 3-gram. This was
+confirmed the hard way: a caller-owned output buffer (the change the 97% claim
+was motivating) was implemented, proven bit-identical by fingerprint, measured
+across interleaved A/B rounds at all four lengths, and came out **1.8–3.6%
+slower** at every one of them. It was reverted. `src/retrieval/embedder.zig` is
+byte-identical to the pre-experiment state.
+
+The earlier 13–40% regression in that paragraph is a separate, still-valid
+result: hoisting the per-position hash seed is provably bit-identical and
+strictly less work, and it was also slower, because it defeated inlining.
+Neither experiment changed the bit pattern; both changed the wall clock.
 
 **LongMemEval is 0.646 core / 0.000 padded, and the embedder is the ceiling.**
 Run `./zig-out/bin/mem3-bench longmemeval`. This is an **offline

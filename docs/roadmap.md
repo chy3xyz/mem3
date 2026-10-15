@@ -109,13 +109,57 @@ claim and has not been adjudicated.
 
 ## Other open work
 
+- **`platform.clock.Timer` returns zero for folded measurements in optimised
+  builds.** Under `-O ReleaseFast`/`ReleaseSafe`, LLVM hoists two
+  `clock_gettime` calls above the region being timed and subtracts identical
+  readings. Measured: Debug 23,951,000 ns / ReleaseSafe **0 ns** / ReleaseFast
+  **0 ns** for the same 20M-iteration loop. It reaches shipped output —
+  `mem3-bench multihop` reports `"min_ns":0.000000` over 1,000 real
+  traversals that each reach ~49 nodes. The in-tree test
+  (`Timer measures a non-zero, monotonic duration`) passes because
+  `zig build test` builds in Debug. Four fixes were tried and measured — memory
+  clobber, `@call(.never_inline)`, function-pointer indirection, and
+  `mach_absolute_time` — and all four still fold. The remaining approach is a
+  per-architecture non-foldable cycle counter through inline asm (`rdtsc` /
+  `cntvct_el0`), which is **not written** because it cannot be validated on
+  Linux from this machine. Until then, treat min/tail-percentile latencies as
+  unreliable and report p50.
+- **Snapshot restore never indexes into HNSW.** `Store.loadSnapshot` calls
+  `addCell` and `cell_index.put` but never `hnsw.insert`, and boot order is
+  `loadSnapshot()` then WAL replay with an early return when the WAL is empty.
+  Since `sync` snapshots *and then truncates the WAL*, a graceful restart after
+  any sync leaves the vector index empty: `/api/memcells` still lists every
+  cell, and every vector retrieval returns nothing. Unfixed — reported by the
+  HNSW work, not yet reproduced end-to-end.
+- **Forget removes from `cell_index`/`mgr` but not from HNSW**, so stale nodes
+  persist in the vector index after a sweep.
+- **`addRaw`'s `errdefer _ = self.ids.fetchSub(1, .monotonic)`** returns an id to
+  a *shared* monotonic counter. Under daemon concurrency that can hand a later
+  insert an id a live cell already holds. Currently masked by
+  `TriSourceManager.addWithId` rejecting the duplicate, but it is the same
+  latent hazard and nothing tests the ordering that makes it safe.
 - **`--foresight` is accepted and discarded.** The CLI warns at encode time, but
   the value never reaches the WAL record or the committed cell, so a
   foresight-only cell loses its spirit dimension across a restart.
-- **Consolidation has no recorded long run.** `mem3-longrun` is built to answer
-  whether the lifecycle reaches steady state and reports a
-  first-decile-vs-last-decile verdict, but no run is recorded in this repository,
-  so no convergence claim is made.
+- **Consolidation does not reach steady state, and no run length will show it.**
+  Recorded run: 2,124 cycles / 397 s / 46,958 cells. `d_cells` first-decile mean
+  21.632, last-decile mean 21.849 — flat. The cause is arithmetic, not a short
+  run: a cell is only fuzzied once `importance × exp(-decay_rate × age_days)`
+  drops below `forgetting_threshold`, which at the measured `imp_mean = 0.747`
+  takes **40 days (matter) / 67 days (form) / 201 days (spirit)**. The run was
+  0.0046 days. Closing this needs a compressed clock or a fixture of pre-aged
+  cells, not a longer run. Note the closing verdict only prints this
+  calculation when `--stats-every=N` is set.
+- **Consolidation is all-pairs and superlinear.** `Consolidator.consolidate`
+  compares every cell pair. Over the run above, 89.9× more cells cost 154.6×
+  more consolidation time (exponent 1.12; 126.9 ms/pass at 518 cells →
+  **20,257.6 ms/pass at 44,909 cells**). At the constitutional 100k scale that
+  is ~5.0 billion pair comparisons per pass. The pair loop itself was already
+  made 75× faster and bit-identical; O(n²) is the remaining problem, and it
+  needs an inverted index or LSH banding, not more micro-optimisation.
+- **`abstracts` per pass is flat at 155 from 5k cells on.** That is the
+  harness's 5-topic synthetic corpus saturating, not convergence — do not read
+  it as evidence.
 - **HNSW recall has not saturated.** `mem3-hnsw-recall` measures recall@10
   against exhaustive scan on 400 nodes: 0.566 @ ef=10, 0.758 @ ef=100, 0.772 @
   ef=400. The default `hnsw_ef_search` is 100.
