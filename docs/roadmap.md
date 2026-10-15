@@ -124,15 +124,24 @@ claim and has not been adjudicated.
   `cntvct_el0`), which is **not written** because it cannot be validated on
   Linux from this machine. Until then, treat min/tail-percentile latencies as
   unreliable and report p50.
-- **Snapshot restore never indexes into HNSW.** `Store.loadSnapshot` calls
-  `addCell` and `cell_index.put` but never `hnsw.insert`, and boot order is
-  `loadSnapshot()` then WAL replay with an early return when the WAL is empty.
-  Since `sync` snapshots *and then truncates the WAL*, a graceful restart after
-  any sync leaves the vector index empty: `/api/memcells` still lists every
-  cell, and every vector retrieval returns nothing. Unfixed — reported by the
-  HNSW work, not yet reproduced end-to-end.
+- **Snapshot restore now rebuilds the vector index** (fixed 2026-10-15).
+  `Store.loadSnapshot` restored `addCell` + `cell_index.put` but never
+  `hnsw.insert`, and `sync` is snapshot-and-truncate: `takeSnapshot` unlinks
+  the WAL on its way out, so a restart after any sync had nothing left to
+  replay. The store then looked intact — `dump`, `cellCount` and
+  `GET /api/memcells` all listed every cell — while `hnsw.count` stayed at
+  zero and every vector query returned an empty slice rather than an error.
+  Reproduced end to end: four cells, `POST /api/sync`, restart,
+  `mem3 query "coffee"` returned `{"query":[],"count":0}` where the
+  no-sync control returned `{"query":[4,6,5],"count":3}`. Fixed by embedding
+  and indexing each restored row in the same loop; after the fix the
+  post-sync query returns exactly the control's three hits.
 - **Forget removes from `cell_index`/`mgr` but not from HNSW**, so stale nodes
-  persist in the vector index after a sweep.
+  persist in the vector index after a sweep. Note this now interacts with the
+  fix above: a fuzzied cell is in HNSW before a restart and is not restored
+  into HNSW afterwards, so the index and the cell map disagree across a
+  restart. Which of those two is correct is an open design question, not a
+  settled one.
 - **`addRaw`'s `errdefer _ = self.ids.fetchSub(1, .monotonic)`** returns an id to
   a *shared* monotonic counter. Under daemon concurrency that can hand a later
   insert an id a live cell already holds. Currently masked by

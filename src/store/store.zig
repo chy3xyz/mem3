@@ -1449,7 +1449,33 @@ pub fn encodeGoalWALPayloadRaw(
                 std.log.warn("snapshot: addCell failed for id={d}: {}", .{ cs.id, err });
                 continue;
             };
-            if (self.mgr.get(cs.id)) |stored| try self.cell_index.put(cs.id, stored);
+            if (self.mgr.get(cs.id)) |stored| {
+                try self.cell_index.put(cs.id, stored);
+                // The vector index has to come back with the cell.
+                //
+                // `sync` is snapshot-and-truncate: `takeSnapshot` unlinks
+                // the WAL on its way out, so a restart after any sync has
+                // *nothing* to replay and this loop is the only thing that
+                // runs. Restoring only `addCell` + `cell_index` left the
+                // store looking intact — `dump` and `GET /api/memcells`
+                // listed every cell — while `hnsw.count` stayed at zero and
+                // every vector query returned nothing. Silent, and only
+                // reachable through the path the daemon takes on its own
+                // maintenance interval.
+                //
+                // Replay cannot double-insert: it reaches `commitBuiltCell`,
+                // whose `addCell` now returns `DuplicateId` for a row this
+                // loop already restored, and it returns before reaching
+                // `hnsw.insert`. `hnsw.insert`'s own `max_id` guard is
+                // likewise not a hazard here — snapshot ids need not be
+                // ascending, and the high-water mark only skips the map
+                // probe for ids above it.
+                const v = try self.emb.embed(self.alloc, stored.episode);
+                defer self.alloc.free(v);
+                self.hnsw.insert(cs.id, v) catch |err| {
+                    std.log.warn("snapshot: hnsw insert failed for id={d}: {}", .{ cs.id, err });
+                };
+            }
         }
         for (data.fuzzy_cells) |cs| {
             const cell = try self.alloc.create(MemCell);
@@ -3699,4 +3725,64 @@ test "encodeWALPayload: round-trips through the replay parser unchanged" {
     try std.testing.expectEqualStrings(
         \\{"id":42,"source":"matter","episode":"quote \" backslash \\ tab \t","facts":"u|likes|coffee","goal_id":3,"relevance":0.750000,"created_at":1700000000000,"updated_at":1700000000001,"last_accessed_at":1700000000002,"importance_score":0.500000,"coherence_score":0.250000,"decay_rate":0.125000,"source_confidence":1.000000,"emotional_valence":0.000000,"access_count":7}
     , payload);
+}
+
+test "Store: a snapshot restore rebuilds the vector index, not just the cells" {
+    const alloc = std.testing.allocator;
+    var dir_buf: [128]u8 = undefined;
+    const data_dir = testDataDir(&dir_buf, "snapvecidx");
+    wipeStoreDir(data_dir);
+    defer wipeStoreDir(data_dir);
+
+    const seeded = blk: {
+        var store = try Store.init(alloc, .{ .data_dir = data_dir, .seed_default_goals = false });
+        defer store.deinit();
+
+        // Deliberately unrelated vocabulary, so a passing assertion cannot
+        // be an artefact of the embedder scoring everything alike.
+        const ids = [_]u64{
+            try store.addRaw(.matter, "the user prefers strong coffee each morning", "user|prefers|coffee", 0, 0.5),
+            try store.addRaw(.matter, "the deploy pipeline runs on kubernetes clusters", "user|deploys|kubernetes", 0, 0.5),
+            try store.addRaw(.matter, "the weekday standup keeps the team aligned", "user|attends|standup", 0, 0.5),
+        };
+        // `sync` is snapshot-and-truncate: `takeSnapshot` unlinks the WAL on
+        // its way out. After this call there is nothing left to replay, which
+        // is exactly the state every daemon restart after a maintenance pass
+        // is in.
+        try store.sync();
+        break :blk ids;
+    };
+
+    var store = try Store.init(alloc, .{ .data_dir = data_dir, .seed_default_goals = false });
+    defer store.deinit();
+
+    // The cells came back. Every pre-existing assertion in this file stops
+    // here — `cellCount`, `dump`, `GET /api/memcells` — and all of them
+    // passed while vector retrieval was dead.
+    try std.testing.expectEqual(@as(usize, 3), store.cellCount());
+    try std.testing.expectEqual(@as(usize, 3), store.cellCountBySource(.matter));
+
+    // The index did not, and `HNSW.search` answers an empty graph with an
+    // empty slice rather than an error, so nothing upstream could notice.
+    try std.testing.expectEqual(@as(usize, 3), store.hnsw.count);
+
+    // Findable, and findable by the right cell — not merely non-empty.
+    const q = try store.emb.embed(alloc, "coffee");
+    defer alloc.free(q);
+    const hits = try store.hnsw.search(alloc, q, 3);
+    defer alloc.free(hits);
+    try std.testing.expect(hits.len > 0);
+
+    var saw_coffee = false;
+    for (hits) |h| {
+        // Every hit must resolve to a restored cell — a stale or invented id
+        // would make the index look healthy while pointing nowhere.
+        _ = store.mgr.get(h.id) orelse return error.TestExpectedCellMissing;
+        const cell = store.mgr.get(h.id).?;
+        if (std.mem.indexOf(u8, cell.episode, "coffee") != null) {
+            try std.testing.expectEqual(seeded[0], cell.id);
+            saw_coffee = true;
+        }
+    }
+    try std.testing.expect(saw_coffee);
 }

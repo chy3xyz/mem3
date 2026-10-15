@@ -269,6 +269,14 @@ Four layers, each justified by a decision record in [`docs/adr/`](docs/adr/):
 - **`Store`** (`src/store/store.zig`) — the container holding cells, goals,
   hyperedges, WAL, snapshot and index, built through one factory from
   `BuildOptions` (data dir, seed goals, embed dim, embedder kind).
+- **Restoring is not only about cells.** `sync` is snapshot-and-truncate:
+  `takeSnapshot` unlinks the WAL on its way out, so a restart after any sync
+  has nothing left to replay and `loadSnapshot` is the only thing that runs.
+  That loop therefore has to rebuild the vector index as well as the cell map
+  — it did not, and the store looked intact while every vector query returned
+  nothing. Fixed, with the reproduction and the negative control in
+  [`docs/roadmap.md`](docs/roadmap.md#other-open-work) and the test
+  `Store: a snapshot restore rebuilds the vector index, not just the cells`.
 
 > The daemon **does** use that `Store`. `src/server/http_server.zig` used to
 > carry its own ~890-line duplicate so the server could run without the CLI's
@@ -479,15 +487,15 @@ extends the file on the next run.
 
 ```bash
 ./scripts/verify.sh           # everything below, plus provenance and a not-verified list
-zig build test                # 305 tests (222 + 83)
+zig build test                # 306 tests (223 + 83)
 zig build check-constitution  # 12 constitution invariants
 zig build bench
 ```
 
 `zig build test` runs two binaries — one rooted at `src/main.zig` and one at
 `tests/main.zig` (unit, integration and property tests under `tests/`). The
-counts above are what the two binaries actually report: `222/222` and `83/83`,
-for `305/305 tests passed` overall.
+counts above are what the two binaries actually report: `223/223` and `83/83`,
+for `306/306 tests passed` overall.
 
 **Zig collects `test` blocks only from files named directly in a root source
 file's `comptime { _ = @import(...) }` block, exactly one level deep.** A file
