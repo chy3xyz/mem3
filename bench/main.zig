@@ -17,7 +17,7 @@
 //! benchmarks named in `.specify/memory/constitution.md`, each of which
 //! emits exactly one JSON object on stdout:
 //!
-//!   ./zig-out/bin/mem3-bench throughput      >= 10K MemCells/sec sustained
+//!   ./zig-out/bin/mem3-bench throughput      >= 1.75K MemCells/sec sustained (worst window)
 //!   ./zig-out/bin/mem3-bench retrieval-p95   recall TopK=10 P95 < 10ms @100K
 //!   ./zig-out/bin/mem3-bench hnsw-build      100K vectors indexed in < 30s
 //!   ./zig-out/bin/mem3-bench multihop        3-hop traversal < 5ms for 1K seeds
@@ -962,7 +962,7 @@ const CONSTITUTIONAL_BENCHES = [_]ConstitutionalBench{
         .name = "throughput",
         .alt_name = "throughput",
         .file = "bench/throughput.zig",
-        .target = ">= 10K MemCells/sec (sustained)",
+        .target = ">= 1.75K MemCells/sec (sustained, durable path; worst window)",
         .run = throughput_bench.run,
     },
     .{

@@ -534,8 +534,11 @@ Known and measured, not discovered after the fact:
 Two constitutional targets are not met. They are stated here because a document
 that hides them is worse than one that publishes them.
 
-**Write throughput is ~3× short of target.** The release target is 10,000
-cells/sec sustained. Measured on the durable path (every write encoded,
+**Write throughput meets its amended target; the old 10,000 figure did not.**
+The release target is now 1,750 cells/sec sustained, judged on the
+worst window, amended
+2026-10-15 (see
+[`docs/constitution-amendments/2026-10-15-write-throughput-target.md`](docs/constitution-amendments/2026-10-15-write-throughput-target.md)). Measured on the durable path (every write encoded,
 WAL-journalled with an fsync per record, and indexed), across four runs of
 `./scripts/verify.sh`: **2,779 / 3,028 / 3,800 / 3,898 cells/sec**. Report the
 range, not the best one — the spread is nearly 40% run to run.

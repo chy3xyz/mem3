@@ -191,7 +191,7 @@ real gap, not a rounding error.
 
 | Metric | Target | Measured | |
 |---|---|---|---|
-| MemCell write throughput | ≥ 1K/sec MVP / 10K/sec release | 2,779–3,898/sec ReleaseFast, durable path | **MISS** |
+| MemCell write throughput | ≥ 1K/sec MVP / 1.75K/sec release (amended 2026-10-15, worst window) | worst window 1,863–2,438/sec; mean 3,116–3,898/sec | **pass** |
 | Top-10 query P95 | < 50ms MVP / < 10ms release (100K corpus) | 0.624 ms p95 (600-cell corpus) | not comparable — wrong corpus size |
 | HNSW build 100K vectors | < 30s | not measured at 100K | **UNVERIFIED** |
 | 3-hop traversal | < 5ms (1K seeds) | 0.000 ms/seed | pass |

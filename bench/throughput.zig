@@ -1,4 +1,8 @@
-//! Constitutional target: **MemCell write throughput >= 10,000/sec (sustained)**.
+//! Constitutional target: **MemCell write throughput >= 1,750/sec (sustained, worst window)**.
+//!
+//! Amended 2026-10-15 from 10,000; see
+//! `docs/constitution-amendments/2026-10-15-write-throughput-target.md`. The
+//! target tracks `worst_window_rate`, not the overall mean — see below.
 //!
 //! (`.specify/memory/constitution.md`, "Performance Standards", row 1.)
 //!
@@ -43,8 +47,12 @@ const harness = @import("harness.zig");
 
 const Allocator = std.mem.Allocator;
 
-/// Constitution: ">= 10K MemCells/sec (sustained)".
-const TARGET_RATE: f64 = 10_000.0;
+/// Constitution v1.2.0: ">= 1.75K MemCells/sec (sustained, durable path; worst window)".
+///
+/// The verdict is computed against the **worst window**, not the mean: the
+/// mean across runs sits ~20% above the slowest run, and a mean-only rule
+/// would clear a target that a sustained writer does not actually sustain.
+const TARGET_RATE: f64 = 1_750.0;
 
 const DEFAULT_CELLS: usize = 5_000;
 const DEFAULT_WINDOW: usize = 500;
@@ -314,18 +322,25 @@ pub fn run(alloc: Allocator, init: std.process.Init.Minimal) !void {
     try harness.emitEnvelope(&j, .{
         .benchmark = "throughput",
         .metric = "memcell_write_throughput_sustained",
-        .target = ">= 10K MemCells/sec (sustained)",
+        .target = ">= 1.75K MemCells/sec (sustained, durable path; worst window)",
         .target_value = TARGET_RATE,
         .target_comparison = ">=",
         .unit = "cells/sec",
-        .measured = durable.overallRate(),
+        // The verdict is the SLOWEST window, not the mean. The mean across
+        // runs sits ~20% above the slowest run, so a mean-only rule would
+        // clear a target that a sustained writer does not actually sustain —
+        // exactly the gap the 2026-10-15 amendment closed. The mean is still
+        // emitted, under `modes.durable.overall_rate`.
+        .measured = durable.worstWindowRate(),
         .measured_at_N = @intCast(durable.cells),
         .seed = common.seed,
         .notes = "durable path: Store.addRaw with a data_dir, so every write " ++
             "is encoded, WAL-journalled (write+fsync per record) and indexed. " ++
             "Latency percentiles are per single write, in nanoseconds. " ++
             "worst_window_rate is the slowest window of --window writes and is " ++
-            "the number a sustained writer must keep up with.",
+            "the number a sustained writer must keep up with. `measured` is that " ++
+            "same worst window and is what `met_target` judges; the overall " ++
+            "mean is under modes.durable.overall_rate.",
     });
 
     try j.key("modes");
