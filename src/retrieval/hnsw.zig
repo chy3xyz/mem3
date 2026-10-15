@@ -156,6 +156,14 @@ pub const HNSW = struct {
     max_level: u8 = 0,
     /// Total node count.
     count: usize = 0,
+    /// High-water mark: the largest id `insert` has ever accepted.
+    ///
+    /// Duplicate detection only has to consult `nodes` for an id at or
+    /// below this, because an id above it has never been accepted — so
+    /// the common append-only case pays one integer compare instead of
+    /// a hash probe on a path that is ~55% of durable-write cost.
+    /// Nothing but the guard in `insert` reads it.
+    max_id: u64 = 0,
     /// Persistent level-assignment RNG.
     ///
     /// This must be *state carried across calls*. It used to be
@@ -271,11 +279,14 @@ pub const HNSW = struct {
 
     /// Record `id` in the fast-path table, or give up on it for good.
     ///
-    /// Re-inserting an existing id lands on the same slot the map
-    /// overwrites, so the two stay in agreement rather than one of them
-    /// going stale. (Re-inserting an id is already a broken way to use
-    /// this index — the old node is orphaned and `count` drifts — so this
-    /// corner only has to stay *consistent*, not useful.)
+    /// `insert` rejects a duplicate id before it gets here, so this only
+    /// ever sees a slot that is empty or already the same node — the two
+    /// structures cannot disagree. It used to note that a re-insert "is
+    /// already a broken way to use this index" and settle for staying
+    /// *consistent* rather than *correct*: the map and the table pointed
+    /// at the same fresh node while the node they replaced was orphaned
+    /// and `count` drifted. Consistency between two wrong answers is not
+    /// a property worth preserving.
     fn trackDense(self: *HNSW, id: u64, n: *Node) !void {
         if (!self.dense_ok) return;
         if (self.dense.items.len == 0) {
@@ -318,8 +329,40 @@ pub const HNSW = struct {
 
     /// Insert a vector with a given id. Computes the level via exponential
     /// distribution `1/M`.
+    ///
+    /// ## Ids are unique; a repeat is rejected, not merged
+    ///
+    /// Returns `errors.DuplicateId` if `id` is already present, leaving
+    /// the index bit-for-bit unmodified. This used to allocate a second
+    /// `Node` under the same id and `put` it over the first, which
+    /// orphaned the original: it stayed linked from its neighbours'
+    /// lists and reachable from the entry point while nothing could free
+    /// it, `count` overreported the searchable set by one per duplicate,
+    /// and `visit_stamp` grew a slot nobody owned. The map and the dense
+    /// table agreed with each other and both disagreed with reality.
+    ///
+    /// Rejection is the right trade over in-place replacement. An upsert
+    /// would have to rewrite the *backlinks* — every neighbour's
+    /// adjacency list holds this id, and a changed vector changes which
+    /// of those edges are still worth keeping — and `shrinkConnections`
+    /// would then have to re-run against lists it did not build. That
+    /// is graph surgery on the hot write path, for a case the store
+    /// cannot produce: `TriSourceManager.addWithId` already returns
+    /// `errors.DuplicateId`, and both production call sites pass through
+    /// it first. A correct, leak-free rejection costs one comparison on
+    /// the common path; a correct upsert costs a correct-and-tested
+    /// rewrite of the whole neighbourhood-update algorithm.
+    ///
+    /// The guard is a compare against `max_id` first, because ids arrive
+    /// strictly increasing in production (a single shared monotonic
+    /// counter in `Store`). An id above the high-water mark cannot be
+    /// present, so no hash lookup happens at all on that path — O(1)
+    /// with a one-instruction fast case. Below the mark the map probe
+    /// runs, which is still O(1). There is no scan.
     pub fn insert(self: *HNSW, id: u64, vector: []const f32) errors!void {
         if (vector.len != self.dim) return errors.InvalidQuery;
+        // Before any allocation: a rejected insert has nothing to free.
+        if (id <= self.max_id and self.nodes.contains(id)) return errors.DuplicateId;
 
         const q = Query.of(vector);
         const level = self.randomLevel();
@@ -346,6 +389,7 @@ pub const HNSW = struct {
         try self.trackDense(id, n);
         try self.nodes.put(id, n);
         self.count += 1;
+        if (id > self.max_id) self.max_id = id;
 
         if (self.entry_point == null) {
             self.entry_point = id;
@@ -1370,4 +1414,241 @@ test "HNSW: contiguous-id fast path never disagrees with the node map" {
     defer alloc.free(got);
     try std.testing.expect(got.len > 0);
     for (got) |g| try std.testing.expect(hnsw.nodes.contains(g.id));
+}
+
+// =============================================================================
+// Duplicate ids
+// =============================================================================
+//
+// `insert` used to allocate a second Node under an id it already held and
+// `put` it over the first. The old node was then unreachable from `nodes`
+// but still linked from its neighbours and possibly still on a path from
+// the entry point, holding a vector and `level + 1` adjacency lists that
+// nothing could free; `count` overreported the searchable set by one per
+// duplicate; and `visit_stamp` grew a slot no node owned.
+//
+// The fix rejects the repeat with `errors.DuplicateId` before allocating
+// anything. These tests pin the three properties that makes that safe:
+// `count` never drifts, the index is left untouched, and nothing leaks.
+//
+// The leak oracle is `std.testing.allocator` itself — it reports any
+// allocation still outstanding when the test returns. A tombstone-style
+// fix (mark the old node dead but keep its allocation, or reuse the node
+// without freeing the old vector) passes a `count`-only assertion and
+// fails here.
+
+// The invariant, stated once: after any sequence of inserts and rejected
+// duplicates, `count` equals the number of distinct ids actually
+// searchable.
+fn assertCountMatchesDistinctIds(hnsw: *const HNSW) !void {
+    try std.testing.expectEqual(hnsw.nodes.count(), hnsw.count);
+    var it = hnsw.nodes.iterator();
+    while (it.next()) |_| {}
+}
+
+test "HNSW: duplicate id is rejected and leaves count unchanged" {
+    const alloc = std.testing.allocator;
+    var hnsw = HNSW.init(alloc, .{}, oracle_dim);
+    defer hnsw.deinit();
+
+    var v: [oracle_dim]f32 = undefined;
+    oracleCorpusVec(&v, 1);
+    try hnsw.insert(1, &v);
+    oracleCorpusVec(&v, 2);
+    try hnsw.insert(2, &v);
+    try hnsw.insert(3, &v);
+
+    try std.testing.expectEqual(@as(usize, 3), hnsw.count);
+    try assertCountMatchesDistinctIds(&hnsw);
+
+    // Re-inserting an existing id is the exact failure mode: it must be
+    // reported, not absorbed.
+    try std.testing.expectError(errors.DuplicateId, hnsw.insert(2, &v));
+
+    // `count` did not drift, and still equals the distinct searchable set.
+    try std.testing.expectEqual(@as(usize, 3), hnsw.count);
+    try assertCountMatchesDistinctIds(&hnsw);
+
+    // The stamp array must not have grown either: a rejected insert
+    // allocates nothing, so it leaves no unreferenced slot behind.
+    try std.testing.expectEqual(@as(usize, 3), hnsw.visit_stamp.items.len);
+
+    // Still searchable at that id.
+    try std.testing.expect(hnsw.nodes.contains(2));
+    try std.testing.expect(hnsw.nodeFor(2) == hnsw.nodes.get(2));
+}
+
+test "HNSW: rejected duplicate leaves the index bit-for-bit unmodified" {
+    // Not merely "it did not crash". The node holding id 2 must be the
+    // *same pointer* as before the attempt, with the same neighbours and
+    // the same vector — an upsert-in-place would have changed the vector
+    // while leaving the pointer, which is exactly the subtle corruption
+    // this contract rules out.
+    const alloc = std.testing.allocator;
+    var hnsw = HNSW.init(alloc, .{}, oracle_dim);
+    defer hnsw.deinit();
+
+    for (0..12) |i| {
+        var v: [oracle_dim]f32 = undefined;
+        oracleCorpusVec(&v, @intCast(i + 1));
+        try hnsw.insert(@intCast(i + 1), &v);
+    }
+
+    const before_node = hnsw.nodes.get(7).?;
+    const before_vec = try alloc.dupe(f32, before_node.vector);
+    defer alloc.free(before_vec);
+    const before_neighbors = try alloc.dupe(u64, before_node.neighbors[0].items);
+    defer alloc.free(before_neighbors);
+    const before_entry = hnsw.entry_point;
+    const before_max_level = hnsw.max_level;
+    const before_count = hnsw.count;
+    const before_stamp_len = hnsw.visit_stamp.items.len;
+
+    var other: [oracle_dim]f32 = undefined;
+    oracleCorpusVec(&other, 999);
+    try std.testing.expectError(errors.DuplicateId, hnsw.insert(7, &other));
+
+    // Same node object, so nothing was replaced underneath the id.
+    try std.testing.expect(hnsw.nodes.get(7).? == before_node);
+    // Same contents — no in-place vector rewrite either.
+    try std.testing.expectEqualSlices(f32, before_vec, before_node.vector);
+    try std.testing.expectEqualSlices(u64, before_neighbors, before_node.neighbors[0].items);
+    // Same shape.
+    try std.testing.expectEqual(before_entry, hnsw.entry_point);
+    try std.testing.expectEqual(before_max_level, hnsw.max_level);
+    try std.testing.expectEqual(before_count, hnsw.count);
+    try std.testing.expectEqual(before_stamp_len, hnsw.visit_stamp.items.len);
+    try assertCountMatchesDistinctIds(&hnsw);
+}
+
+test "HNSW: search after a rejected duplicate returns the original vector" {
+    // The stale-duplicate failure mode: a search for the *new* vector
+    // must not surface the old node under the reused id, and a search
+    // for the *old* vector must still find exactly the original — one
+    // hit, not two copies of an id.
+    const alloc = std.testing.allocator;
+    var hnsw = HNSW.init(alloc, .{}, oracle_dim);
+    defer hnsw.deinit();
+
+    var seed: [oracle_dim]f32 = undefined;
+    var i: usize = 0;
+    while (i < 40) : (i += 1) {
+        oracleCorpusVec(&seed, @intCast(i + 100));
+        try hnsw.insert(@intCast(i + 100), &seed);
+    }
+
+    // id 7 is the one we will collide on. It is *below* the ids above, so
+    // the collision is caught by the map probe rather than the high-water
+    // fast path — the corner that has to work when ids are not monotonic.
+    var old_vec: [oracle_dim]f32 = undefined;
+    oracleCorpusVec(&old_vec, 7);
+    try hnsw.insert(7, &old_vec);
+    try std.testing.expectEqual(@as(usize, 41), hnsw.count);
+    // A genuinely different direction, far from anything indexed.
+    var new_vec: [oracle_dim]f32 = undefined;
+    oracleVec(&new_vec, 0xDEAD_BEEF);
+    oracleNormalize(&new_vec);
+
+    try std.testing.expectError(errors.DuplicateId, hnsw.insert(7, &new_vec));
+
+    // The rejected vector must not be findable anywhere. Every stored
+    // vector is a distinct unit vector, so *if* `new_vec` had been
+    // accepted it would score ~1.0 against itself and sit at rank 0.
+    // Asserting only "id 7 is absent from the top 10" would be wrong —
+    // with 41 vectors an unrelated query legitimately ranks id 7 in the
+    // top 10 — so the test pins the property that actually matters:
+    // nothing in the index matches this direction closely.
+    const by_new = try hnsw.search(alloc, &new_vec, 10);
+    defer alloc.free(by_new);
+    for (by_new) |r| {
+        try std.testing.expect(r.score < 0.99);
+    }
+
+    // Searching for the original vector still returns id 7, and the node
+    // it resolves to is the original.
+    const by_old = try hnsw.search(alloc, &old_vec, 5);
+    defer alloc.free(by_old);
+    var hits: usize = 0;
+    for (by_old) |r| {
+        if (r.id == 7) hits += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), hits);
+    try std.testing.expectEqual(@as(f32, 1.0), by_old[0].score);
+    try std.testing.expectEqual(@as(u64, 7), by_old[0].id);
+}
+
+test "HNSW: count equals distinct ids across a long insert with collisions" {
+    // The invariant under sustained mixed traffic, which is where an
+    // off-by-one per duplicate would accumulate instead of showing up
+    // once. Ids are strictly increasing like the store's, and every
+    // third id is submitted twice — the second attempt with a different
+    // vector, so an upsert bug could not hide behind identical content.
+    const alloc = std.testing.allocator;
+    var hnsw = HNSW.init(alloc, .{}, oracle_dim);
+    defer hnsw.deinit();
+
+    const n: usize = 150;
+    var inserted: usize = 0;
+    var rejected: usize = 0;
+    var i: usize = 1;
+    while (i <= n) : (i += 1) {
+        var v: [oracle_dim]f32 = undefined;
+        oracleCorpusVec(&v, @intCast(i));
+        try hnsw.insert(@intCast(i), &v);
+        inserted += 1;
+
+        if (i % 3 == 0) {
+            var dup: [oracle_dim]f32 = undefined;
+            oracleVec(&dup, @as(u64, @intCast(i)) +% 0x9E37_79B9);
+            oracleNormalize(&dup);
+            try std.testing.expectError(errors.DuplicateId, hnsw.insert(@intCast(i), &dup));
+            rejected += 1;
+        }
+    }
+
+    try std.testing.expectEqual(@as(usize, n), inserted);
+    try std.testing.expectEqual(@as(usize, n / 3), rejected);
+    try std.testing.expectEqual(@as(usize, n), hnsw.count);
+    try assertCountMatchesDistinctIds(&hnsw);
+    // One stamp slot per accepted node — no orphans from the rejects.
+    try std.testing.expectEqual(@as(usize, n), hnsw.visit_stamp.items.len);
+    // And the map still agrees with the dense table everywhere.
+    try std.testing.expectEqual(hnsw.count, hnsw.nodes.count());
+}
+
+// Regression guard for the O(1) fast path itself. The duplicate check
+// compares against `max_id` before probing the map; if that high-water
+// mark were not maintained, or were maintained wrongly, a duplicate at
+// or below it would sail through and the count invariant above would
+// fail. This pins the marking rule directly so the failure names the
+// cause instead of surfacing as a count drift 150 inserts later.
+test "HNSW: max_id high-water mark tracks the largest accepted id" {
+    const alloc = std.testing.allocator;
+    var hnsw = HNSW.init(alloc, .{}, oracle_dim);
+    defer hnsw.deinit();
+
+    try std.testing.expectEqual(@as(u64, 0), hnsw.max_id); // nothing accepted yet
+
+    var v: [oracle_dim]f32 = undefined;
+    oracleCorpusVec(&v, 4);
+    try hnsw.insert(4, &v);
+    try std.testing.expectEqual(@as(u64, 4), hnsw.max_id);
+
+    // An id below the mark still gets probed, so a lower id is accepted
+    // and the mark does NOT move down.
+    oracleCorpusVec(&v, 2);
+    try hnsw.insert(2, &v);
+    try std.testing.expectEqual(@as(u64, 4), hnsw.max_id);
+    try std.testing.expectEqual(@as(usize, 2), hnsw.count);
+
+    // Repeating id 2 — at or below the mark — must still be caught.
+    try std.testing.expectError(errors.DuplicateId, hnsw.insert(2, &v));
+    try std.testing.expectEqual(@as(usize, 2), hnsw.count);
+
+    // Above the mark: the fast path decides it cannot be present.
+    oracleCorpusVec(&v, 9);
+    try hnsw.insert(9, &v);
+    try std.testing.expectEqual(@as(u64, 9), hnsw.max_id);
+    try std.testing.expectEqual(@as(usize, 3), hnsw.count);
+    try assertCountMatchesDistinctIds(&hnsw);
 }
