@@ -159,13 +159,43 @@ claim and has not been adjudicated.
   0.0046 days. Closing this needs a compressed clock or a fixture of pre-aged
   cells, not a longer run. Note the closing verdict only prints this
   calculation when `--stats-every=N` is set.
+- **Consolidation was not deterministic; now it is** (fixed 2026-10-15).
+  `Consolidator.consolidate` collected its cell list straight out of three
+  `AutoHashMap` iterators and then keyed everything off the index into that
+  list: `bitsets` was laid out by it, `cluster_map` was keyed by union-find
+  roots chosen by it, and `generateAbstract` took `indices[0]` as the
+  cluster's representative cell. Hash-map iteration order is unspecified *and*
+  shifts with insertion order — measured on ids 1000..1008, filling forwards
+  iterates `1006 1007 1001 1000 1003 1004 1008 1002 1005` and filling
+  backwards iterates `1006 1007 1001 1003 1008 1004 1000 1002 1005`. So
+  **which episode became an abstract's text depended on insertion order and
+  on whether anything had been forgotten in between.** Separately,
+  `abstract_ids` was assembled by iterating `cluster_map`, another hash map,
+  so the order the caller journals and indexes them in varied per run even
+  when the clustering was identical. Fixed by sorting the cell list by id
+  (O(n log n), and it also makes a cell's index stable across passes — the
+  precondition any incremental clustering needs) and by sorting the returned
+  `abstract_ids` ascending.
 - **Consolidation is all-pairs and superlinear.** `Consolidator.consolidate`
   compares every cell pair. Over the run above, 89.9× more cells cost 154.6×
   more consolidation time (exponent 1.12; 126.9 ms/pass at 518 cells →
   **20,257.6 ms/pass at 44,909 cells**). At the constitutional 100k scale that
   is ~5.0 billion pair comparisons per pass. The pair loop itself was already
-  made 75× faster and bit-identical; O(n²) is the remaining problem, and it
-  needs an inverted index or LSH banding, not more micro-optimisation.
+  made 75× faster and bit-identical; O(n²) is the remaining problem.
+  **An inverted index is not the obvious win here and was rejected on
+  arithmetic**: the signature is 512 bits with ~55 tokens per cell, so bucket
+  collisions are dense and the candidate set comes out at ~2.95n² against
+  n²/2 for the full scan — about six times *worse*. The promising direction
+  is keeping the union-find across passes and comparing only newly arrived
+  cells against everything already present: at the long run's 400 cells per
+  pass that is ~1.8e7 pairs instead of 1.01e9, roughly 56×. A standalone
+  probe confirms this yields an **identical partition** (pair-wise agreement
+  640000/640000; only the chosen root differs, and the root is just a
+  `cluster_map` key). It costs resident memory for a per-cell signature cache
+  (~2.9 MB at 45k cells, 6.4 MB at 100k, growing linearly) and needs a
+  defined invalidation rule when `consolidation_threshold` changes. Not
+  implemented — both are open design decisions, and the id-ordered cell list
+  from the fix above is the prerequisite for it.
 - **`abstracts` per pass is flat at 155 from 5k cells on.** That is the
   harness's 5-topic synthetic corpus saturating, not convergence — do not read
   it as evidence.

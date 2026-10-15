@@ -79,7 +79,7 @@ pub const Consolidator = struct {
     /// Returns counts; does not return the abstract cells (those are
     /// stored in the manager and can be queried by source/.form).
     pub fn consolidate(self: *Consolidator) !ConsolidationResult {
-        // Step 1: collect all cells.
+        // Step 1: collect all cells, in **id order**.
         var cells = std.ArrayList(*MemCell).empty;
         defer cells.deinit(self.alloc);
         var it_s = self.mgr.sensory.iterator();
@@ -89,6 +89,23 @@ pub const Consolidator = struct {
         var it_a = self.mgr.action.iterator();
         while (it_a.next()) |e| try cells.append(self.alloc, e.value_ptr.*);
         if (cells.items.len < 2) return .{ .clusters = 0, .abstracts_created = 0, .cells_processed = cells.items.len };
+
+        // The three sources are `AutoHashMap`s, and hash-map iteration order
+        // is explicitly unspecified. Everything downstream keys off the
+        // index into `cells`: `bitsets` is laid out by it, `cluster_map` is
+        // keyed by union-find roots chosen by it, and `generateAbstract`
+        // takes `indices[0]` as the cluster's representative cell. So the
+        // iteration order decided, on every pass, *which cell's episode
+        // became the abstract's text* — and that order depended on the
+        // table's capacity and rehash history, i.e. on insertion order and
+        // on whether anything had been forgotten in between. The same
+        // corpus could consolidate differently from one run to the next.
+        //
+        // Sorting by id costs O(n log n) and makes the whole pass a pure
+        // function of the cell set. It also means the index of a given cell
+        // is stable across passes, which is the precondition any incremental
+        // clustering would need.
+        std.mem.sort(*MemCell, cells.items, {}, byIdAscending);
 
         const n = cells.items.len;
         // Step 2: single-linkage clustering via union-find.
@@ -196,10 +213,18 @@ pub const Consolidator = struct {
             }
         }
 
+        // `cluster_map` is an `AutoHashMap`, so the order abstracts were
+        // appended in is hash order — random per instance, since
+        // `std.HashMap` seeds itself. That order reaches the caller, which
+        // journals and indexes the slice, so without this the WAL record
+        // sequence for an identical cell set differs run to run.
+        const ids_out = try abstract_ids.toOwnedSlice(self.alloc);
+        std.mem.sort(u64, ids_out, {}, std.sort.asc(u64));
+
         return .{
             .clusters = cluster_map.count(),
             .abstracts_created = abstracts_created,
-            .abstract_ids = try abstract_ids.toOwnedSlice(self.alloc),
+            .abstract_ids = ids_out,
             .cells_processed = n,
         };
     }
@@ -394,6 +419,15 @@ fn forEachToken(text: []const u8, context: anytype, comptime sink: fn (@TypeOf(c
 }
 
 /// Token bitset for one cell, packed into `words` (length `TOKEN_WORDS`).
+/// Sort key for `consolidate`'s cell list: ascending id.
+///
+/// Ties cannot occur — `TriSourceManager` keys all three of its source maps
+/// by the same unique id — so this is a total order and the resulting
+/// arrangement is reproducible.
+fn byIdAscending(_: void, a: *MemCell, b: *MemCell) bool {
+    return a.id < b.id;
+}
+
 fn packCell(words: []u64, cell: *const MemCell) void {
     const visit = struct {
         fn v(ws: []u64, text: []const u8) void {
@@ -488,4 +522,103 @@ test "Consolidator: no cluster when cells too dissimilar" {
     var result = try con.consolidate();
     defer result.deinitAbstractIds(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 0), result.abstracts_created);
+}
+
+test "Consolidator: output depends on the cell set, not on insertion order" {
+    // The same nine cells, added in two different orders into two
+    // independent managers, must produce the same abstracts.
+    //
+    // Before the id sort in `consolidate`, `cells` came straight out of
+    // three `AutoHashMap` iterators whose order is unspecified and shifts
+    // with capacity and rehash history. `generateAbstract` takes
+    // `indices[0]` as the cluster representative, so the iteration order
+    // chose which episode became the abstract's text. This test is the
+    // regression guard for that.
+    const alloc = std.testing.allocator;
+    // Laid out so that one cluster's members sit at indices 0, 3 and 8,
+    // which is what makes this test discriminate. `AutoHashMap` with ids
+    // 1000..1008 iterates as 1006 1007 1001 1000 ... when filled forwards
+    // and 1006 1007 1001 1003 ... when filled backwards, so that cluster's
+    // first-seen member is id 1000 one way and id 1003 the other. Any two
+    // clusters would do as long as the members straddle those positions.
+    //
+    // Three groups with no vocabulary in common, each sharing five of six
+    // tokens within the group, so at threshold 0.3 they cluster cleanly and
+    // never merge with each other.
+    const episodes = [_][]const u8{
+        "cat mat sat on the rug",        // 0  cluster A
+        "kube deploy cluster node pool", // 1  cluster B
+        "kube deploy cluster node zone", // 2  cluster B
+        "cat mat lay on the rug",        // 3  cluster A
+        "standup team weekday morning",  // 4  cluster C
+        "standup team weekday evening",  // 5  cluster C
+        "standup team weekday noon",     // 6  cluster C
+        "standup team weekday dawn",     // 7  cluster C
+        "cat mat rest on a rug",         // 8  cluster A
+    };
+
+    var forward_buf: [512]u8 = undefined;
+    var reverse_buf: [512]u8 = undefined;
+    const forward = try consolidateEpisodes(alloc, &episodes, false, &forward_buf);
+    const reverse = try consolidateEpisodes(alloc, &episodes, true, &reverse_buf);
+
+    // Both runs must actually have produced something, or this asserts
+    // nothing: two empty strings are equal for the wrong reason.
+    try std.testing.expect(forward.len > 0);
+    try std.testing.expect(reverse.len > 0);
+    try std.testing.expectEqualStrings(forward, reverse);
+}
+
+/// Consolidate `episodes` (optionally reversed) and flatten the resulting
+/// abstracts' episodes into `buf`, so two runs can be compared as bytes.
+fn consolidateEpisodes(
+    alloc: std.mem.Allocator,
+    episodes: []const []const u8,
+    reverse: bool,
+    buf: []u8,
+) ![]const u8 {
+    var ids = std.atomic.Value(u64).init(1);
+    var mgr = TriSourceManager.init(alloc, &ids);
+    defer mgr.deinit();
+    var fuzzy = FuzzyStore.init(alloc);
+    defer fuzzy.deinit();
+    var con = Consolidator.init(alloc, .{ .consolidation_threshold = 0.3 }, &fuzzy, &mgr);
+
+    for (episodes, 0..) |_, i| {
+        const at = if (reverse) episodes.len - 1 - i else i;
+        // Pin the id to the content, not to the insertion position. Ids are
+        // assigned once and never move in a real store, so "the same cells"
+        // has to mean the same id-to-content mapping in both managers —
+        // otherwise this compares two different stores rather than two
+        // orders of one store.
+        //
+        // Offset from 1 because `generateAbstract` mints ids from the same
+        // `next_id` counter this bypasses, and a low id here would collide
+        // with an abstract and silently drop it.
+        _ = try mgr.addWithId(@intCast(1000 + at), .{
+            .id = 0,
+            .source = .matter,
+            .episode = episodes[at],
+            .atomic_facts = &.{},
+            .foresight = &.{},
+            .goal_associations = &.{.{ .goal_id = 1, .relevance = 0.5, .priority = 1 }},
+            .metadata = .{ .source_confidence = 0.9, .importance_score = 0.5 },
+        });
+    }
+
+    var result = try con.consolidate();
+    defer result.deinitAbstractIds(alloc);
+    var out: usize = 0;
+    for (result.abstract_ids) |aid| {
+        const cell = mgr.get(aid) orelse continue;
+        for (cell.episode) |byte| {
+            if (out == buf.len) return error.BufferTooSmall;
+            buf[out] = byte;
+            out += 1;
+        }
+        if (out == buf.len) return error.BufferTooSmall;
+        buf[out] = '|';
+        out += 1;
+    }
+    return buf[0..out];
 }
