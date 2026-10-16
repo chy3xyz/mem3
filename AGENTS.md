@@ -126,7 +126,7 @@ tests/
 | Embedding | ✅ | Built-in hashed lexer is the default and is byte-identical to pre-MCP builds. `--embedder-cmd` delegates to a long-lived external program over a line protocol (the "optional tier"); no new link dependency either way |
 | Persistence | ✅ | WAL-first + snapshot. WAL truncated on sync. |
 | Tests | ✅ | 405: 322 (`src/main.zig`-rooted) + 83 (`tests/main.zig`-rooted), plus 12 constitution invariants as a separate gate, 0 leaks |
-| Binary | ✅ | 798,904 bytes `ReleaseFast` / 4,092,632 bytes Debug, only links libSystem |
+| Binary | ✅ | 898,040 bytes `ReleaseFast` / 4,383,928 bytes Debug, only links libSystem |
 | Toolchain | ✅ | Pinned via `.zigversion` (Zig 0.17.0) |
 | Platforms | ✅ | macOS + Linux (x86_64 and aarch64). Windows/WASM refused at compile time — see [Platforms](#platforms) |
 
@@ -199,7 +199,7 @@ real gap, not a rounding error.
 | 3-hop traversal | < 5ms (1K seeds) | 0.000 ms/seed | pass |
 | Cold-start | < 200ms | 0.077 ms | pass |
 | RSS at 100K cells | < 500MB | not measured at 100K | **UNVERIFIED** |
-| Binary size | < 10MB stripped | 798,904 bytes ReleaseFast | pass |
+| Binary size | < 10MB stripped | 898,040 bytes ReleaseFast | pass |
 | External deps (ldd) | 0 | `otool -L` lists only `libSystem` | pass |
 | LongMemEval accuracy | ≥ 80% | 0.646 core / 0.000 padded (offline reimplementation) | **MISS** |
 

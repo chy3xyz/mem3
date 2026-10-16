@@ -45,8 +45,8 @@ zig build            # binaries land in zig-out/bin/
 
 `zig build` produces `mem3` (the CLI + daemon), `mem3-bench`, `mem3-longrun`,
 `mem3-hnsw-recall`, `mem3-forgetting-eval`, `notebook`, and `loadtest`. The
-default Debug build of `mem3` is **4,092,632 bytes** and `-Doptimize=ReleaseFast`
-is **798,904 bytes**; both link only `libSystem` (both measured on this tree,
+default Debug build of `mem3` is **4,383,928 bytes** and `-Doptimize=ReleaseFast`
+is **898,040 bytes**; both link only `libSystem` (both measured on this tree,
 Apple M1 Pro / arm64).
 
 Artifacts:
