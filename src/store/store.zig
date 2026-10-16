@@ -453,6 +453,12 @@ pub const Store = struct {
             if (self.mgr.get(id) != null) continue;
             try forgotten.append(self.alloc, id);
             _ = self.cell_index.remove(id);
+            // The vector index too, or `mem3_vector_index_nodes` publishes a
+            // count that only ever grows and the tombstoned cells' vectors
+            // stay resident. Retrieval was already safe — `getCell` misses
+            // from here on, so the candidate is skipped — this is about the
+            // index agreeing with the cell map.
+            _ = self.hnsw.markDeleted(id);
 
             if (self.wal) |wal| {
                 // `.forget` (0x20) has been in the record enum since the
@@ -3840,4 +3846,43 @@ test "Store: a failed insert leaks its id instead of returning it" {
     try std.testing.expectEqual(before + 2, store.ids.load(.monotonic));
     try std.testing.expect(next > before);
     try std.testing.expectEqual(before + 1, next);
+}
+
+test "Store: forgetting a cell takes its vector out of the index" {
+    const alloc = std.testing.allocator;
+    var dir_buf: [128]u8 = undefined;
+    const data_dir = testDataDir(&dir_buf, "forgetidx");
+    wipeStoreDir(data_dir);
+    defer wipeStoreDir(data_dir);
+
+    var store = try Store.init(alloc, .{ .data_dir = data_dir, .seed_default_goals = false });
+    defer store.deinit();
+
+    var ids: [6]u64 = undefined;
+    for (&ids, 0..) |*slot, i| {
+        var buf: [64]u8 = undefined;
+        slot.* = try store.addRaw(.matter, try std.fmt.bufPrint(&buf, "episode number {d} about a deployment", .{i}), "u|has|episode", 0, 0.5);
+    }
+    try std.testing.expectEqual(@as(usize, 6), store.hnsw.count);
+
+    // Age the first two past the forgetting threshold. `existenceContribution`
+    // is `importance * exp(-decay_rate * age_days)` against
+    // `forgetting_threshold` (0.1), so at importance 0.5 and the matter
+    // decay rate 0.05/day the crossover is ~46 days back.
+    const old_ms = 120 * 86_400_000;
+    const now_ms = @import("../utils/time.zig").nowMs();
+    for (ids[0..2]) |id| {
+        const cell = store.mgr.get(id) orelse return error.TestExpectedCellMissing;
+        cell.metadata.created_at = now_ms - old_ms;
+    }
+
+    const swept = try store.forget(false);
+    try std.testing.expectEqual(@as(usize, 2), swept.fuzzied);
+    try std.testing.expectEqual(@as(usize, 4), store.cellCount());
+
+    // The forgotten cells are gone from the cell map, so they cannot come
+    // back through retrieval — `getCell` misses and the candidate is
+    // skipped. But their vectors are still sitting in the index, which is
+    // what `mem3_vector_index_nodes` publishes and what holds their memory.
+    try std.testing.expectEqual(@as(usize, 4), store.hnsw.count);
 }

@@ -136,6 +136,17 @@ pub const Node = struct {
     level: u8,
     /// neighbors[i] is the neighbor list at layer i. Lower index = higher layer.
     neighbors: []std.ArrayList(u64),
+    /// Tombstone set by `markDeleted`. The node keeps its memory — this
+    /// index never frees a node, and the adjacency lists that point at it
+    /// are not rewritten — but it stops being a result and stops steering
+    /// a search away from live neighbours.
+    ///
+    /// Its vector is also the only copy: `insert` copies the caller's slice
+    /// into the node. So a tombstoned cell's 384 floats stay resident for
+    /// the life of the index unless something reclaims them. `markDeleted`
+    /// zeroes them, which drops the memory the allocator is holding on to
+    /// without needing the pointer to stay valid.
+    deleted: bool = false,
 
     pub fn deinit(self: *Node, alloc: Allocator) void {
         alloc.free(self.vector);
@@ -457,18 +468,64 @@ pub const HNSW = struct {
         }
     }
 
+    /// Tombstone a node and drop it from the searchable set.
+    ///
+    /// `forget` moves a cell out of the manager and out of `cell_index`,
+    /// so `Store.getCell` already misses and retrieval skips the candidate —
+    /// the forgotten memory cannot come back through a query. What used to
+    /// be left behind was the index itself: the node stayed in `nodes`,
+    /// `count` kept counting it, `mem3_vector_index_nodes` published a
+    /// number that grew with every forgetting sweep and never fell, and the
+    /// node's 384-float vector copy stayed resident for the life of the
+    /// index. At the 47k cells the long run reaches, that is ~72 MB of
+    /// vectors for memories the store had already decided to forget.
+    ///
+    /// Returns whether a live node was tombstoned. Idempotent: marking an
+    /// already-deleted id returns false and does not decrement twice.
+    ///
+    /// This does not unlink the node. Adjacency lists in this index hold
+    /// ids, and rewriting every neighbour's list — plus re-running the
+    /// pruning that produced those lists — is graph surgery on a hot path.
+    /// A tombstone is enough for correctness because the caller has already
+    /// made the cell unreachable by id, and `search` drops tombstoned
+    /// candidates from its results. It is not enough to stop the graph
+    /// degrading over a very long run of forget/add cycles; that would need
+    /// a rebuild, which is a separate piece of work.
+    pub fn markDeleted(self: *HNSW, id: u64) bool {
+        const node = self.nodes.get(id) orelse return false;
+        if (node.deleted) return false;
+        node.deleted = true;
+        @memset(node.vector, 0.0);
+        // Its outgoing edges are not followed for results any more, and
+        // leaving them would let a tombstone pin memory through the
+        // neighbour lists that still name it.
+        for (node.neighbors) |*list| list.clearRetainingCapacity();
+        self.count -= 1;
+        return true;
+    }
+
     /// Search for the top-k nearest neighbors by cosine similarity.
     pub fn search(self: *HNSW, alloc: Allocator, query: []const f32, k: usize) errors![]SearchResult {
         if (query.len != self.dim) return errors.InvalidQuery;
         if (self.entry_point == null) return &.{};
         const q = Query.of(query);
-        const cands = try self.searchInternal(q, @max(k, @as(usize, self.cfg.hnsw_ef_search)), 0);
-        const out = try alloc.alloc(SearchResult, @min(k, cands.len));
-        for (out, 0..) |*r, i| {
-            r.id = cands[i];
-            r.score = score(q, self.nodeFor(cands[i]).?);
+        // Over-fetch, because tombstoned candidates are dropped below and
+        // a swept store would otherwise come back short. Three times is
+        // arbitrary but bounded; returning fewer than `k` live hits is not
+        // a correctness failure, just a smaller result set.
+        const want = @max(k, @as(usize, self.cfg.hnsw_ef_search));
+        const fetch = @min(self.count, want + want / 2);
+        const cands = try self.searchInternal(q, fetch, 0);
+
+        var out = std.ArrayList(SearchResult).empty;
+        errdefer out.deinit(alloc);
+        for (cands) |id| {
+            if (out.items.len == k) break;
+            const node = self.nodeFor(id) orelse continue;
+            if (node.deleted) continue;
+            try out.append(alloc, .{ .id = id, .score = score(q, node) });
         }
-        return out;
+        return out.toOwnedSlice(alloc);
     }
 
     /// HNSW Algorithm 2 — best-first search within a single layer.

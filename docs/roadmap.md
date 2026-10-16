@@ -136,12 +136,31 @@ claim and has not been adjudicated.
   no-sync control returned `{"query":[4,6,5],"count":3}`. Fixed by embedding
   and indexing each restored row in the same loop; after the fix the
   post-sync query returns exactly the control's three hits.
-- **Forget removes from `cell_index`/`mgr` but not from HNSW**, so stale nodes
-  persist in the vector index after a sweep. Note this now interacts with the
-  fix above: a fuzzied cell is in HNSW before a restart and is not restored
-  into HNSW afterwards, so the index and the cell map disagree across a
-  restart. Which of those two is correct is an open design question, not a
-  settled one.
+- **Forgetting a cell now takes its vector out of HNSW** (fixed 2026-10-16).
+  `store.forget` took the cell out of `mgr` and `cell_index` but left the node
+  in the vector index. Retrieval was never at risk — `getCell` reads
+  `cell_index`, so the candidate is skipped and a forgotten memory cannot
+  come back through a query — but two things were wrong. `count` kept
+  counting it, and `count` is published as `mem3_vector_index_nodes`, so a
+  Prometheus gauge only ever grew and never fell no matter how much the
+  store forgot. And `insert` copies the caller's slice into the node, so each
+  forgotten cell kept 384 floats resident for the life of the index; at the
+  47k cells the long run reaches that is ~72 MB of vectors behind memories
+  the store had already decided to forget. `HNSW.markDeleted` tombstones the
+  node, zeroes its vector, drops it from `count`, and `search` filters
+  tombstoned candidates out of its results.
+  **This makes the index and the cell map agree across a restart too** — the
+  snapshot restore indexes live cells only, which is now the same answer
+  `forget` converges to, instead of the two disagreeing depending on whether
+  the process had restarted.
+  Two limits, both stated rather than hidden. The tombstone does not unlink
+  the node: adjacency lists in this index hold ids, so rewriting every
+  neighbour's list and re-running the pruning that produced them is graph
+  surgery on a hot path. Over a long run of forget/add cycles the graph will
+  degrade and would need a rebuild, which is separate work. And `search`
+  over-fetches by 1.5× to refill after filtering, so a heavily-swept store
+  can come back with fewer than `k` live hits; that is a smaller result set,
+  not a wrong one.
 - **`addRaw`'s `errdefer _ = self.ids.fetchSub(1, .monotonic)`** returns an id to
   a *shared* monotonic counter. Under daemon concurrency that can hand a later
   insert an id a live cell already holds. Currently masked by

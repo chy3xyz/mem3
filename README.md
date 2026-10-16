@@ -487,15 +487,15 @@ extends the file on the next run.
 
 ```bash
 ./scripts/verify.sh           # everything below, plus provenance and a not-verified list
-zig build test                # 308 tests (225 + 83)
+zig build test                # 309 tests (226 + 83)
 zig build check-constitution  # 12 constitution invariants
 zig build bench
 ```
 
 `zig build test` runs two binaries — one rooted at `src/main.zig` and one at
 `tests/main.zig` (unit, integration and property tests under `tests/`). The
-counts above are what the two binaries actually report: `225/225` and `83/83`,
-for `308/308 tests passed` overall.
+counts above are what the two binaries actually report: `226/226` and `83/83`,
+for `309/309 tests passed` overall.
 
 **Zig collects `test` blocks only from files named directly in a root source
 file's `comptime { _ = @import(...) }` block, exactly one level deep.** A file
