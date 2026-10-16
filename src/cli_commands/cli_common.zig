@@ -17,11 +17,19 @@ const platform_stdio = @import("../platform/stdio.zig");
 /// `--data-dir` (default `data`) is honored — the Store is WAL-backed
 /// when set, in-memory when empty. Reads `parsed.dry_run` to choose
 /// between durable and ephemeral mode.
+///
+/// `--embedder-cmd` / `--embedder-arg` are forwarded verbatim. With neither
+/// set the store uses the built-in hashed lexer and stays dependency-free;
+/// with a command set, the external backend is spawned here, at open time,
+/// so a tool that is missing or answers with the wrong width fails before
+/// anything is indexed rather than halfway through.
 pub fn openStore(alloc: std.mem.Allocator, parsed: cli.Parsed) !*Store {
     const data_dir: ?[]const u8 = if (parsed.data_dir.len == 0) null else parsed.data_dir;
     return Store.init(alloc, .{
         .data_dir = data_dir,
         .seed_default_goals = true,
+        .embedder_cmd = parsed.embedder_cmd,
+        .embedder_args = parsed.embedder_args.items,
     });
 }
 

@@ -63,13 +63,28 @@ pub const Parsed = struct {
     dry_run: bool = false,
     help: bool = false,
     version: bool = false,
+    /// Path to an external embedding program, or null for the built-in
+    /// hashed lexer. Opting in is the only way to get a real semantic
+    /// embedding without mem3 taking a dependency — the child process is
+    /// spawned once and kept for the life of the store, so there is no
+    /// per-write process spawn.
+    ///
+    /// Deliberately not a `Config.EmbedderKind` variant: an enum cannot
+    /// carry a program path, and `init(kind, dim)` has nowhere to put one.
+    /// That is why this is a `BuildOptions` field and not a config one.
+    embedder_cmd: ?[]const u8 = null,
+    /// Arguments for `embedder_cmd`, verbatim. No shell, so quoting and
+    /// globbing are the caller's problem. Collected into a list because a
+    /// repeat-single-flag parser cannot express `llama-server --port X`.
+    embedder_args: std.ArrayList([]const u8) = .empty,
     /// Remaining args after subcommand + global flags, kept as key/value pairs.
     args: std.ArrayList(Arg) = .empty,
 
     pub fn deinit(self: *Parsed, alloc: Allocator) void {
-        // args holds borrowed slices from the cmdline iterator (which
-        // has program lifetime) — no per-element frees needed.
+        // Both hold borrowed slices from the cmdline iterator (which has
+        // program lifetime) — no per-element frees needed.
         self.args.deinit(alloc);
+        self.embedder_args.deinit(alloc);
     }
 };
 
@@ -148,6 +163,22 @@ pub fn parseSlice(alloc: Allocator, raw_args: []const []const u8) ParseError!Par
             p.data_dir = arg["--data-dir=".len..];
             continue;
         }
+        // The `=` form is matched here, one flag at a time, and the
+        // space form in `liftSpaceForm` below. A flag added to only one of
+        // the two parses in one and silently does nothing in the other:
+        // `--embedder-cmd=/path` landed in `p.args` and was never read, so
+        // the store quietly fell back to the built-in lexer and indexed
+        // with it. A flag that parses in one form and not the other is
+        // the worst kind, because it looks like it worked.
+        if (std.mem.startsWith(u8, arg, "--embedder-cmd=")) {
+            p.embedder_cmd = arg["--embedder-cmd=".len..];
+            continue;
+        }
+        // Repeatable, same as the space form.
+        if (std.mem.startsWith(u8, arg, "--embedder-arg=")) {
+            try p.embedder_args.append(alloc, arg["--embedder-arg=".len..]);
+            continue;
+        }
         if (std.mem.startsWith(u8, arg, "--bind=")) {
             p.bind = arg["--bind=".len..];
             continue;
@@ -181,6 +212,15 @@ pub fn parseSlice(alloc: Allocator, raw_args: []const []const u8) ParseError!Par
             try p.args.append(alloc, .{ .key = "--data-dir", .value = null });
             continue;
         }
+        if (std.mem.eql(u8, arg, "--embedder-cmd")) {
+            try p.args.append(alloc, .{ .key = "--embedder-cmd", .value = null });
+            continue;
+        }
+        // Repeatable: `--embedder-arg=--model --embedder-arg=/path/to/m.bin`.
+        if (std.mem.eql(u8, arg, "--embedder-arg")) {
+            try p.args.append(alloc, .{ .key = "--embedder-arg", .value = null });
+            continue;
+        }
         // Track if the previous arg was a flag expecting a value.
         //
         // This runs *before* the subcommand slot on purpose: the first
@@ -204,7 +244,7 @@ pub fn parseSlice(alloc: Allocator, raw_args: []const []const u8) ParseError!Par
                 // `--port 8080 --port=9090` and `--port=9090 --port 8080`
                 // both resolve last-wins. Unknown flags keep their Arg
                 // entry untouched for the subcommand handler to read.
-                try liftSpaceForm(&p, last.key, arg);
+                try liftSpaceForm(alloc, &p, last.key, arg);
                 continue;
             }
         }
@@ -221,13 +261,17 @@ pub fn parseSlice(alloc: Allocator, raw_args: []const []const u8) ParseError!Par
 /// Apply a space-form global flag's value to its `Parsed` field.
 /// Flags the parser does not own (`--source`, `--topk`, ...) are left
 /// for the subcommand handler, which reads them out of `Parsed.args`.
-fn liftSpaceForm(p: *Parsed, key: []const u8, v: []const u8) ParseError!void {
+fn liftSpaceForm(alloc: Allocator, p: *Parsed, key: []const u8, v: []const u8) ParseError!void {
     if (std.mem.eql(u8, key, "--port")) {
         p.port = try parseIntStrict(u16, v);
     } else if (std.mem.eql(u8, key, "--bind")) {
         p.bind = v;
     } else if (std.mem.eql(u8, key, "--data-dir")) {
         p.data_dir = v;
+    } else if (std.mem.eql(u8, key, "--embedder-cmd")) {
+        p.embedder_cmd = v;
+    } else if (std.mem.eql(u8, key, "--embedder-arg")) {
+        try p.embedder_args.append(alloc, v);
     } else if (std.mem.eql(u8, key, "--log-every")) {
         p.log_every_seconds = try parseIntStrict(u64, v);
     } else if (std.mem.eql(u8, key, "--log-format")) {
@@ -334,6 +378,12 @@ pub const HELP_TEXT =
     \\                          (default: 3600, so the daemon forgets on its
     \\                          own; independent of --maint-interval, and
     \\                          --maint-interval=0 also stops the sweep)
+    \\  --embedder-cmd=<path>  Delegate embedding to a long-lived external
+    \\                          program (line protocol, see
+    \\                          retrieval/embedder.zig). Omit for the built-in
+    \\                          zero-dependency hashed lexer.
+    \\  --embedder-arg=<arg>   One argument for --embedder-cmd; repeatable.
+    \\                          No shell is involved.
     \\  --dry-run              Show what would be done, don't write
     \\                          (`serve`: forgetting sweeps preview only)
     \\  --help, -h             Show this help

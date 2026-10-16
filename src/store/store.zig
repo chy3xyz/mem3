@@ -112,6 +112,23 @@ fn diag(comptime fmt: []const u8, args: anytype) void {
     /// NOT persisted, only ids and graph topology, so switching
     /// embedder requires a re-index to be meaningful.
     embedder_kind: Config.EmbedderKind = .lexical_hash,
+    /// Opt in: path to an external embedding runtime ("llama-server",
+    /// "python3", ...), resolved through PATH. When null — the default,
+    /// and the only thing an existing caller can produce — `embedder_kind`
+    /// decides, so nothing about the default changes.
+    ///
+    /// When set, `embedder_kind` is ignored, `embed_dim` becomes the
+    /// *required* width (the backend is probed at construction and a
+    /// mismatch fails `init` rather than corrupting the index later), and
+    /// every failure of the child process surfaces as an error from the
+    /// call that needed it. See `retrieval/embedder.zig` for the protocol
+    /// and the full failure table.
+    embedder_cmd: ?[]const u8 = null,
+    /// Arguments passed to `embedder_cmd`, verbatim. No shell, so quoting
+    /// and globbing are the caller's business. `{s}` placeholders are not
+    /// substituted: the tool is long-lived and takes its model path from
+    /// its own arguments.
+    embedder_args: []const []const u8 = &.{},
 };
 
 /// In-process memory store. Composes TriSourceManager + GoalPoset +
@@ -194,6 +211,11 @@ pub const Store = struct {
         const goals_ptr = try alloc.create(ghw.GoalPoset);
         errdefer alloc.destroy(goals_ptr);
         goals_ptr.* = ghw.GoalPoset.init(alloc);
+        // Registered after the value exists, so it runs *before* the
+        // `destroy` above (errdefer unwinds in reverse). Without it a
+        // failure anywhere later in `init` freed the struct and leaked
+        // every node and id string inside it.
+        errdefer goals_ptr.deinit();
         self.goals = goals_ptr;
 
         if (opts.seed_default_goals) {
@@ -217,6 +239,7 @@ pub const Store = struct {
         const mgr_ptr = try alloc.create(memory.TriSourceManager);
         errdefer alloc.destroy(mgr_ptr);
         mgr_ptr.* = memory.TriSourceManager.init(alloc, &self.ids);
+        errdefer mgr_ptr.deinit();
         self.mgr = mgr_ptr;
 
         // Lifecycle
@@ -245,11 +268,13 @@ pub const Store = struct {
         const harness_ptr = try alloc.create(ghw.HarnessRegistry);
         errdefer alloc.destroy(harness_ptr);
         harness_ptr.* = ghw.HarnessRegistry.init(alloc);
+        errdefer harness_ptr.deinit();
         self.harness = harness_ptr;
 
         const world_ptr = try alloc.create(ghw.WorldModel);
         errdefer alloc.destroy(world_ptr);
         world_ptr.* = ghw.WorldModel.init(alloc);
+        errdefer world_ptr.deinit();
         self.world = world_ptr;
 
         self.xlog = ghw.CrossLayerLog.init(alloc);
@@ -259,8 +284,21 @@ pub const Store = struct {
         const hnsw_ptr = try alloc.create(HNSW);
         errdefer alloc.destroy(hnsw_ptr);
         hnsw_ptr.* = HNSW.init(alloc, .{}, opts.embed_dim);
+        errdefer hnsw_ptr.deinit();
         self.hnsw = hnsw_ptr;
-        self.emb = try Embedder.init(opts.embedder_kind, opts.embed_dim);
+        // An external runtime is opt-in and is not reachable from a Config,
+        // so it is a separate constructor: `init(kind, dim)` has no way to
+        // learn a program path. A backend that cannot start, or that
+        // answers with the wrong width, fails here — before a single cell
+        // is indexed — instead of poisoning the index later.
+        self.emb = if (opts.embedder_cmd) |cmd|
+            try Embedder.initExternal(alloc, .{
+                .cmd = cmd,
+                .args = opts.embedder_args,
+                .dim = opts.embed_dim,
+            })
+        else
+            try Embedder.init(opts.embedder_kind, opts.embed_dim);
 
         // The retriever embeds queries with the *store's* embedder, not a
         // second one built from `Config` defaults. With the old
@@ -294,6 +332,9 @@ pub const Store = struct {
 
         self.cell_index.deinit();
         self.xlog.deinit();
+        // Kills the child process if an external embedder was opted into,
+        // and is a no-op for the two built-ins.
+        self.emb.destroy();
         self.harness.deinit();
         self.alloc.destroy(self.harness);
         self.world.deinit();
@@ -3885,4 +3926,65 @@ test "Store: forgetting a cell takes its vector out of the index" {
     // skipped. But their vectors are still sitting in the index, which is
     // what `mem3_vector_index_nodes` publishes and what holds their memory.
     try std.testing.expectEqual(@as(usize, 4), store.hnsw.count);
+}
+
+test "Store: the external embedder is opt-in, off by default, and its failures reach the caller" {
+    const alloc = std.testing.allocator;
+
+    // Default: no external backend, so nothing about an existing caller's
+    // behaviour can move.
+    const opts: BuildOptions = .{ .data_dir = null };
+    try std.testing.expect(opts.embedder_cmd == null);
+    try std.testing.expectEqual(@as(usize, 0), opts.embedder_args.len);
+    try std.testing.expect(opts.embedder_kind == .lexical_hash);
+
+    // No shell means no way to stand in for a model; skip rather than fail
+    // for a reason that has nothing to do with the store.
+    const args = [_][]const u8{
+        "-c",
+        "while IFS= read -r l; do printf '%s 1 0 0\\n' \"${#l}\"; done",
+    };
+    var store = Store.init(alloc, .{
+        .data_dir = null,
+        .seed_default_goals = false,
+        .embed_dim = 4,
+        .embedder_cmd = "/bin/sh",
+        .embedder_args = &args,
+    }) catch |err| switch (err) {
+        error.BackendNotFound, error.BackendNotExecutable, error.BackendSpawnFailed => return error.SkipZigTest,
+        else => return err,
+    };
+    defer store.deinit();
+
+    try std.testing.expect(store.emb == .external_pipe);
+    const id = try store.addRaw(.matter, "hello world", "user|likes|coffee", 1, 0.7);
+    try std.testing.expectEqual(@as(usize, 1), store.hnsw.count);
+
+    // Retrieval goes through the store's own copy of the same embedder (the
+    // retriever holds a second copy of the union over one pipe), so this is
+    // also the test that sequential use of the shared handle works.
+    const hits = try store.query(alloc, "hello world", .{});
+    defer alloc.free(hits);
+    try std.testing.expect(hits.len > 0);
+    try std.testing.expectEqual(id, hits[0].cell.id);
+
+    // A dead backend fails the write. It must not fall back to some other
+    // embedder and silently change the vector space of the index.
+    const dead_args = [_][]const u8{
+        "-c",
+        "IFS= read -r l; printf '1 1 1 1\\n'; exit 0",
+    };
+    var dead = try Store.init(alloc, .{
+        .data_dir = null,
+        .seed_default_goals = false,
+        .embed_dim = 4,
+        .embedder_cmd = "/bin/sh",
+        .embedder_args = &dead_args,
+    });
+    defer dead.deinit();
+    try std.testing.expectError(
+        error.BackendExited,
+        dead.addRaw(.matter, "hello world", "user|likes|coffee", 1, 0.7),
+    );
+    try std.testing.expectEqual(@as(usize, 0), dead.hnsw.count);
 }
