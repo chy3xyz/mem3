@@ -16,6 +16,7 @@
 //! - `consolidate` — run the consolidation pipeline
 //! - `forget`    — run the existence-gain-driven forgetting sweep
 //! - `serve`     — start the HTTP daemon
+//! - `mcp`       — serve the Model Context Protocol over stdio
 //! - `bench`     — run performance benchmarks
 //!
 //! ## Constitution compliance
@@ -145,6 +146,26 @@ comptime {
     _ = @import("utils/time.zig");
     _ = @import("utils/jsonl.zig");
     _ = @import("utils/logger.zig");
+
+    // The MCP server. Each file is named INDIVIDUALLY, not via
+    // `mcp/mod.zig`: Zig collects `test` blocks only from files named
+    // directly in the root's comptime block, so a re-export builds the
+    // module without ever registering its tests. This is the same trap
+    // documented above for `reranker.zig` and `goal_tree.zig`, and the
+    // reason `mod.zig` alone is not enough.
+    //
+    // Hand-rolled protocol code is exactly where a silently green suite
+    // hides: a parser that drops an escape, a framer that dispatches a
+    // half-line, a server that answers a notification. Every one of
+    // those is a field bug with no compiler support, so the tests are
+    // the only thing standing between them and a client that hangs.
+    _ = @import("mcp/json.zig");
+    _ = @import("mcp/json_out.zig");
+    _ = @import("mcp/framing.zig");
+    _ = @import("mcp/protocol.zig");
+    _ = @import("mcp/tools.zig");
+    _ = @import("mcp/server.zig");
+    _ = @import("cli_commands/mcp.zig");
 }
 
 const log = std.log.scoped(.mem3_main);
@@ -184,6 +205,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         .forget => @import("cli_commands/forget.zig").run(alloc, parsed),
         .serve => @import("cli_commands/serve.zig").run(alloc, parsed),
         .bench => @import("cli_commands/bench.zig").run(alloc, parsed),
+        .mcp => @import("cli_commands/mcp.zig").run(alloc, parsed),
         .help => cli.printHelp(),
         .version => {
             std.debug.print("{s}", .{version.banner()});

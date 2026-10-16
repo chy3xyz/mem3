@@ -19,6 +19,7 @@ pub const Subcommand = enum {
     forget,
     serve,
     bench,
+    mcp,
     help,
     version,
 };
@@ -320,6 +321,7 @@ pub fn subcommandFromName(name: []const u8) ParseError!Subcommand {
     if (std.mem.eql(u8, name, "forget")) return .forget;
     if (std.mem.eql(u8, name, "serve")) return .serve;
     if (std.mem.eql(u8, name, "bench")) return .bench;
+    if (std.mem.eql(u8, name, "mcp")) return .mcp;
     if (std.mem.eql(u8, name, "help")) return .help;
     if (std.mem.eql(u8, name, "version")) return .version;
     return error.UnknownSubcommand;
@@ -362,6 +364,7 @@ pub const HELP_TEXT =
     \\  consolidate   Run the consolidation pipeline
     \\  forget        Run the existence-gain-driven forgetting sweep
     \\  serve         Start the HTTP daemon (default port 7777)
+    \\  mcp           Serve the Model Context Protocol over stdio
     \\  bench         Run the in-process smoke benchmark suite
     \\  help          Show this help
     \\  version       Show version
@@ -400,6 +403,11 @@ pub const HELP_TEXT =
     \\  mem3 serve --forget-interval 0     # retain everything (opt out)
     \\  mem3 serve --dry-run # sweep without deleting
     \\  mem3 bench --json
+    \\
+    \\MCP (one JSON-RPC message per line on stdin/stdout):
+    \\  mem3 mcp                    # attach mem3 to an MCP client
+    \\  mem3 mcp --data-dir=./data  # same store the CLI uses
+    \\  mem3 mcp --in-memory         # ephemeral session, no writes
     \\
 ;
 

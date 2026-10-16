@@ -438,31 +438,53 @@ pub fn rename(from: [*:0]const u8, to: [*:0]const u8) Error!void {
     if (std.c.rename(from, to) != 0) return error.IoFailed;
 }
 
-/// Create `path` and every missing parent. Returns the first component that
-/// already existed, or the full path if it was created from scratch.
-pub fn makeDirAll(path: [*:0]const u8) Error![]const u8 {
-    var created_up_to: usize = 0;
+/// Create `path` and every missing parent. Returns `path`.
+///
+/// `scratch` must have room for the longest parent prefix plus a
+/// terminator. Each prefix has to be a real NUL-terminated C string to hand
+/// to `posixPathKind` and `makeDir`, and a slice of `path` is not: cutting
+/// at a separator produces `['/', 'n', 'o', 0]` with a sentinel lying about
+/// the byte it points at. The previous version built exactly that.
+///
+/// Takes a **sentinel slice**, not a `[*:0]const u8`, because it reads
+/// `path.len` and a many-item pointer has no length. It was the latter
+/// until this was noticed, so this function has never compiled. It survived
+/// only because nothing called it: Zig analyses a function body lazily, and
+/// naming a file in the root's `comptime` block does not analyse every
+/// declaration inside it. A `pub fn` that is dead is not a safe `pub fn`,
+/// it is a landmine for the first caller.
+///
+/// The old doc promised "the first component that already existed, or the
+/// full path if it was created from scratch" and the body implemented
+/// neither — it tracked the position after the *last* separator walked.
+/// Returning `path` is the one contract that cannot be wrong, and nothing in
+/// the repo called this. Use `posixPathKind` if you need to know what
+/// pre-existed.
+pub fn makeDirAll(scratch: []u8, path: [:0]const u8) Error![:0]const u8 {
     var i: usize = 0;
     while (i < path.len) : (i += 1) {
         if (path[i] != '/' and path[i] != '\\') continue;
-        if (i == 0) {
-            created_up_to = 1;
-            continue;
-        }
-        const parent = path[0..i :0];
-        const parent_kind = posixPathKind(parent) catch DirMode.file;
-        if (parent_kind == .directory) {
-            created_up_to = i + 1;
-            continue;
-        }
+        if (i == 0) continue;
+        if (i + 1 > scratch.len) return error.IoFailed;
+        @memcpy(scratch[0..i], path[0..i]);
+        scratch[i] = 0;
+        const parent: [*:0]const u8 = scratch[0..i :0].ptr;
+        const kind = posixPathKind(parent) catch DirMode.file;
+        if (kind == .directory) continue;
         makeDir(parent) catch |err| switch (err) {
             // Lost a race with another process creating the same directory.
             error.AlreadyExists => {},
             else => return err,
         };
-        created_up_to = i + 1;
     }
-    return path[0..created_up_to];
+    const kind = posixPathKind(path.ptr) catch DirMode.file;
+    if (kind != .directory) {
+        makeDir(path.ptr) catch |err| switch (err) {
+            error.AlreadyExists => {},
+            else => return err,
+        };
+    }
+    return path;
 }
 
 // ---------------------------------------------------------------------------
@@ -641,4 +663,39 @@ test "rename moves a file" {
     const fd = try open(b, .{ .access = .read_only });
     defer close(fd);
     try std.testing.expectEqual(@as(u64, 7), try sizeOf(fd));
+}
+
+test "makeDirAll creates every missing parent, and reports how far it got" {
+    var buf: [256]u8 = undefined;
+    const root = tmpPath(&buf, "mkdirall");
+    // `tmpPath` hands back a sentinel pointer; makeDirAll wants the
+    // sentinel *slice*, which is what actually carries a length.
+    const base: [:0]const u8 = root[0..std.mem.len(root) :0];
+
+    var deep_buf: [512]u8 = undefined;
+    const deep_z = try std.fmt.bufPrint(&deep_buf, "{s}/a/b/c", .{base});
+    deep_buf[deep_z.len] = 0;
+    const deep: [:0]const u8 = deep_buf[0..deep_z.len :0];
+
+    var scratch: [512]u8 = undefined;
+    const made = try makeDirAll(&scratch, deep);
+    // The contract is "returns path", and the leaf is created too, not
+    // just its parents — the old version stopped at the last separator.
+    try std.testing.expectEqualStrings(deep, made);
+    try std.testing.expectEqual(@as(DirMode, .directory), (try posixPathKind(deep)));
+
+    // Second call is idempotent: the parents all exist now.
+    const again = try makeDirAll(&scratch, deep);
+    try std.testing.expectEqual(@as(DirMode, .directory), (try posixPathKind(again)));
+
+    _ = std.c.unlink(deep.ptr);
+    var b_buf: [512]u8 = undefined;
+    const bz = try std.fmt.bufPrint(&b_buf, "{s}/a/b", .{base});
+    b_buf[bz.len] = 0;
+    _ = std.c.unlink(b_buf[0..bz.len :0].ptr);
+    var a_buf: [512]u8 = undefined;
+    const az = try std.fmt.bufPrint(&a_buf, "{s}/a", .{base});
+    a_buf[az.len] = 0;
+    _ = std.c.unlink(a_buf[0..az.len :0].ptr);
+    _ = std.c.unlink(base.ptr);
 }
