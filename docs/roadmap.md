@@ -7,6 +7,29 @@ Current version: **`0.1.0-alpha`**. Supported targets: **macOS and Linux**.
 
 ---
 
+## Recently closed
+
+- **MCP server** (`mem3 mcp`, JSON-RPC 2.0 over stdio, hand-written, zero
+  dependencies). Five tools: `memory_add`, `memory_query`, `goal_list`,
+  `memory_forget`, `memory_stats`. `memory_forget` defaults to `dry_run: true`,
+  which is stricter than the CLI. This was the missing distribution channel:
+  without it the daemon's storage was reachable only by a bespoke HTTP client.
+  Still unverified against a real Claude Code / MCP host — the protocol version
+  `2025-06-18` is declared, not negotiated.
+- **Optional external embedding** (`--embedder-cmd`, `--embedder-arg`). A
+  long-lived child process speaking a one-line-in / one-line-of-floats-out
+  protocol, so a real embedding model becomes an *option* rather than a build
+  dependency. The zero-dependency hashed lexer stays the default, and the
+  default path is byte-identical to pre-MCP builds — pinned by a permanent
+  fingerprint test. Cost of the external path is 1.50–1.96× the lexical path at
+  p50, and neither adds a link dependency (`otool -L` still lists only
+  `libSystem`).
+- **HNSW recall** — see "The graph used to be disconnected" below. On a
+  400-node corpus recall@10 went 0.6090 → **0.9920** at ef=10, and reachability
+  went 0.7675 → 0.9975.
+
+---
+
 ## Platform support
 
 **macOS and Linux only.** `x86_64-linux-gnu` and `aarch64-linux-gnu` both
@@ -228,9 +251,34 @@ claim and has not been adjudicated.
   ratchet, since every failure pushes the counter further back over ids that
   are already committed. `addHyperedge` was already correct here and said why:
   ids must be unique, not dense. Leaking an id costs nothing.
-- **HNSW recall has not saturated.** `mem3-hnsw-recall` measures recall@10
-  against exhaustive scan on 400 nodes: 0.566 @ ef=10, 0.758 @ ef=100, 0.772 @
-  ef=400. The default `hnsw_ef_search` is 100.
+- **HNSW recall falls off with corpus size, and the default `ef` is a
+  small-corpus setting.** `mem3-hnsw-recall` measures recall@10 against
+  exhaustive scan. On 400 nodes (dim=32) it is **0.9920 @ ef=10** and **0.9980 @
+  ef=100**, against a level-0 reachability of 0.9975 — recall is capped by graph
+  connectivity, not by search width. At dim=384 it degrades with `n`: 0.9980
+  (1k), 0.8930 (10k), 0.6760 (30k), 0.4300 (100k) at `ef=100`, and needs
+  `ef ≈ 0.08·n` to saturate (0.9890 at ef=3200 for n=100k). The default
+  `hnsw_ef_search` is 100.
+- **The graph used to be disconnected, and that — not search width — was the
+  recall ceiling.** Before this round, a directed walk from the entry point
+  reached only 307/400 nodes; `1 − 307/400 = 0.7675` against a measured
+  recall@10 of 0.7720 at ef=400. The cause was `shrinkConnections`
+  implementing the paper's diversity rule with the operands swapped: it
+  discarded the *candidate* instead of evicting the *kept neighbour`, which
+  compounds (every kept neighbour is another chance to discard) and dropped
+  average level-0 degree from 32 to 13.4 — while every max-degree assertion
+  stayed green, because the assertion bounded the maximum, not the mean. With
+  reachability at 1.0000 the same 400-node corpus went to 0.9920/0.9980.
+- **`ef_construction = 200` is now the dominant insert cost.** At the corrected
+  pruning, `efc=100` measures both *better* recall and *faster* insert
+  (−26% on a 4000-cell interleaved build, p50 over 8 rounds) than `efc=200`
+  did under the broken pruning. It is still 200 in `Config` because it is a
+  product-level default that every benchmark inherits; changing it is a
+  deliberate decision, not a side effect of a recall fix.
+- **The 100k build-time target is missed by 14x.** `spec.md` and the
+  constitution both state < 30s for 100k vectors; measured is **430.6 s**
+  (dim=384, efc=200, whole-index build). Cost of the recall fix, which keeps
+  more edges alive. `efc=100` roughly halves it and still misses.
 - **No group commit.** `wal.append` fsyncs on every record (~1.2 ms). Currently
   not the dominant write cost, but it will become one once insert is fixed.
 - **The on-disk format is unstable.** `0.1.0-alpha`, no external users, no

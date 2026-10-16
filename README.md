@@ -232,6 +232,7 @@ mem3 <subcommand> [flags]
 | `consolidate` | Run the consolidation pipeline | works |
 | `forget` | Existence-gain-driven forgetting sweep | works |
 | `serve` | Start the HTTP daemon | works |
+| `mcp` | Serve the Model Context Protocol over stdio | works; protocol version declared, not yet exercised against a real MCP host |
 | `bench` | In-process smoke suite (see [Performance](#performance)) | works; the release gate is `zig build bench` |
 | `help`, `version` | Help text / version string | works |
 
@@ -244,9 +245,27 @@ sources), `--goal-ids` (comma-separated ids). With `--json` it prints
 `{"query":[ids...],"count":N}`.
 
 Global flags: `--json`, `--data-dir=<path>` (default `data`), `--log-format=human|jsonl|silent`,
-`--log-every=<seconds>`, `--dry-run`, `--help`, `--version`.
+`--log-every=<seconds>`, `--embedder-cmd=<path>`, `--embedder-arg=<arg>`
+(repeatable), `--dry-run`, `--help`, `--version`.
 
 `serve` flags: `--port=<n>` (default 7777), `--bind=<addr>` (default 127.0.0.1).
+
+`mcp` speaks JSON-RPC 2.0 over stdin/stdout, one message per line, and exposes
+five tools: `memory_add`, `memory_query`, `goal_list`, `memory_forget`,
+`memory_stats`. `memory_forget` defaults to `dry_run: true`. It is hand-written
+against the std library — the zero-dependency rule is not relaxed here. Point an
+MCP client at it with:
+
+```json
+{ "mcpServers": { "mem3": { "command": "/path/to/mem3", "args": ["mcp", "--data-dir=/path/to/store"] } } }
+```
+
+`--embedder-cmd` delegates embedding to a long-lived external program instead of
+the built-in hashed lexer: mem3 writes one line of text, the program replies with
+one line of whitespace-separated floats, and the process is reused for every
+call. Width mismatches fail at startup, not mid-query. Omit the flag and nothing
+changes — the built-in path is byte-identical to builds without this feature, and
+neither path adds a link dependency.
 
 > The example in `mem3 --help` (`mem3 add --source matter --episode "hello" --facts "u|likes|coffee"`)
 > does not run — it omits the spirit dimension and fails with `SpiritDimMissing`.
@@ -487,15 +506,15 @@ extends the file on the next run.
 
 ```bash
 ./scripts/verify.sh           # everything below, plus provenance and a not-verified list
-zig build test                # 309 tests (226 + 83)
+zig build test                # 405 tests (322 + 83)
 zig build check-constitution  # 12 constitution invariants
 zig build bench
 ```
 
 `zig build test` runs two binaries — one rooted at `src/main.zig` and one at
 `tests/main.zig` (unit, integration and property tests under `tests/`). The
-counts above are what the two binaries actually report: `226/226` and `83/83`,
-for `309/309 tests passed` overall.
+counts above are what the two binaries actually report: `322/322` and `83/83`,
+for `405/405 tests passed` overall.
 
 **Zig collects `test` blocks only from files named directly in a root source
 file's `comptime { _ = @import(...) }` block, exactly one level deep.** A file
@@ -554,14 +573,16 @@ Known and measured, not discovered after the fact:
   it is absent from the WAL record and from the committed cell.`), and `dump`
   returns `"foresight":[]` with a placeholder goal id of `0`, so a
   foresight-only cell loses its spirit dimension.
-- **HNSW is a real graph index, but a shallow one.** The layered structure is
-  built and searched by greedy descent with `ef`-bounded expansion, not
-  sampled. Measured recall@10 against an exhaustive scan on a 400-node corpus
-  (`mem3-hnsw-recall`): **0.566 @ ef=10, 0.758 @ ef=100, 0.772 @ ef=400**, with
-  `max_level=2`. The layers are populated (level 0: 400 nodes avg degree 28.47;
-  level 1: 34 nodes; level 2: 4 nodes), so the hierarchy is real but two levels
-  deep, and recall has not saturated at the default `ef`. Say nothing about a
-  large index.
+- **HNSW recall is high on small graphs and falls off with corpus size.** The
+  layered structure is built and searched by greedy descent with `ef`-bounded
+  expansion, not sampled. Measured recall@10 against an exhaustive scan on a
+  400-node corpus (`mem3-hnsw-recall`, dim=32): **0.9920 @ ef=10, 0.9980 @
+  ef=100**, against a level-0 reachability of 399/400 = 0.9975 — recall is
+  capped by graph connectivity, not by search width. At dim=384 the same
+  measurement degrades with `n`: **0.9980** (n=1k), **0.8930** (n=10k),
+  **0.6760** (n=30k), **0.4300** (n=100k) at the default `ef=100`, reaching
+  0.9890 only at ef=3200. Saturation needs roughly `ef ≈ 0.08·n`, so the
+  default is a small-corpus setting: say nothing about a 100k index at `ef=100`.
 - **The WAL fsyncs on every record**, costing ~1.2 ms per durable append. There
   is no group commit.
 - **The daemon's HTTP stack is POSIX-only.** Raw `socket`/`bind`/`listen`/

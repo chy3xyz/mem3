@@ -15,7 +15,7 @@
 | Theory | 三源合恰论 (物/象/性) + GHW 范式 (Goal/Harness/World) |
 | Spec-kit | Initialized; spec at `specs/001-trisource-everos-mvp/` |
 | Platforms | **macOS and Linux only** — Windows and WASM refused at compile time (see [Platforms](#platforms)) |
-| Status | **v0.1.0-alpha** (CLI + persistence + 309 tests + 12 constitution invariants, all measured). All 7 constitutional principles active. |
+| Status | **v0.1.0-alpha** (CLI + MCP + persistence + 405 tests + 12 constitution invariants, all measured). All 7 constitutional principles active. |
 
 ## Read Order for New Agents
 
@@ -122,8 +122,10 @@ tests/
 | `mem3 forget` | ✅ | Existence-gain-driven forgetting sweep |
 | `mem3 bench` | ✅ | Fast in-process smoke suite; the release gate is `zig build bench` |
 | `mem3 serve` | ✅ | HTTP daemon with /healthz /metrics /api/sync /api/memcells /api/memcells/:id |
+| `mem3 mcp` | ✅ | MCP server over stdio (JSON-RPC 2.0, hand-written, zero deps). 5 tools: `memory_add` / `memory_query` / `goal_list` / `memory_forget` / `memory_stats` |
+| Embedding | ✅ | Built-in hashed lexer is the default and is byte-identical to pre-MCP builds. `--embedder-cmd` delegates to a long-lived external program over a line protocol (the "optional tier"); no new link dependency either way |
 | Persistence | ✅ | WAL-first + snapshot. WAL truncated on sync. |
-| Tests | ✅ | 300: 217 (`src/main.zig`-rooted) + 83 (`tests/main.zig`-rooted), plus 12 constitution invariants as a separate gate, 0 leaks |
+| Tests | ✅ | 405: 322 (`src/main.zig`-rooted) + 83 (`tests/main.zig`-rooted), plus 12 constitution invariants as a separate gate, 0 leaks |
 | Binary | ✅ | 798,904 bytes `ReleaseFast` / 4,092,632 bytes Debug, only links libSystem |
 | Toolchain | ✅ | Pinned via `.zigversion` (Zig 0.17.0) |
 | Platforms | ✅ | macOS + Linux (x86_64 and aarch64). Windows/WASM refused at compile time — see [Platforms](#platforms) |
@@ -193,7 +195,7 @@ real gap, not a rounding error.
 |---|---|---|---|
 | MemCell write throughput | ≥ 1K/sec MVP / 1.75K/sec release (amended 2026-10-15, worst window) | worst window 1,863–2,438/sec; mean 3,116–3,898/sec | **pass** |
 | Top-10 query P95 | < 50ms MVP / < 10ms release (100K corpus) | 0.624 ms p95 (600-cell corpus) | not comparable — wrong corpus size |
-| HNSW build 100K vectors | < 30s | not measured at 100K | **UNVERIFIED** |
+| HNSW build 100K vectors | < 30s | 430.6 s (dim=384, efc=200, whole-index build) | **MISS — 14x over** |
 | 3-hop traversal | < 5ms (1K seeds) | 0.000 ms/seed | pass |
 | Cold-start | < 200ms | 0.077 ms | pass |
 | RSS at 100K cells | < 500MB | not measured at 100K | **UNVERIFIED** |
