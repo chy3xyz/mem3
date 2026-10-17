@@ -190,6 +190,19 @@ pub const Envelope = struct {
 pub const Rejection = struct {
     code: i32,
     message: []const u8,
+    /// Source text of the request's `id`, when the document parsed far
+    /// enough to read one and validation still rejected the message.
+    ///
+    /// JSON-RPC 2.0 requires a response to carry "the same ID as the
+    /// request... if the id could not be detected, it MUST be Null". A
+    /// message that has a perfectly good `id` and a broken `method` is
+    /// not an undetectable id, so echoing `null` there tells the client
+    /// nothing about which request failed — and a client batching
+    /// requests gets one `id: null` per bad element and no way to tell
+    /// them apart from the error that killed the whole batch.
+    ///
+    /// Borrowed from the caller's line, which outlives the parse.
+    id_raw: ?[]const u8 = null,
 };
 
 pub const Parsed = union(enum) {
@@ -222,12 +235,22 @@ pub fn parseMessage(alloc: Allocator, line: []const u8) Allocator.Error!Parsed {
     var doc_owned = true;
     defer if (doc_owned) doc.deinit();
 
-    if (validate(&doc)) |r| return .{ .rejected = r };
+    // Read the id before validation, while the document that holds its
+    // source text is still alive. `validate` may reject a message that
+    // carried a perfectly good id, and that id is what the error has to
+    // echo back.
+    const id_raw = doc.span("id");
+
+    if (validate(&doc)) |r| {
+        var rejection = r;
+        rejection.id_raw = id_raw;
+        return .{ .rejected = rejection };
+    }
 
     doc_owned = false;
     return .{ .ok = .{
         .doc = doc,
-        .id_raw = doc.span("id"),
+        .id_raw = id_raw,
         .method = json.get(doc.root, "method").?.asString().?,
         .params = paramsOf(doc.root),
     } };

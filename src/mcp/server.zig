@@ -215,10 +215,11 @@ pub const Server = struct {
 
         switch (parsed) {
             .rejected => |r| {
-                // Even a rejection is answered — with `id: null`, since
-                // there is no id to echo. Silence here is what leaves a
-                // client waiting forever.
-                return self.writeError(null, r.code, r.message);
+                // Even a rejection is answered. The id is the one the
+                // request carried when it had one — `null` is only for an
+                // id we could not read, which is what makes a batch of
+                // several bad elements distinguishable from each other.
+                return self.writeError(r.id_raw, r.code, r.message);
             },
             .ok => |*env| {
                 defer env.deinit();
@@ -1567,4 +1568,63 @@ test "server: every tool's result survives the modern envelope" {
         try testing.expectEqualStrings("complete", (json.get(result, "resultType") orelse unreachable).asString().?);
         try testing.expect((json.get(result, "content") orelse unreachable).asArray().?.len == 1);
     }
+}
+
+test "server: a rejected request is answered under its own id, not null" {
+    var h = try Harness.init(testing.allocator, false);
+    defer h.deinit(testing.allocator);
+
+    // JSON-RPC: a response carries the same id as its request, and `null`
+    // only when the id could not be detected. A message with a readable id
+    // and a broken method is not that — and inside a batch, nulling every
+    // bad element makes them indistinguishable from each other and from an
+    // error that killed the whole batch.
+    const got = try h.sendMessage(testing.allocator,
+        \\[{"jsonrpc":"2.0","id":60,"method":"ping","params":{}},{"jsonrpc":"2.0","id":61},{"jsonrpc":"2.0","id":62,"method":"ping","params":{}}]
+    );
+    defer testing.allocator.free(got);
+
+    var doc = try json.parse(testing.allocator, std.mem.trim(u8, got, "\r\n"));
+    defer doc.deinit();
+    const arr = doc.root.asArray().?;
+    try testing.expectEqual(@as(usize, 3), arr.len);
+
+    // The only element carrying an error must be the one sent as id 61,
+    // and it must answer to that id. Ids are echoed as *source text*, so
+    // a numeric id comes back as a number, not a string — reading it with
+    // `asString` is how this test first failed on correct output.
+    for (arr) |v| {
+        const o = v.asObject().?;
+        const id_value = json.get(.{ .object = o }, "id") orelse unreachable;
+        const id_num: f64 = switch (id_value) {
+            .number => |n| n,
+            else => -1,
+        };
+        if (json.get(.{ .object = o }, "error") != null) {
+            try testing.expectEqual(@as(f64, 61), id_num);
+            const code = json.get(json.get(.{ .object = o }, "error") orelse unreachable, "code") orelse unreachable;
+            try testing.expectEqual(@as(f64, -32600), switch (code) {
+                .number => |n| n,
+                else => 0,
+            });
+        } else {
+            // Its neighbours are untouched: both are still answered, and
+            // neither is the error. (Two neighbours, not one — 60 and 62.)
+            try testing.expect(id_num == 60 or id_num == 62);
+            try testing.expect(json.get(.{ .object = o }, "result") != null);
+        }
+    }
+}
+
+test "server: a message too broken to have an id is answered with id null" {
+    var h = try Harness.init(testing.allocator, false);
+    defer h.deinit(testing.allocator);
+
+    // The other half of the rule: when the id genuinely cannot be read,
+    // null is required, not merely permitted.
+    const got = try h.sendMessage(testing.allocator, "{ this is not json");
+    defer testing.allocator.free(got);
+
+    try testing.expect(std.mem.indexOf(u8, got, "\"id\":null") != null);
+    try testing.expect(std.mem.indexOf(u8, got, "-32700") != null);
 }
