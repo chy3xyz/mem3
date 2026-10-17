@@ -137,6 +137,141 @@ pub const Framer = struct {
     }
 };
 
+/// Walks the elements of a JSON-RPC batch — one line whose top level is
+/// an array of messages — yielding each element's *source text*, borrowed
+/// from the input.
+///
+/// ## Why the framer owns this
+///
+/// MCP requires implementations to **receive** batches even though almost
+/// no client sends one: "Implementations MUST support receiving batches;
+/// MAY support sending them". Not supporting them is the kind of omission
+/// that costs nothing until the day a client batches a connection open and
+/// the server answers every element with `-32700`, which the client then
+/// reports as a parse failure rather than as a missing feature.
+///
+/// Yielding source text rather than parsed values is deliberate: each
+/// slice is a complete JSON-RPC message, so the server hands it to
+/// `protocol.parseMessage` exactly as if it had arrived on its own line,
+/// and every element gets its own `Document` with its own lifetime. A
+/// batch therefore cannot outlive its own memory.
+///
+/// Only element *boundaries* are found here. Whether an element is valid
+/// JSON, or a valid request, is `parseMessage`'s question — this layer
+/// decides what a message is, not whether it is a good one.
+pub const BatchIterator = struct {
+    src: []const u8,
+    /// Next byte to examine.
+    pos: usize,
+    /// Bracket nesting below the batch array. `0` means "between
+    /// elements", where `,` separates and `]` closes.
+    depth: usize = 0,
+    in_string: bool = false,
+    escape: bool = false,
+    /// First byte of the element being scanned. `null` when the cursor is
+    /// on whitespace or a separator just past one.
+    elem_start: ?usize = null,
+    /// Set once the closing `]` has been consumed.
+    finished: bool = false,
+
+    pub const Error = error{MalformedBatch};
+
+    /// A batch line is one whose first non-whitespace byte is `[`. This
+    /// is not validation: `[]` and `[{,}]` both pass here and are
+    /// reported by `next` instead.
+    pub fn isBatch(line: []const u8) bool {
+        const trimmed = std.mem.trim(u8, line, " \t\r\n");
+        return trimmed.len > 0 and trimmed[0] == '[';
+    }
+
+    /// Start at the first element. `error.MalformedBatch` when the line
+    /// does not open an array.
+    pub fn init(line: []const u8) Error!BatchIterator {
+        const trimmed = std.mem.trimStart(u8, line, " \t\r\n");
+        if (trimmed.len == 0 or trimmed[0] != '[') return error.MalformedBatch;
+        return .{ .src = line, .pos = trimmed.ptr - line.ptr + 1 };
+    }
+
+    /// The next element's source text, or `null` at the end of the
+    /// batch. `error.MalformedBatch` for a missing separator, an
+    /// unterminated string, or a closing bracket that arrives while the
+    /// caller is still inside a nested container.
+    pub fn next(self: *BatchIterator) Error!?[]const u8 {
+        // A consumed batch ends; it does not fall off the end of the
+        // input looking for a closing bracket that was already there.
+        if (self.finished) return null;
+        while (self.pos < self.src.len) {
+            const c = self.src[self.pos];
+            self.pos += 1;
+
+            if (self.in_string) {
+                // The escape flag must be consumed before anything else,
+                // or `\"` ends the string on the escaped quote and every
+                // subsequent `,` and `]` inside that string is read as
+                // structure.
+                if (self.escape) {
+                    self.escape = false;
+                } else if (c == '\\') {
+                    self.escape = true;
+                } else if (c == '"') {
+                    self.in_string = false;
+                }
+                continue;
+            }
+
+            switch (c) {
+                '"' => {
+                    self.in_string = true;
+                    if (self.elem_start == null) self.elem_start = self.pos - 1;
+                },
+                '[', '{' => {
+                    self.depth += 1;
+                    if (self.elem_start == null) self.elem_start = self.pos - 1;
+                },
+                ']', '}' => {
+                    if (self.depth == 0) {
+                        // `]` closes the batch; `}` here is a stray
+                        // closer and the same kind of defect.
+                        if (c != ']') return error.MalformedBatch;
+                        const elem = try self.take();
+                        self.finished = true;
+                        return elem;
+                    }
+                    self.depth -= 1;
+                },
+                ',' => {
+                    if (self.depth != 0) continue;
+                    const elem = try self.take();
+                    // `[,x]` — a separator with no value before it.
+                    if (elem == null) return error.MalformedBatch;
+                    return elem;
+                },
+                else => {
+                    if (self.elem_start == null and !isSpace(c)) self.elem_start = self.pos - 1;
+                },
+            }
+        }
+        // Ran out before the closing `]`. A truncated batch is a
+        // truncated batch; the caller answers it as malformed rather
+        // than treating the partial tail as a whole message.
+        return error.MalformedBatch;
+    }
+
+    /// Close the current element, or `null` if the cursor is still on
+    /// separators and whitespace.
+    fn take(self: *BatchIterator) Error!?[]const u8 {
+        const start = self.elem_start orelse return null;
+        const elem = std.mem.trimEnd(u8, self.src[start..self.pos - 1], " \t\r\n");
+        self.elem_start = null;
+        if (elem.len == 0) return error.MalformedBatch;
+        return elem;
+    }
+};
+
+fn isSpace(c: u8) bool {
+    return c == ' ' or c == '\t' or c == '\r' or c == '\n';
+}
+
 // =============================================================================
 // Tests
 //

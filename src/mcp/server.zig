@@ -53,6 +53,10 @@ pub const Server = struct {
     /// snapshot on a clean exit instead of losing the session to the
     /// WAL-replay path next time. `Store.sync` is a no-op in memory.
     dirty: bool = false,
+    /// Non-null while a JSON-RPC batch is being dispatched. `emit`
+    /// appends here instead of writing, and `handleBatch` turns the
+    /// result into one array. See `emit`.
+    batch_buf: ?std.ArrayList(u8) = null,
 
     pub fn init(alloc: Allocator, store: *Store, out_fd: std.posix.fd_t) Server {
         return .{
@@ -111,6 +115,100 @@ pub const Server = struct {
         // answering something the client never sent.
         if (json.isBlank(line)) return;
 
+        // MCP: "Implementations MUST support receiving batches". A batch
+        // is one line holding a top-level array, and every response to it
+        // has to come back as a single array — so it cannot reuse the
+        // one-message path, which emits as it goes.
+        if (framing.BatchIterator.isBatch(line)) return self.handleBatch(line);
+
+        try self.handleMessage(line);
+    }
+
+    /// Dispatch every message in a JSON-RPC batch and answer with one
+    /// array.
+    ///
+    /// Three rules from JSON-RPC 2.0 §5 govern the edges:
+    ///
+    ///   * A batch that is not an array, or an array with no elements, is
+    ///     answered with a **single** response object carrying `id: null`
+    ///     — never an array, and never an empty one.
+    ///   * An array of only notifications produces **no output at all**.
+    ///     An empty array response would be a response to nothing.
+    ///   * An invalid element inside a valid batch is answered in place,
+    ///     with `id: null`, and the rest of the batch still runs.
+    fn handleBatch(self: *Server, line: []const u8) !void {
+        var it = framing.BatchIterator.init(line) catch {
+            return self.writeError(null, protocol.Code.invalid_request, "batch must be a JSON array of messages");
+        };
+
+        self.batch_buf = .empty;
+        defer if (self.batch_buf) |*b| b.deinit(self.alloc);
+
+        var dispatched: usize = 0;
+        // `next`'s payload is itself optional: `[]` reaches the closing
+        // bracket with no element open, and that is the empty-batch case
+        // rather than a value, so the optional is resolved here instead of
+        // being unwrapped by the `while` capture.
+        var malformed = false;
+        while (it.next()) |maybe_elem| {
+            const elem = maybe_elem orelse break;
+            dispatched += 1;
+            // A failing element must not abandon the ones after it: the
+            // client sent a whole batch and is owed an answer to each.
+            self.handleMessage(elem) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => try self.writeError(null, protocol.Code.internal_error, "failed while handling one batch element"),
+            };
+        } else |err| {
+            malformed = err == error.MalformedBatch;
+        }
+
+        // Detach before answering. A batch that turns out to be malformed
+        // is answered with a *single* response object, and leaving the
+        // capture buffer installed would swallow that object into the
+        // array being abandoned.
+        var collected = self.takeBatch();
+        defer collected.deinit(self.alloc);
+
+        if (malformed) {
+            return self.writeError(null, protocol.Code.invalid_request, "batch is not a well-formed array of messages");
+        }
+        if (dispatched == 0) {
+            // `[]` — an array with no value in it. A single response
+            // object, because there is nothing to put in an array.
+            return self.writeError(null, protocol.Code.invalid_request, "batch must contain at least one message");
+        }
+        if (collected.items.len == 0) {
+            // Every element was a notification. Silence is the only
+            // correct answer; `[]` would be a response to nothing.
+            return;
+        }
+        try self.emitBatchArray(collected.items);
+    }
+
+    /// Detach the capture buffer and hand it to the caller. Setting the
+    /// field to `null` is what stops `emit` from writing back into a
+    /// buffer the caller now owns.
+    fn takeBatch(self: *Server) std.ArrayList(u8) {
+        const b = self.batch_buf.?;
+        self.batch_buf = null;
+        return b;
+    }
+
+    /// Write `[` + collected responses + `]`, bypassing the capture
+    /// buffer the responses were collected into.
+    fn emitBatchArray(self: *Server, items: []const u8) !void {
+        var line: std.ArrayList(u8) = .empty;
+        defer line.deinit(self.alloc);
+        try line.appendSlice(self.alloc, "[");
+        try line.appendSlice(self.alloc, items);
+        try line.append(self.alloc, ']');
+        try self.emitRaw(line.items);
+    }
+
+    /// Parse and dispatch exactly one message, writing whatever response
+    /// it produces straight to the output fd (or into the batch buffer).
+    fn handleMessage(self: *Server, line: []const u8) !void {
         var parsed = protocol.parseMessage(self.alloc, line) catch {
             return self.writeError(null, protocol.Code.internal_error, "out of memory while parsing the request");
         };
@@ -285,7 +383,23 @@ pub const Server = struct {
     /// One line, one write. Partial writes on a protocol stream would
     /// desynchronise the client's framing, so this loops until the whole
     /// line is out rather than assuming the fd took it all.
+    ///
+    /// Inside a batch, responses are *collected* rather than written:
+    /// JSON-RPC requires every response to one batch to arrive as a
+    /// single array, so an element answered straight to the fd would
+    /// already be out of order by the time the second one is produced.
     fn emit(self: *Server, bytes: []const u8) !void {
+        if (self.batch_buf) |*b| {
+            if (b.items.len != 0) try b.appendSlice(self.alloc, ",");
+            try b.appendSlice(self.alloc, bytes);
+            return;
+        }
+        try self.emitRaw(bytes);
+    }
+
+    /// Write bytes to the output fd with no batch capture, so the array
+    /// that closes a batch is not swallowed by the buffer it came from.
+    fn emitRaw(self: *Server, bytes: []const u8) !void {
         var sent: usize = 0;
         while (sent < bytes.len) {
             const n = platform_stdio.writeFd(self.out_fd, bytes[sent..]);
@@ -815,4 +929,183 @@ fn countLines(text: []const u8) usize {
         if (l.len > 0) n += 1;
     }
     return n;
+}
+
+// -----------------------------------------------------------------------------
+// JSON-RPC batching.
+//
+// MCP says "Implementations MUST support receiving batches; MAY support sending
+// them". Each test below pins one of the three edges of JSON-RPC 2.0 §5, which
+// are the parts a batch implementation gets wrong.
+// -----------------------------------------------------------------------------
+
+test "framing: a batch is one line, and its elements are found without parsing them" {
+    var it = try framing.BatchIterator.init(
+        \\[{"jsonrpc":"2.0","id":1,"method":"ping"},{"jsonrpc":"2.0","method":"notifications/initialized"},{"jsonrpc":"2.0","id":2,"method":"ping"}]
+    );
+    try testing.expectEqualStrings(
+        \\{"jsonrpc":"2.0","id":1,"method":"ping"}
+    , (try it.next()).?);
+    try testing.expectEqualStrings(
+        \\{"jsonrpc":"2.0","method":"notifications/initialized"}
+    , (try it.next()).?);
+    try testing.expectEqualStrings(
+        \\{"jsonrpc":"2.0","id":2,"method":"ping"}
+    , (try it.next()).?);
+    try testing.expectEqual(@as(?[]const u8, null), try it.next());
+}
+
+test "framing: a comma or bracket inside a string does not end an element" {
+    // The whole reason this is hand-written rather than a split on ',':
+    // a naive splitter cuts this batch into two malformed halves.
+    var it = try framing.BatchIterator.init(
+        \\[{"jsonrpc":"2.0","id":1,"params":{"episode":"a, b] c {d} e"}},{"jsonrpc":"2.0","id":2,"method":"ping"}]
+    );
+    try testing.expect(std.mem.indexOf(u8, (try it.next()).?, "a, b] c {d} e") != null);
+    try testing.expectEqualStrings(
+        \\{"jsonrpc":"2.0","id":2,"method":"ping"}
+    , (try it.next()).?);
+}
+
+test "framing: an escaped quote does not end the string it is in" {
+    // Without the escape flag the `\"` closes the string on the escaped
+    // quote, and every `,` and `]` after it is read as structure.
+    var it = try framing.BatchIterator.init(
+        \\[{"jsonrpc":"2.0","id":1,"params":{"episode":"he said \"],{[\" loudly"}},{"jsonrpc":"2.0","id":2,"method":"ping"}]
+    );
+    try testing.expect(std.mem.indexOf(u8, (try it.next()).?, "he said") != null);
+    try testing.expectEqualStrings(
+        \\{"jsonrpc":"2.0","id":2,"method":"ping"}
+    , (try it.next()).?);
+}
+
+test "framing: nested arrays and objects are not element boundaries" {
+    var it = try framing.BatchIterator.init(
+        \\[{"jsonrpc":"2.0","id":1,"params":{"goal_ids":[1,2,3],"nested":{"a":[4,5]}}},{"jsonrpc":"2.0","id":2,"method":"ping"}]
+    );
+    try testing.expect(std.mem.indexOf(u8, (try it.next()).?, "goal_ids") != null);
+    try testing.expectEqualStrings(
+        \\{"jsonrpc":"2.0","id":2,"method":"ping"}
+    , (try it.next()).?);
+}
+
+test "framing: a truncated batch is malformed, not a silently short answer" {
+    try testing.expectError(error.MalformedBatch, framing.BatchIterator.init("{\"jsonrpc\":\"2.0\"}"));
+    try testing.expectError(error.MalformedBatch, framing.BatchIterator.init(""));
+    // Missing the closing bracket: reporting the partial tail as a whole
+    // message would answer a request the client never finished sending.
+    var it = try framing.BatchIterator.init(
+        \\[{"jsonrpc":"2.0","id":1,"method":"ping"}
+    );
+    try testing.expectError(error.MalformedBatch, it.next());
+}
+
+test "framing: isBatch reports shape, not validity" {
+    try testing.expect(framing.BatchIterator.isBatch("  [1]  "));
+    try testing.expect(!framing.BatchIterator.isBatch("{\"jsonrpc\":\"2.0\"}"));
+    try testing.expect(!framing.BatchIterator.isBatch(""));
+    try testing.expect(!framing.BatchIterator.isBatch("   "));
+}
+
+test "server: a batch answers with ONE array holding every response" {
+    var h = try Harness.init(testing.allocator, false);
+    defer h.deinit(testing.allocator);
+
+    const got = try h.sendMessage(testing.allocator,
+        \\[{"jsonrpc":"2.0","id":1,"method":"ping"},{"jsonrpc":"2.0","id":2,"method":"ping"},{"jsonrpc":"2.0","id":3,"method":"tools/list"}]
+    );
+    defer testing.allocator.free(got);
+
+    // One line, not three. A client reading responses by id still copes,
+    // but one that reads a single response per write does not.
+    try testing.expectEqual(@as(usize, 1), countLines(got));
+
+    var doc = try json.parse(testing.allocator, std.mem.trim(u8, got, "\r\n"));
+    defer doc.deinit();
+    const arr = doc.root.asArray().?;
+    try testing.expectEqual(@as(usize, 3), arr.len);
+    for (arr) |v| {
+        const o = v.asObject().?;
+        try testing.expect(json.get(.{ .object = o }, "result") != null);
+    }
+}
+
+test "server: a batch of only notifications produces no output at all" {
+    var h = try Harness.init(testing.allocator, false);
+    defer h.deinit(testing.allocator);
+
+    const got = try h.sendMessage(testing.allocator,
+        \\[{"jsonrpc":"2.0","method":"notifications/initialized"},{"jsonrpc":"2.0","method":"notifications/cancelled"}]
+    );
+    defer testing.allocator.free(got);
+
+    // `[]` would be a response to nothing, and a client matching
+    // responses by id would wait on ids that were never sent.
+    try testing.expectEqual(@as(usize, 0), got.len);
+}
+
+test "server: an empty batch is one error object, not an empty array" {
+    var h = try Harness.init(testing.allocator, false);
+    defer h.deinit(testing.allocator);
+
+    const got = try h.sendMessage(testing.allocator, "[]");
+    defer testing.allocator.free(got);
+
+    try testing.expectEqual(@as(usize, 1), countLines(got));
+    const trimmed = std.mem.trim(u8, got, "\r\n");
+    try testing.expectEqualStrings("{", trimmed[0..1]);
+    try testing.expect(std.mem.indexOf(u8, trimmed, "-32600") != null);
+}
+
+test "server: a bad element is answered in place and the rest of the batch still runs" {
+    var h = try Harness.init(testing.allocator, false);
+    defer h.deinit(testing.allocator);
+
+    const got = try h.sendMessage(testing.allocator,
+        \\[{"jsonrpc":"2.0","id":1,"method":"ping"},{"jsonrpc":"2.0","id":2},{"jsonrpc":"2.0","id":3,"method":"ping"}]
+    );
+    defer testing.allocator.free(got);
+
+    var doc = try json.parse(testing.allocator, std.mem.trim(u8, got, "\r\n"));
+    defer doc.deinit();
+    const arr = doc.root.asArray().?;
+    // Three in, three out. Aborting at the bad element would leave the
+    // client waiting on ids 1 and 3 forever.
+    try testing.expectEqual(@as(usize, 3), arr.len);
+    try testing.expect(json.get(.{ .object = arr[0].asObject().? }, "result") != null);
+    try testing.expect(json.get(.{ .object = arr[1].asObject().? }, "error") != null);
+    try testing.expect(json.get(.{ .object = arr[2].asObject().? }, "result") != null);
+}
+
+test "server: a tool call inside a batch really runs" {
+    var h = try Harness.init(testing.allocator, false);
+    defer h.deinit(testing.allocator);
+
+    const got = try h.sendMessage(testing.allocator,
+        \\[{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"memory_stats","arguments":{}}},{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"memory_stats","arguments":{}}}]
+    );
+    defer testing.allocator.free(got);
+
+    var doc = try json.parse(testing.allocator, std.mem.trim(u8, got, "\r\n"));
+    defer doc.deinit();
+    const arr = doc.root.asArray().?;
+    try testing.expectEqual(@as(usize, 2), arr.len);
+    for (arr) |v| try testing.expect(json.get(.{ .object = v.asObject().? }, "result") != null);
+}
+
+test "server: a single message is still not treated as a batch" {
+    var h = try Harness.init(testing.allocator, false);
+    defer h.deinit(testing.allocator);
+
+    const got = try h.sendMessage(testing.allocator,
+        \\{"jsonrpc":"2.0","id":1,"method":"ping"}
+    );
+    defer testing.allocator.free(got);
+
+    // The regression this guards: routing every line through the batch
+    // path would wrap a lone response in an array, and a client expecting
+    // one response object would reject it.
+    try testing.expectEqual(@as(usize, 1), countLines(got));
+    const trimmed = std.mem.trim(u8, got, "\r\n");
+    try testing.expectEqualStrings("{", trimmed[0..1]);
 }
