@@ -207,7 +207,7 @@ Two details matter if you are reading the numbers:
 model is one variant and one `switch` arm. `Store`'s `BuildOptions.embedder_kind`
 defaults to `.lexical_hash`; the historical `StubEmbedder` (`.stub_xxhash`) is
 still selectable, and `.onnx_external` is reserved and unimplemented (it
-panics).
+returns `error.UnsupportedEmbedder`).
 
 > **Caveat worth knowing before you switch embedders on an existing `data/`.**
 > Only ids and HNSW graph topology are persisted — the vectors themselves are
@@ -625,12 +625,21 @@ These are enforced conventions, not style preferences. Do not regress them:
 
 Known and measured, not discovered after the fact:
 
-- **Lexical, not semantic.** Retrieval works — `mem3 query` returns ranked,
-  reproducible results and typos/morphology still match — but the embedder is
-  bag-of-features over surface forms. It has no world knowledge, so synonymy
-  across unrelated vocabulary ("the persistence layer" ↔ "how mem3 stores
-  records on disk") will not match. `.onnx_external` is reserved and
-  unimplemented.
+- **Lexical by default, and semantic is opt-in.** Retrieval works — `mem3 query`
+  returns ranked, reproducible results and typos/morphology still match — but the
+  built-in embedder is bag-of-features over surface forms. It has no world
+  knowledge, so synonymy across unrelated vocabulary ("the persistence layer" ↔
+  "how mem3 stores records on disk") will not match. `--embedder-cmd` delegates
+  to a real model instead; see [CLI reference](#cli-reference). Two honest
+  caveats: every recall figure in this document was measured with the built-in
+  embedder or synthetic geometry, so the numbers do not describe the external
+  path; and bridging to a local model costs one adapter, because Ollama and
+  llama.cpp both speak HTTP and this protocol speaks lines.
+- **No hybrid retrieval.** mem3 searches vectors only. BM25 + vector fused with
+  Reciprocal Rank Fusion is what the competition ships (`local-memory-mcp` v2,
+  `@studiomeyer/local-memory-mcp`), and a keyword miss on an exact identifier —
+  an error code, a file name, a version — is the failure a lexical fallback is
+  for. This is a real gap, not a design position.
 - **Switching embedders invalidates a persisted index.** Vectors are not
   persisted, only ids and graph topology — see [Retrieval](#retrieval).
 - **`--foresight` is accepted and discarded.** The cell is written without it;
@@ -803,6 +812,10 @@ locally generated case set, a deterministic surface reader, no LLM judge, no
 network. The output says so in a `disclaimer` field every run. Against the
 constitutional ≥80% target it reports `met_target: false`.
 
+Every number in that table is a measurement of the **built-in** embedder. Since
+`--embedder-cmd` landed, a real model can replace it, and this benchmark has not
+been re-run that way — so the table bounds the default path, not the project.
+
 | Configuration | Cells | combined accuracy (answerable) | retrieval hit rate |
 |---|---|---|---|
 | core, no distractor padding | 144 | **0.6458** | 0.8542 |
@@ -816,8 +829,12 @@ neighbour over every indexed vector. It does not move when the index changes, so
 the failure is upstream of HNSW — **`lexical_hash` never placed the question and
 its answer in the same neighbourhood.** The retrieval layer is not the
 bottleneck here; the embedder is. Swapping the embedder is the only change that
-moves this number, and no semantic embedder ships yet (`.onnx_external` is
-reserved and panics).
+moves this number. A real model is now reachable through `--embedder-cmd`, but
+this benchmark has not been re-run that way, so nobody here knows what it would
+report — including whether a stronger embedder fixes the padded configurations,
+which fail at 0.0000 and look like a different failure than the 0.6458 core
+score does. (The `.onnx_external` embedder kind remains reserved and returns
+`error.UnsupportedEmbedder`; `--embedder-cmd` is the path that works.)
 
 ## License
 

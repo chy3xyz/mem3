@@ -146,11 +146,14 @@ nearest neighbour over every indexed vector. It does not move when the index
 changes, so the failure is upstream of HNSW. Had the hit rate been high with a
 low `retrieval_hit_rate`, the index would be at fault; it is not.
 
-The only change that moves this number is a semantic embedder. `.onnx_external`
-is reserved and unimplemented (it panics), and shipping one is a dependency
-question that needs its own constitutional amendment — Principle IV forbids
-linking a runtime, but an externally-executed model is a different shape of
-claim and has not been adjudicated.
+The only change that moves this number is a semantic embedder. That question
+has since been answered a different way: `--embedder-cmd` delegates to an
+externally-executed model over a line protocol, which is a different claim from
+linking a runtime and was shipped without a new amendment. `.onnx_external` is
+still reserved and unimplemented (it returns `error.UnsupportedEmbedder`).
+This benchmark has not been re-run through the external path, so what a real
+model would report here — including for the two configurations that score
+0.0000 — remains unmeasured.
 
 ---
 
