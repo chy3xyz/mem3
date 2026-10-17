@@ -244,24 +244,63 @@ pub const Server = struct {
 
     fn handleRequest(self: *Server, env: *protocol.Envelope) !void {
         const id = env.id_raw.?;
+        const era = protocol.eraOf(env.params, env.method);
+
+        // Modern-era admission. Both `_meta` fields the spec marks
+        // required are checked here rather than at each method, because
+        // "every request carries them" is a property of the era and not
+        // of any one method.
+        if (era.isModern()) {
+            const requested = protocol.requestedVersion(env.params).?;
+            if (!protocol.supportsVersion(requested)) {
+                return self.writeUnsupportedVersion(id, requested);
+            }
+            if (protocol.metaGet(env.params, protocol.META_CLIENT_CAPABILITIES) == null) {
+                return self.writeError(
+                    id,
+                    protocol.Code.invalid_params,
+                    "a 2026-07-28 request requires params._meta.io.modelcontextprotocol/clientCapabilities",
+                );
+            }
+        }
+
+        if (std.mem.eql(u8, env.method, "server/discover")) {
+            // `server/discover` with no per-request `_meta` is answered
+            // `-32602` on purpose. It is the stdio fallback probe: a
+            // dual-era client sends this first, and treats any error
+            // that is not a recognised modern error as "legacy server,
+            // use `initialize`". `-32602` is exactly that, so a legacy
+            // client degrades instead of failing.
+            if (!era.isModern()) {
+                return self.writeError(
+                    id,
+                    protocol.Code.invalid_params,
+                    "server/discover requires params._meta.io.modelcontextprotocol/protocolVersion",
+                );
+            }
+            return self.writeDiscover(id, era);
+        }
 
         if (std.mem.eql(u8, env.method, "initialize")) {
             return self.writeInitialize(id, env);
         }
         if (std.mem.eql(u8, env.method, "ping")) {
+            // Removed in 2026-07-28, but a legacy client's liveness
+            // probe still sends it, and answering costs one empty
+            // object.
             var result: std.ArrayList(u8) = .empty;
             defer result.deinit(self.alloc);
             try result.appendSlice(self.alloc, "{}");
-            return self.writeResult(id, result.items);
+            return self.writeResultForEra(id, result.items, era);
         }
         if (std.mem.eql(u8, env.method, "tools/list")) {
             var result: std.ArrayList(u8) = .empty;
             defer result.deinit(self.alloc);
             try tools.writeToolsList(self.alloc, &result);
-            return self.writeResult(id, result.items);
+            return self.writeResultForEra(id, result.items, era);
         }
         if (std.mem.eql(u8, env.method, "tools/call")) {
-            return self.handleToolsCall(id, env);
+            return self.handleToolsCall(id, env, era);
         }
 
         return self.writeError(id, protocol.Code.method_not_found, "unknown method");
@@ -293,7 +332,7 @@ pub const Server = struct {
         try self.writeResult(id, result.items);
     }
 
-    fn handleToolsCall(self: *Server, id: []const u8, env: *protocol.Envelope) !void {
+    fn handleToolsCall(self: *Server, id: []const u8, env: *protocol.Envelope, era: protocol.Era) !void {
         const params = env.params orelse {
             return self.writeError(id, protocol.Code.invalid_params, "tools/call requires params");
         };
@@ -344,7 +383,7 @@ pub const Server = struct {
                 var failed: std.ArrayList(u8) = .empty;
                 defer failed.deinit(self.alloc);
                 try writeToolContent(&failed, self.alloc, reason.items, true);
-                return self.writeResult(id, failed.items);
+                return self.writeResultForEra(id, failed.items, era);
             },
         };
         defer result.deinit();
@@ -352,7 +391,7 @@ pub const Server = struct {
         var body: std.ArrayList(u8) = .empty;
         defer body.deinit(self.alloc);
         try writeToolContent(&body, self.alloc, result.text, result.is_error);
-        try self.writeResult(id, body.items);
+        try self.writeResultForEra(id, body.items, era);
     }
 
     /// `tools/call` result: a single text block holding the tool's JSON
@@ -370,6 +409,95 @@ pub const Server = struct {
         var line: std.ArrayList(u8) = .empty;
         defer line.deinit(self.alloc);
         try protocol.writeResult(&line, self.alloc, id, result_json);
+        try self.emit(line.items);
+    }
+
+    /// The same result, wrapped for whichever era asked.
+    ///
+    /// The legacy shape is passed through untouched. The modern shape
+    /// gains `resultType` and a `serverInfo` echo, both of which the
+    /// 2026-07-28 revision requires and no earlier one knows about —
+    /// adding them unconditionally would change the bytes a legacy
+    /// client validates against, for no benefit.
+    fn writeResultForEra(self: *Server, id: []const u8, result_json: []const u8, era: protocol.Era) !void {
+        if (!era.isModern()) return self.writeResult(id, result_json);
+
+        // Two buffers, not one: `writeResult` *appends* the envelope
+        // around the result it is handed, so passing it the list that is
+        // mid-construction would splice the document into itself.
+        var modern: std.ArrayList(u8) = .empty;
+        defer modern.deinit(self.alloc);
+        protocol.wrapModernResult(&modern, self.alloc, result_json) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.NotAResultObject => {
+                // A builder emitted something that is not a bare object.
+                // Refusing is better than shipping a result whose fields
+                // the client cannot read and whose emptiness it cannot
+                // explain.
+                return self.writeError(id, protocol.Code.internal_error, "tool produced a result that is not a JSON object");
+            },
+        };
+
+        var line: std.ArrayList(u8) = .empty;
+        defer line.deinit(self.alloc);
+        try protocol.writeResult(&line, self.alloc, id, modern.items);
+        try self.emit(line.items);
+    }
+
+    /// `server/discover` — the one method the spec says a server MUST
+    /// implement. It is how a modern client learns what this server
+    /// speaks without guessing, and how a dual-era client decides
+    /// whether to stay modern or fall back to `initialize`.
+    ///
+    /// No tools are listed here: that is `tools/list`'s job, and the
+    /// discover probe is meant to be cheap enough to send before any
+    /// real work.
+    fn writeDiscover(self: *Server, id: []const u8, era: protocol.Era) !void {
+        var result: std.ArrayList(u8) = .empty;
+        defer result.deinit(self.alloc);
+        try result.appendSlice(self.alloc, "{\"supportedVersions\":[");
+        for (protocol.SUPPORTED_VERSIONS, 0..) |v, i| {
+            if (i != 0) try result.append(self.alloc, ',');
+            try out.string(&result, self.alloc, v);
+        }
+        // Only `tools` is declared. Advertising `resources` or `prompts`
+        // would make a client probe methods this server answers with
+        // -32601, and the spec prefers an absent capability to a
+        // declared-and-unimplemented one.
+        try result.appendSlice(self.alloc, "],\"capabilities\":{\"tools\":{}},\"instructions\":");
+        try out.string(
+            &result,
+            self.alloc,
+            "TriSource-EverOS memory. memory_add needs a spirit dimension: pass source and at least one of facts or goal_ids.",
+        );
+        // Cacheable: this answer cannot change while the process lives,
+        // which is exactly what a shared cache is safe for.
+        try result.appendSlice(self.alloc, ",\"ttlMs\":60000,\"cacheScope\":\"public\"}");
+
+        return self.writeResultForEra(id, result.items, era);
+    }
+
+    /// `-32022 UnsupportedProtocolVersion`, with the versions this
+    /// server does speak.
+    ///
+    /// The `supported` list is the whole point of the error: the client
+    /// is expected to pick one and retry, and a client that has not
+    /// migrated has no other way to learn what would work.
+    fn writeUnsupportedVersion(self: *Server, id: []const u8, requested: []const u8) !void {
+        var line: std.ArrayList(u8) = .empty;
+        defer line.deinit(self.alloc);
+        try line.appendSlice(self.alloc, "{\"jsonrpc\":\"2.0\",\"id\":");
+        try line.appendSlice(self.alloc, id);
+        try line.appendSlice(self.alloc, ",\"error\":{\"code\":");
+        try out.int(&line, self.alloc, protocol.Code.unsupported_protocol_version);
+        try line.appendSlice(self.alloc, ",\"message\":\"Unsupported protocol version\",\"data\":{\"supported\":[");
+        for (protocol.SUPPORTED_VERSIONS, 0..) |v, i| {
+            if (i != 0) try line.append(self.alloc, ',');
+            try out.string(&line, self.alloc, v);
+        }
+        try line.appendSlice(self.alloc, "],\"requested\":");
+        try out.string(&line, self.alloc, requested);
+        try line.appendSlice(self.alloc, "}}}");
         try self.emit(line.items);
     }
 
@@ -1108,4 +1236,335 @@ test "server: a single message is still not treated as a batch" {
     try testing.expectEqual(@as(usize, 1), countLines(got));
     const trimmed = std.mem.trim(u8, got, "\r\n");
     try testing.expectEqualStrings("{", trimmed[0..1]);
+}
+
+// -----------------------------------------------------------------------------
+// MCP revision 2026-07-28 — the stateless core.
+//
+// The revision removes the `initialize` handshake, moves the protocol
+// version into every request's `_meta`, requires a `resultType` on every
+// result, and makes `server/discover` mandatory. mem3 is dual-era: these
+// tests pin the modern path *and* that it did not disturb the legacy one.
+//
+// Requests are assembled with `appendSlice` rather than written as format
+// strings. Zig treats `{` and `}` inside a format string as interpolation
+// delimiters, so a JSON body full of them has to be doubled — and getting
+// that wrong once sent a request with its braces eaten, which the server
+// correctly answered with -32700 while the test blamed the server.
+// -----------------------------------------------------------------------------
+
+/// A modern-era request line. `params_tail` goes inside `params`, before
+/// the `_meta` block; pass `""` for a request with no other parameters.
+fn modernRequest(
+    alloc: std.mem.Allocator,
+    id: []const u8,
+    method: []const u8,
+    params_tail: []const u8,
+    version: []const u8,
+) ![]u8 {
+    var line: std.ArrayList(u8) = .empty;
+    errdefer line.deinit(alloc);
+    try line.appendSlice(alloc, "{\"jsonrpc\":\"2.0\",\"id\":");
+    try out.string(&line, alloc, id);
+    try line.appendSlice(alloc, ",\"method\":");
+    try out.string(&line, alloc, method);
+    try line.appendSlice(alloc, ",\"params\":{");
+    try line.appendSlice(alloc, params_tail);
+    try line.appendSlice(alloc, "\"_meta\":{");
+    try line.appendSlice(alloc, "\"io.modelcontextprotocol/protocolVersion\":");
+    try out.string(&line, alloc, version);
+    try line.appendSlice(alloc, ",\"io.modelcontextprotocol/clientCapabilities\":{}");
+    // Four objects are open here — the JSON-RPC envelope, `params`,
+    // `_meta` and `clientInfo` — and all four are closed.
+    try line.appendSlice(alloc, ",\"io.modelcontextprotocol/clientInfo\":{\"name\":\"probe\",\"version\":\"1\"}}}}");
+    return line.toOwnedSlice(alloc);
+}
+
+test "server: a modern request is built with braces that survive" {
+    // The regression this guards is a construction bug, not a protocol
+    // one: a request whose braces were eaten looks exactly like a client
+    // sending garbage, and the -32700 it draws is correct behaviour
+    // being blamed for the mistake.
+    const alloc = testing.allocator;
+    const line = try modernRequest(alloc, "1", "server/discover", "", protocol.MODERN_VERSION);
+    defer alloc.free(line);
+
+    var doc = try json.parse(alloc, line);
+    defer doc.deinit();
+    const root = doc.root.asObject().?;
+    try testing.expectEqualStrings("2.0", (json.get(.{ .object = root }, "jsonrpc") orelse unreachable).asString().?);
+    try testing.expectEqualStrings("server/discover", (json.get(.{ .object = root }, "method") orelse unreachable).asString().?);
+    const params = json.get(.{ .object = root }, "params").?;
+    try testing.expectEqualStrings(
+        protocol.MODERN_VERSION,
+        (protocol.metaGet(params, protocol.META_PROTOCOL_VERSION) orelse unreachable).asString().?,
+    );
+}
+
+test "server: server/discover reports versions, capabilities and identity" {
+    var h = try Harness.init(testing.allocator, false);
+    defer h.deinit(testing.allocator);
+
+    const line = try modernRequest(testing.allocator, "d1", "server/discover", "", protocol.MODERN_VERSION);
+    defer testing.allocator.free(line);
+    const got = try h.sendMessage(testing.allocator, line);
+    defer testing.allocator.free(got);
+
+    var doc = try json.parse(testing.allocator, std.mem.trim(u8, got, "\r\n"));
+    defer doc.deinit();
+    const root = doc.root.asObject().?;
+    const result = json.get(.{ .object = root }, "result") orelse {
+        std.debug.print("no result: {s}\n", .{got});
+        return error.MissingResult;
+    };
+
+    try testing.expectEqualStrings("complete", (json.get(result, "resultType") orelse unreachable).asString().?);
+
+    // The id must come back exactly as sent. A *string* id here, not a
+    // number, is why ids are echoed as source text rather than parsed and
+    // reprinted.
+    try testing.expectEqualStrings("d1", (json.get(.{ .object = root }, "id") orelse unreachable).asString().?);
+
+    const versions = (json.get(result, "supportedVersions") orelse unreachable).asArray().?;
+    try testing.expect(versions.len >= 2);
+    try testing.expectEqualStrings(protocol.MODERN_VERSION, versions[0].asString().?);
+    for (versions) |v| try testing.expect(protocol.supportsVersion(v.asString().?));
+    // It must also list what the handshake can still negotiate. A modern
+    // client reading this and picking a legacy version must not then be
+    // told to downgrade to something it cannot use.
+    for (protocol.LEGACY_VERSIONS) |lv| {
+        var found = false;
+        for (versions) |v| found = found or std.mem.eql(u8, v.asString().?, lv);
+        try testing.expect(found);
+    }
+
+    // Only `tools` is implemented, so only `tools` may be advertised. The
+    // spec prefers an absent capability to a declared-and-unimplemented one.
+    const caps = (json.get(result, "capabilities") orelse unreachable).asObject().?;
+    try testing.expect(json.get(.{ .object = caps }, "tools") != null);
+    try testing.expect(json.get(.{ .object = caps }, "resources") == null);
+    try testing.expect(json.get(.{ .object = caps }, "prompts") == null);
+
+    const meta = (json.get(result, "_meta") orelse unreachable).asObject().?;
+    const info = json.get(.{ .object = meta }, protocol.META_SERVER_INFO) orelse unreachable;
+    try testing.expectEqualStrings(protocol.SERVER_NAME, (json.get(info, "name") orelse unreachable).asString().?);
+}
+
+test "server: server/discover without per-request _meta is -32602, the fallback signal" {
+    var h = try Harness.init(testing.allocator, false);
+    defer h.deinit(testing.allocator);
+
+    // A legacy client probes with `server/discover` first and treats any
+    // error that is not a recognised modern error as "legacy server, send
+    // `initialize` instead". So this MUST be -32602 and MUST NOT be
+    // -32022 — -32022 means "I am modern, retry with a version I speak".
+    const got = try h.sendMessage(testing.allocator,
+        \\{"jsonrpc":"2.0","id":1,"method":"server/discover","params":{}}
+    );
+    defer testing.allocator.free(got);
+
+    try testing.expect(std.mem.indexOf(u8, got, "-32602") != null);
+    try testing.expect(std.mem.indexOf(u8, got, "-32022") == null);
+}
+
+test "server: an unsupported version is -32022 listing what we do speak" {
+    var h = try Harness.init(testing.allocator, false);
+    defer h.deinit(testing.allocator);
+
+    const line = try modernRequest(testing.allocator, "1", "tools/list", "", "1999-01-01");
+    defer testing.allocator.free(line);
+    const got = try h.sendMessage(testing.allocator, line);
+    defer testing.allocator.free(got);
+
+    try testing.expect(std.mem.indexOf(u8, got, "-32022") != null);
+    // The client is expected to pick one of these and retry. An error that
+    // does not say what would work leaves it with nothing but disconnect.
+    try testing.expect(std.mem.indexOf(u8, got, "1999-01-01") != null);
+    try testing.expect(std.mem.indexOf(u8, got, protocol.MODERN_VERSION) != null);
+    try testing.expect(std.mem.indexOf(u8, got, "\"supported\"") != null);
+}
+
+test "server: a modern request missing a required _meta field is -32602" {
+    var h = try Harness.init(testing.allocator, false);
+    defer h.deinit(testing.allocator);
+
+    // protocolVersion present, clientCapabilities absent.
+    const got = try h.sendMessage(testing.allocator,
+        \\{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28"}}}
+    );
+    defer testing.allocator.free(got);
+
+    try testing.expect(std.mem.indexOf(u8, got, "-32602") != null);
+    try testing.expect(std.mem.indexOf(u8, got, "clientCapabilities") != null);
+}
+
+test "server: a modern result carries resultType and a serverInfo echo" {
+    var h = try Harness.init(testing.allocator, false);
+    defer h.deinit(testing.allocator);
+
+    const line = try modernRequest(testing.allocator, "1", "tools/list", "", protocol.MODERN_VERSION);
+    defer testing.allocator.free(line);
+    const got = try h.sendMessage(testing.allocator, line);
+    defer testing.allocator.free(got);
+
+    var doc = try json.parse(testing.allocator, std.mem.trim(u8, got, "\r\n"));
+    defer doc.deinit();
+    const root = doc.root.asObject().?;
+    const result = json.get(.{ .object = root }, "result").?;
+    try testing.expectEqualStrings("complete", (json.get(result, "resultType") orelse unreachable).asString().?);
+    try testing.expect((json.get(result, "tools") orelse unreachable).asArray().?.len > 0);
+    const meta = (json.get(result, "_meta") orelse unreachable).asObject().?;
+    try testing.expect(json.get(.{ .object = meta }, protocol.META_SERVER_INFO) != null);
+}
+
+test "server: a modern tool call result is wrapped, and its content block survives" {
+    var h = try Harness.init(testing.allocator, false);
+    defer h.deinit(testing.allocator);
+
+    const line = try modernRequest(
+        testing.allocator,
+        "1",
+        "tools/call",
+        "\"name\":\"memory_stats\",\"arguments\":{},",
+        protocol.MODERN_VERSION,
+    );
+    defer testing.allocator.free(line);
+    const got = try h.sendMessage(testing.allocator, line);
+    defer testing.allocator.free(got);
+
+    var doc = try json.parse(testing.allocator, std.mem.trim(u8, got, "\r\n"));
+    defer doc.deinit();
+    const root = doc.root.asObject().?;
+    const result = json.get(.{ .object = root }, "result").?;
+    try testing.expectEqualStrings("complete", (json.get(result, "resultType") orelse unreachable).asString().?);
+    // The content block must come through the envelope re-open intact.
+    // This is the splice in `wrapModernResult`, and it is exactly where a
+    // mistake would silently eat the tool's actual payload.
+    try testing.expect((json.get(result, "content") orelse unreachable).asArray().?.len == 1);
+}
+
+test "server: a legacy result carries neither resultType nor a serverInfo echo" {
+    var h = try Harness.init(testing.allocator, false);
+    defer h.deinit(testing.allocator);
+
+    const got = try h.sendMessage(testing.allocator,
+        \\{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}
+    );
+    defer testing.allocator.free(got);
+
+    // An unmigrated client validates against the older schema. Adding
+    // fields purely for the modern era's benefit would change bytes it
+    // never asked for.
+    try testing.expect(std.mem.indexOf(u8, got, "resultType") == null);
+    try testing.expect(std.mem.indexOf(u8, got, protocol.META_SERVER_INFO) == null);
+}
+
+test "server: initialize still works and still answers with a legacy version" {
+    var h = try Harness.init(testing.allocator, false);
+    defer h.deinit(testing.allocator);
+
+    const got = try h.sendMessage(testing.allocator,
+        \\{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"probe","version":"1"}}}
+    );
+    defer testing.allocator.free(got);
+
+    try testing.expect(std.mem.indexOf(u8, got, "2025-06-18") != null);
+    try testing.expect(std.mem.indexOf(u8, got, "resultType") == null);
+}
+
+test "server: initialize carrying modern _meta is still served as legacy" {
+    var h = try Harness.init(testing.allocator, false);
+    defer h.deinit(testing.allocator);
+
+    // `initialize` does not exist in the stateless core, so a request for
+    // it is a legacy request even when it also carries modern metadata.
+    // Otherwise the handshake answer would be wrapped in a resultType that
+    // no handshake-era client expects.
+    const got = try h.sendMessage(testing.allocator,
+        \\{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"probe","version":"1"},"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}
+    );
+    defer testing.allocator.free(got);
+
+    try testing.expect(std.mem.indexOf(u8, got, "2025-11-25") != null);
+    try testing.expect(std.mem.indexOf(u8, got, "resultType") == null);
+}
+
+test "server: one batch may mix eras, and each response is shaped for its own" {
+    var h = try Harness.init(testing.allocator, false);
+    defer h.deinit(testing.allocator);
+
+    const modern = try modernRequest(testing.allocator, "2", "tools/list", "", protocol.MODERN_VERSION);
+    defer testing.allocator.free(modern);
+    const probe = try modernRequest(testing.allocator, "3", "server/discover", "", protocol.MODERN_VERSION);
+    defer testing.allocator.free(probe);
+
+    // A legacy request with no `_meta` at all, spliced in verbatim.
+    var batch: std.ArrayList(u8) = .empty;
+    defer batch.deinit(testing.allocator);
+    try batch.append(testing.allocator, '[');
+    // Appended, not written as a literal: an empty `"params":{}` inside a
+    // format string is read as an interpolation delimiter pair, and the
+    // element boundary after it silently moves.
+    try batch.appendSlice(testing.allocator,
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\",\"params\":{}}",
+    );
+    try batch.append(testing.allocator, ',');
+    try batch.appendSlice(testing.allocator, modern);
+    try batch.append(testing.allocator, ',');
+    try batch.appendSlice(testing.allocator, probe);
+    try batch.append(testing.allocator, ']');
+
+    const got = try h.sendMessage(testing.allocator, batch.items);
+    defer testing.allocator.free(got);
+
+    var doc = try json.parse(testing.allocator, std.mem.trim(u8, got, "\r\n"));
+    defer doc.deinit();
+    const arr = doc.root.asArray().?;
+    try testing.expectEqual(@as(usize, 3), arr.len);
+
+    // Statelessness made observable: one process, one batch, three
+    // requests spanning two protocol eras, each answered on its own terms.
+    const r0 = json.get(.{ .object = arr[0].asObject().? }, "result") orelse unreachable;
+    try testing.expect(json.get(r0, "resultType") == null);
+
+    const r1 = json.get(.{ .object = arr[1].asObject().? }, "result") orelse unreachable;
+    try testing.expectEqualStrings("complete", (json.get(r1, "resultType") orelse unreachable).asString().?);
+
+    const r2 = json.get(.{ .object = arr[2].asObject().? }, "result") orelse unreachable;
+    try testing.expect((json.get(r2, "supportedVersions") orelse unreachable).asArray().?.len > 0);
+}
+
+test "server: every tool's result survives the modern envelope" {
+    // `wrapModernResult` re-opens the outermost braces of whatever a
+    // builder produced. A builder emitting anything but a bare object
+    // makes that splice produce a result the spec calls invalid, and only
+    // running every tool through it finds that.
+    var h = try Harness.init(testing.allocator, false);
+    defer h.deinit(testing.allocator);
+
+    inline for (.{ "memory_stats", "goal_list", "memory_forget" }) |name| {
+        const line = try modernRequest(
+            testing.allocator,
+            "1",
+            "tools/call",
+            "\"name\":\"" ++ name ++ "\",\"arguments\":{},",
+            protocol.MODERN_VERSION,
+        );
+        defer testing.allocator.free(line);
+
+        const got = try h.sendMessage(testing.allocator, line);
+        defer testing.allocator.free(got);
+
+        var doc = try json.parse(testing.allocator, std.mem.trim(u8, got, "\r\n"));
+        defer doc.deinit();
+        const root = doc.root.asObject().?;
+        const result = json.get(.{ .object = root }, "result") orelse {
+            // A tool refusing a call is `isError: true` *inside* a result,
+            // not a protocol error, so having neither here is the defect.
+            std.debug.print("tool {s}: neither result nor error: {s}\n", .{ name, got });
+            return error.MissingToolResult;
+        };
+        try testing.expectEqualStrings("complete", (json.get(result, "resultType") orelse unreachable).asString().?);
+        try testing.expect((json.get(result, "content") orelse unreachable).asArray().?.len == 1);
+    }
 }

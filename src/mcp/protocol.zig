@@ -27,17 +27,68 @@ const Allocator = std.mem.Allocator;
 const json = @import("json.zig");
 const out = @import("json_out.zig");
 
-/// The MCP revision this server implements. `initialize` echoes the
-/// client's version when it is one we support, and this one otherwise.
-pub const PROTOCOL_VERSION = "2025-06-18";
+/// The current MCP revision, and the one this server prefers.
+///
+/// Revision `2026-07-28` removed the `initialize` handshake: the
+/// protocol version travels per request in
+/// `params._meta["io.modelcontextprotocol/protocolVersion"]`, and every
+/// result carries a `resultType`. This server implements that era and
+/// still answers the legacy handshake, because most deployed clients
+/// have not migrated and a legacy client has no fall-forward path.
+pub const MODERN_VERSION = "2026-07-28";
 
-/// Revisions we can speak. Clients negotiate by sending theirs; we
-/// answer with theirs if listed here, else with `PROTOCOL_VERSION`.
+/// The legacy revision this server answers `initialize` with. Clients
+/// that only speak `2025-11-25` or earlier negotiate to one of the
+/// versions below and are then served under handshake semantics.
+pub const LEGACY_VERSION = "2025-06-18";
+
+/// Back-compat alias for the legacy revision. `initialize` negotiates
+/// within this list, so it is the legacy newest we can name.
+pub const PROTOCOL_VERSION = LEGACY_VERSION;
+
+/// Every revision this server can speak, newest first.
 pub const SUPPORTED_VERSIONS = [_][]const u8{
-    "2025-06-18",
+    MODERN_VERSION,
+    "2025-11-25",
+    LEGACY_VERSION,
     "2025-03-26",
     "2024-11-05",
 };
+
+/// Revisions that predate the stateless core, i.e. those for which
+/// `initialize` is a legitimate request rather than an unknown method.
+pub const LEGACY_VERSIONS = [_][]const u8{
+    "2025-11-25",
+    LEGACY_VERSION,
+    "2025-03-26",
+    "2024-11-05",
+};
+
+/// Which era an incoming message belongs to, decided per request.
+///
+/// The discriminator is the presence of
+/// `io.modelcontextprotocol/protocolVersion` in `params._meta`, not any
+/// connection state: the protocol is stateless and a client may
+/// interleave unrelated requests on one stdio process.
+pub const Era = enum {
+    /// Carries per-request `_meta`. Results need `resultType` and a
+    /// `serverInfo` echo.
+    modern,
+    /// No per-request `_meta`, or an `initialize` request, which selects
+    /// handshake semantics for the process by the spec's own rule.
+    legacy,
+
+    pub fn isModern(self: Era) bool {
+        return self == .modern;
+    }
+};
+
+/// The reserved `_meta` prefix. Key names under it are MCP's alone.
+pub const META_PREFIX = "io.modelcontextprotocol/";
+pub const META_PROTOCOL_VERSION = META_PREFIX ++ "protocolVersion";
+pub const META_CLIENT_INFO = META_PREFIX ++ "clientInfo";
+pub const META_CLIENT_CAPABILITIES = META_PREFIX ++ "clientCapabilities";
+pub const META_SERVER_INFO = META_PREFIX ++ "serverInfo";
 
 /// Standard JSON-RPC error codes.
 pub const Code = struct {
@@ -46,7 +97,68 @@ pub const Code = struct {
     pub const method_not_found: i32 = -32601;
     pub const invalid_params: i32 = -32602;
     pub const internal_error: i32 = -32603;
+
+    /// `UnsupportedProtocolVersion`. Reserved for MCP by the 2026-07-28
+    /// revision and defined by no earlier one, so emitting it is what
+    /// tells a dual-era client "retry modern, do not fall back to
+    /// `initialize`" instead of "you are talking to a legacy server".
+    pub const unsupported_protocol_version: i32 = -32022;
 };
+
+/// `params._meta` as an object, or `null`.
+///
+/// `params` itself must be an object for `_meta` to be reachable; a
+/// scalar or absent `params` reads as "no metadata", which is what an
+// old client sending `tools/list` with no `params` actually means.
+pub fn metaOf(params: ?json.Value) ?[]const json.Member {
+    const p = params orelse return null;
+    if (p.asObject() == null) return null;
+    const m = json.get(p, "_meta") orelse return null;
+    return m.asObject();
+}
+
+/// One `_meta` value by full key, e.g. `META_PROTOCOL_VERSION`.
+pub fn metaGet(params: ?json.Value, key: []const u8) ?json.Value {
+    const members = metaOf(params) orelse return null;
+    for (members) |m| {
+        if (std.mem.eql(u8, m.key, key)) return m.value;
+    }
+    return null;
+}
+
+/// The protocol version this request declares, or `null` when it
+/// declares none.
+pub fn requestedVersion(params: ?json.Value) ?[]const u8 {
+    const v = metaGet(params, META_PROTOCOL_VERSION) orelse return null;
+    return v.asString();
+}
+
+/// Classify a request by the per-request metadata it carries.
+pub fn eraOf(params: ?json.Value, method: []const u8) Era {
+    // `initialize` is a legacy method by definition. On a dual-era
+    // server it selects handshake semantics for the stdio process, so it
+    // must not be mistaken for a modern request just because a modern
+    // client also happens to send `_meta` alongside it.
+    if (std.mem.eql(u8, method, "initialize")) return .legacy;
+    if (requestedVersion(params) != null) return .modern;
+    return .legacy;
+}
+
+/// Whether a version string is one this server implements.
+pub fn supportsVersion(v: []const u8) bool {
+    for (SUPPORTED_VERSIONS) |s| {
+        if (std.mem.eql(u8, s, v)) return true;
+    }
+    return false;
+}
+
+/// Whether a version predates the stateless core.
+pub fn isLegacyVersion(v: []const u8) bool {
+    for (LEGACY_VERSIONS) |s| {
+        if (std.mem.eql(u8, s, v)) return true;
+    }
+    return false;
+}
 
 /// A validated request or notification. `deinit` releases the parsed
 /// document; everything else in it borrows from the caller's `line`.
@@ -216,15 +328,64 @@ pub fn writeError(
     try out_list.appendSlice(gpa, "}}");
 }
 
-/// Negotiate a protocol version: the client's if we speak it, else
-/// ours.
+/// Negotiate a protocol version for `initialize`: the client's if we
+/// speak it, else ours.
+///
+/// Iterates `LEGACY_VERSIONS`, not `SUPPORTED_VERSIONS`. A client that
+/// asked for `2026-07-28` and then sent `initialize` is asking for the
+/// era in which that method does not exist; answering it with the
+/// modern revision would hand back a version whose own rules this
+/// response violates — there is no handshake to negotiate in it.
 pub fn negotiateVersion(requested: ?[]const u8) []const u8 {
-    const want = requested orelse return PROTOCOL_VERSION;
-    for (SUPPORTED_VERSIONS) |v| {
+    const want = requested orelse return LEGACY_VERSION;
+    for (LEGACY_VERSIONS) |v| {
         if (std.mem.eql(u8, v, want)) return want;
     }
-    return PROTOCOL_VERSION;
+    return LEGACY_VERSION;
 }
+
+/// Wrap a built legacy-shaped result object into a 2026-07-28 result.
+///
+/// The revision requires `resultType` on every result and asks servers
+/// to identify themselves in `result._meta`, neither of which a legacy
+/// result has room for. Rather than duplicate every builder with a
+/// second variant that can drift out of step, the fields between the
+/// outermost braces are re-opened under the modern envelope.
+///
+/// This is why every result builder in this module must emit a compact
+/// object — a leading `{`, a trailing `}`, no whitespace outside it.
+/// That is a checked precondition rather than an assumption: a builder
+/// that ever changes shape fails the test that walks every tool's
+/// result through here, instead of quietly producing a result the spec
+/// calls invalid.
+pub fn wrapModernResult(out_list: *std.ArrayList(u8), gpa: Allocator, result_json: []const u8) !void {
+    const inner = std.mem.trim(u8, result_json, " \t\r\n");
+    if (inner.len < 2 or inner[0] != '{' or inner[inner.len - 1] != '}') {
+        // Reaching here means a builder produced something that is not a
+        // bare object. Emitting it wrapped would be worse than refusing:
+        // the client would see a result with no usable fields and no
+        // indication why.
+        return error.NotAResultObject;
+    }
+    try out_list.appendSlice(gpa, "{\"resultType\":\"complete\",");
+    if (inner.len > 2) {
+        try out_list.appendSlice(gpa, inner[1 .. inner.len - 1]);
+        try out_list.append(gpa, ',');
+    }
+    try out_list.appendSlice(gpa, "\"_meta\":{");
+    try out.string(out_list, gpa, META_SERVER_INFO);
+    try out_list.appendSlice(gpa, ":{\"name\":");
+    try out.string(out_list, gpa, SERVER_NAME);
+    try out_list.appendSlice(gpa, ",\"version\":");
+    try out.string(out_list, gpa, SERVER_VERSION);
+    try out_list.appendSlice(gpa, "}}}");
+}
+
+/// Identity reported in `serverInfo` and in every modern result's
+/// `_meta`. Self-reported and unverified by design; the spec says so,
+/// and says clients must not use it for anything but display.
+pub const SERVER_NAME = "mem3";
+pub const SERVER_VERSION = "0.1.0-alpha";
 
 // =============================================================================
 // Tests
@@ -384,7 +545,27 @@ test "protocol: version negotiation answers with a version we speak" {
     // Unknown or absent: our own, never the client's.
     try testing.expectEqualStrings(PROTOCOL_VERSION, negotiateVersion("2099-01-01"));
     try testing.expectEqualStrings(PROTOCOL_VERSION, negotiateVersion(null));
-    for (SUPPORTED_VERSIONS) |v| {
+    for (LEGACY_VERSIONS) |v| {
         try testing.expectEqualStrings(v, negotiateVersion(v));
     }
+    // The loop above deliberately runs over `LEGACY_VERSIONS`, not
+    // `SUPPORTED_VERSIONS`. A client that asks to negotiate the modern
+    // revision and then sends `initialize` is asking for the era in
+    // which that method does not exist, so echoing its version back
+    // would hand it a version whose own rules this answer breaks.
+    try testing.expectEqualStrings(LEGACY_VERSION, negotiateVersion(MODERN_VERSION));
+    try testing.expect(!isLegacyVersion(MODERN_VERSION));
+}
+
+// The one property `negotiateVersion` must never violate: it answers
+// from the legacy set, and that set is disjoint from the modern era.
+test "protocol: the legacy negotiation set cannot name the stateless era" {
+    for (LEGACY_VERSIONS) |v| {
+        try testing.expect(!std.mem.eql(u8, v, MODERN_VERSION));
+        try testing.expect(isLegacyVersion(v));
+    }
+    try testing.expect(supportsVersion(MODERN_VERSION));
+    for (SUPPORTED_VERSIONS) |v| try testing.expect(supportsVersion(v));
+    try testing.expect(!supportsVersion("2099-01-01"));
+    try testing.expect(!supportsVersion(""));
 }
