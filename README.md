@@ -260,6 +260,13 @@ MCP client at it with:
 { "mcpServers": { "mem3": { "command": "/path/to/mem3", "args": ["mcp", "--data-dir=/path/to/store"] } } }
 ```
 
+It speaks revisions `2025-06-18`, `2025-03-26` and `2024-11-05`; an
+`initialize` carrying anything else is answered with `2025-06-18` rather than
+an echo of a version the server has not verified. JSON-RPC **batches** are
+accepted as well as required: a line holding a top-level array is answered with
+a single array, an all-notification batch is answered with nothing at all, and
+an empty or malformed batch gets one error object rather than an empty array.
+
 `--embedder-cmd` delegates embedding to a long-lived external program instead of
 the built-in hashed lexer: mem3 writes one line of text, the program replies with
 one line of whitespace-separated floats, and the process is reused for every
@@ -506,15 +513,15 @@ extends the file on the next run.
 
 ```bash
 ./scripts/verify.sh           # everything below, plus provenance and a not-verified list
-zig build test                # 405 tests (322 + 83)
+zig build test                # 417 tests (334 + 83)
 zig build check-constitution  # 12 constitution invariants
 zig build bench
 ```
 
 `zig build test` runs two binaries — one rooted at `src/main.zig` and one at
 `tests/main.zig` (unit, integration and property tests under `tests/`). The
-counts above are what the two binaries actually report: `322/322` and `83/83`,
-for `405/405 tests passed` overall.
+counts above are what the two binaries actually report: `334/334` and `83/83`,
+for `417/417 tests passed` overall.
 
 **Zig collects `test` blocks only from files named directly in a root source
 file's `comptime { _ = @import(...) }` block, exactly one level deep.** A file

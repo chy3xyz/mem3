@@ -14,8 +14,21 @@ Current version: **`0.1.0-alpha`**. Supported targets: **macOS and Linux**.
   `memory_forget`, `memory_stats`. `memory_forget` defaults to `dry_run: true`,
   which is stricter than the CLI. This was the missing distribution channel:
   without it the daemon's storage was reachable only by a bespoke HTTP client.
-  Still unverified against a real Claude Code / MCP host — the protocol version
-  `2025-06-18` is declared, not negotiated.
+  **Still unverified against a real MCP host** — no client has run against it
+  yet. It was checked with a strict conformance probe instead, which found and
+  fixed one real omission: JSON-RPC batches. MCP says "implementations MUST
+  support receiving batches", and a batch arriving on one line was answered
+  with `-32700` per element, which a client reports as a parse failure rather
+  than as a missing feature. It also raised a suspicion that turned out to be
+  wrong: `initialize` appears to echo whatever version a client asks for, but
+  `SUPPORTED_VERSIONS` lists `2024-11-05`/`2025-03-26`/`2025-06-18` and
+  anything else falls back to `2025-06-18`, which is what the spec asks for.
+- **The protocol has moved past this server.** The current MCP revision is
+  `2026-07-28`, which removes the `initialize` handshake entirely, carries the
+  protocol version per request in `_meta`, and drops `ping`. mem3 implements the
+  legacy handshake era, which most clients still support, so this is a ceiling
+  rather than a break — but there is no forward path, and a client that has
+  migrated will fail against it.
 - **Optional external embedding** (`--embedder-cmd`, `--embedder-arg`). A
   long-lived child process speaking a one-line-in / one-line-of-floats-out
   protocol, so a real embedding model becomes an *option* rather than a build
