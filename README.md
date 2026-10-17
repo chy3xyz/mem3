@@ -307,8 +307,7 @@ Four layers, each justified by a decision record in [`docs/adr/`](docs/adr/):
   [ADR-0003](docs/adr/0003-hnsw-from-scratch.md).
 - **`Store`** (`src/store/store.zig`) — the container holding cells, goals,
   hyperedges, WAL, snapshot and index, built through one factory from
-  `BuildOptions` (data dir, seed goals, embed dim, embedder kind).
-- **Restoring is not only about cells.** `sync` is snapshot-and-truncate:
+  `BuildOptions` (data dir, seed goals, embed dim, embedder kind).- **Restoring is not only about cells.** `sync` is snapshot-and-truncate:
   `takeSnapshot` unlinks the WAL on its way out, so a restart after any sync
   has nothing left to replay and `loadSnapshot` is the only thing that runs.
   That loop therefore has to rebuild the vector index as well as the cell map
@@ -323,6 +322,36 @@ Four layers, each justified by a decision record in [`docs/adr/`](docs/adr/):
 > `mem3_store.Store` directly. One implementation, two surfaces. The
 > `/api/goals` gap this duplication caused is closed — see
 > [HTTP API](#http-api).
+
+### Inside the MCP server
+
+`src/mcp/` is five files, and the split is by *who decides what a byte means*
+rather than by function:
+
+| File | Decides |
+|---|---|
+| `framing.zig` | where one message ends and the next begins — including where one element of a batch ends |
+| `json.zig` / `json_out.zig` | how bytes become values and back, with no escapes silently lost |
+| `protocol.zig` | whether a message is a request, a notification, or garbage — and which protocol era it speaks |
+| `server.zig` | dispatch, and the shape of every response |
+| `tools.zig` | what a tool does; the only file that touches `Store` |
+
+A line is only a message once its newline has arrived: a truncated trailing
+line is *not yet a message*, and asking the framer for it returns nothing
+rather than a guess. That is the difference between a transport a real client
+interoperates with and one that intermittently hangs, because a client's
+write and a pipe read share no boundary.
+
+Two asymmetries carry more weight than the rest. **A notification is never
+answered** — an unsolicited response desynchronises a client that matches
+responses by id. And **a rejection is always answered**, because silence
+leaves a client waiting on a request that was structurally impossible. The
+one exception is a request whose `id` could not be read at all, which
+JSON-RPC requires be answered as `null`; a request that has a readable id and
+a broken method is not that case, and gets its own id back.
+
+See [CLI reference](#cli-reference) for what a client sees, and run
+[`scripts/mcp_conformance.py`](#testing) to check it.
 
 ## HTTP API
 
@@ -526,15 +555,31 @@ extends the file on the next run.
 
 ```bash
 ./scripts/verify.sh           # everything below, plus provenance and a not-verified list
-zig build test                # 430 tests (347 + 83)
+zig build test                # 432 tests (349 + 83)
 zig build check-constitution  # 12 constitution invariants
 zig build bench
+python3 scripts/mcp_conformance.py   # drives a live `mem3 mcp` over stdio
 ```
+
+`scripts/mcp_conformance.py` is the one that answers "does the MCP server
+actually work", and it is deliberately not a unit test: it starts the binary
+and speaks JSON-RPC 2.0 at it, so it catches wiring faults — a truncated
+response, a missing newline, an id that is not echoed, bytes on stderr —
+that no in-process test can. It checks the things a specification makes
+mandatory (`server/discover`, `resultType`, `-32022`, batching, the
+notification asymmetry) rather than mem3's own opinions, and it exits
+non-zero on the first thing that is wrong. Pass `--mem3 <path>` to point it
+at a specific build.
+
+What it is *not*: an interoperability test. Every message in it was written by
+the same person who wrote the server, so a shared misreading of the spec would
+pass here and fail against a real client. No real MCP host has run against
+mem3 yet, and the script says so in its own docstring.
 
 `zig build test` runs two binaries — one rooted at `src/main.zig` and one at
 `tests/main.zig` (unit, integration and property tests under `tests/`). The
 counts above are what the two binaries actually report: `347/347` and `83/83`,
-for `430/430 tests passed` overall.
+for `432/432 tests passed` overall.
 
 **Zig collects `test` blocks only from files named directly in a root source
 file's `comptime { _ = @import(...) }` block, exactly one level deep.** A file
