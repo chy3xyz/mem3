@@ -15,20 +15,31 @@ Current version: **`0.1.0-alpha`**. Supported targets: **macOS and Linux**.
   which is stricter than the CLI. This was the missing distribution channel:
   without it the daemon's storage was reachable only by a bespoke HTTP client.
   **Still unverified against a real MCP host** — no client has run against it
-  yet. It was checked with a strict conformance probe instead, which found and
-  fixed one real omission: JSON-RPC batches. MCP says "implementations MUST
-  support receiving batches", and a batch arriving on one line was answered
-  with `-32700` per element, which a client reports as a parse failure rather
-  than as a missing feature. It also raised a suspicion that turned out to be
-  wrong: `initialize` appears to echo whatever version a client asks for, but
-  `SUPPORTED_VERSIONS` lists `2024-11-05`/`2025-03-26`/`2025-06-18` and
-  anything else falls back to `2025-06-18`, which is what the spec asks for.
-- **The protocol has moved past this server.** The current MCP revision is
-  `2026-07-28`, which removes the `initialize` handshake entirely, carries the
-  protocol version per request in `_meta`, and drops `ping`. mem3 implements the
-  legacy handshake era, which most clients still support, so this is a ceiling
-  rather than a break — but there is no forward path, and a client that has
-  migrated will fail against it.
+  yet, only against conformance probes written here, which is a weaker claim
+  and worth stating as one.
+- **Dual-era, not legacy-only.** The current revision `2026-07-28` removed the
+  `initialize` handshake, moved the protocol version into every request's
+  `_meta`, required a `resultType` on every result, and made `server/discover`
+  mandatory. mem3 implements that era *and* the handshake era, decided per
+  request rather than per connection — the protocol is stateless, so a client
+  may interleave unrelated requests on one stdio process. The discriminator is
+  the presence of `_meta["io.modelcontextprotocol/protocolVersion"]`, with
+  `initialize` always legacy because that method does not exist in the modern
+  core. Legacy responses are byte-identical to before, because an unmigrated
+  client validates against the older schema.
+- Two conformance defects were found by probing rather than by reading, and
+  both are the kind a test suite built alongside the code cannot find. JSON-RPC
+  batches: "implementations MUST support receiving batches", and a batch
+  arriving on one line was answered with `-32700` per element — which a client
+  reports as a parse failure, not as a missing feature. And the stdio fallback
+  rule: `server/discover` without `_meta` must be `-32602`, not `-32022`,
+  because `-32022` means "I am modern, retry" and a legacy client would treat
+  it as one.
+- A third suspicion turned out to be wrong, and is recorded because a false
+  alarm costs more than a re-investigation. `initialize` appears to echo
+  whatever version a client asks for, but `SUPPORTED_VERSIONS` is a real list
+  and anything outside it falls back to `2025-06-18`, which is what the spec
+  asks for.
 - **Optional external embedding** (`--embedder-cmd`, `--embedder-arg`). A
   long-lived child process speaking a one-line-in / one-line-of-floats-out
   protocol, so a real embedding model becomes an *option* rather than a build

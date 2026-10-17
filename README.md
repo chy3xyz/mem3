@@ -45,8 +45,8 @@ zig build            # binaries land in zig-out/bin/
 
 `zig build` produces `mem3` (the CLI + daemon), `mem3-bench`, `mem3-longrun`,
 `mem3-hnsw-recall`, `mem3-forgetting-eval`, `notebook`, and `loadtest`. The
-default Debug build of `mem3` is **4,383,928 bytes** and `-Doptimize=ReleaseFast`
-is **898,040 bytes**; both link only `libSystem` (both measured on this tree,
+default Debug build of `mem3` is **4,404,808 bytes** and `-Doptimize=ReleaseFast`
+is **914,456 bytes**; both link only `libSystem` (both measured on this tree,
 Apple M1 Pro / arm64).
 
 Artifacts:
@@ -260,12 +260,25 @@ MCP client at it with:
 { "mcpServers": { "mem3": { "command": "/path/to/mem3", "args": ["mcp", "--data-dir=/path/to/store"] } } }
 ```
 
-It speaks revisions `2025-06-18`, `2025-03-26` and `2024-11-05`; an
-`initialize` carrying anything else is answered with `2025-06-18` rather than
-an echo of a version the server has not verified. JSON-RPC **batches** are
-accepted as well as required: a line holding a top-level array is answered with
-a single array, an all-notification batch is answered with nothing at all, and
-an empty or malformed batch gets one error object rather than an empty array.
+It speaks revisions `2026-07-28`, `2025-11-25`, `2025-06-18`, `2025-03-26` and
+`2024-11-05`, and it is **dual-era**: a modern client and a legacy one can be
+served on the same stdio process, decided per request rather than per
+connection.
+
+- A request carrying `params._meta["io.modelcontextprotocol/protocolVersion"]`
+  is served under the stateless core — results carry `resultType` and a
+  `serverInfo` echo.
+- A request without it, or an `initialize`, is served under handshake
+  semantics, byte-for-byte as earlier versions answered.
+- `server/discover` reports every supported version, the capabilities and the
+  identity, and a client that sends it without `_meta` gets `-32602` — which
+  is the signal a dual-era client reads as "legacy server, send `initialize`".
+- A version we do not speak is answered `-32022` with the list of ones we do.
+
+JSON-RPC **batches** are accepted as well as required: a line holding a
+top-level array is answered with a single array, an all-notification batch is
+answered with nothing at all, and an empty or malformed batch gets one error
+object rather than an empty array. A batch may mix eras.
 
 `--embedder-cmd` delegates embedding to a long-lived external program instead of
 the built-in hashed lexer: mem3 writes one line of text, the program replies with
@@ -513,15 +526,15 @@ extends the file on the next run.
 
 ```bash
 ./scripts/verify.sh           # everything below, plus provenance and a not-verified list
-zig build test                # 417 tests (334 + 83)
+zig build test                # 430 tests (347 + 83)
 zig build check-constitution  # 12 constitution invariants
 zig build bench
 ```
 
 `zig build test` runs two binaries — one rooted at `src/main.zig` and one at
 `tests/main.zig` (unit, integration and property tests under `tests/`). The
-counts above are what the two binaries actually report: `334/334` and `83/83`,
-for `417/417 tests passed` overall.
+counts above are what the two binaries actually report: `347/347` and `83/83`,
+for `430/430 tests passed` overall.
 
 **Zig collects `test` blocks only from files named directly in a root source
 file's `comptime { _ = @import(...) }` block, exactly one level deep.** A file
