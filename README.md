@@ -635,11 +635,17 @@ Known and measured, not discovered after the fact:
   embedder or synthetic geometry, so the numbers do not describe the external
   path; and bridging to a local model costs one adapter, because Ollama and
   llama.cpp both speak HTTP and this protocol speaks lines.
-- **No hybrid retrieval.** mem3 searches vectors only. BM25 + vector fused with
-  Reciprocal Rank Fusion is what the competition ships (`local-memory-mcp` v2,
+- **The sparse arm of "hybrid" is a copy of the dense one.** `recall` really
+  does fuse three signals (`src/retrieval/hybrid_retriever.zig`, weights
+  `λ_dense=0.5, λ_sparse=0.2, λ_graph=0.3`) and the graph arm is genuine
+  multi-hop expansion. But there is no lexical index anywhere in the tree — no
+  BM25, no FTS, no inverted index — and the sparse score is assigned
+  `dense_score`, so `λ_sparse` currently *re-weights* the dense arm (effectively
+  0.7/0.3) rather than adding a keyword path. BM25 fused with vectors is what
+  the competition ships (`local-memory-mcp` v2,
   `@studiomeyer/local-memory-mcp`), and a keyword miss on an exact identifier —
   an error code, a file name, a version — is the failure a lexical fallback is
-  for. This is a real gap, not a design position.
+  for. The skeleton and the weights are there; only the arm is missing.
 - **Switching embedders invalidates a persisted index.** Vectors are not
   persisted, only ids and graph topology — see [Retrieval](#retrieval).
 - **`--foresight` is accepted and discarded.** The cell is written without it;
