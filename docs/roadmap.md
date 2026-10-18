@@ -138,22 +138,38 @@ commit would not move this number. What would:
 > LLM judge, no network. Not comparable to Mem0's or Zep's published figures.
 > The output carries a `disclaimer` field saying exactly this on every run.
 
-**`lexical_hash` is the ceiling, not the retrieval layer.** The evidence is
-`exhaustive_nn_hit_rate = 0.6042`, which is *identical* across all four runs —
-core, quarter-padded, full-padded, and the hypergraph-disabled control. That
-control is index-independent: it asks whether the gold cell is the exact cosine
-nearest neighbour over every indexed vector. It does not move when the index
-changes, so the failure is upstream of HNSW. Had the hit rate been high with a
-low `retrieval_hit_rate`, the index would be at fault; it is not.
+**The "it's the embedder, not the index" diagnosis was half right and has been
+re-measured.** `exhaustive_nn_hit_rate = 0.6042` is indeed identical across all
+four runs, and it is index-independent — so that particular metric is a
+statement about the embedder. But the sentence that followed it, "the retrieval
+layer is not the bottleneck here", was wrong, and the way it was wrong is the
+useful part.
 
-The only change that moves this number is a semantic embedder. That question
-has since been answered a different way: `--embedder-cmd` delegates to an
-externally-executed model over a line protocol, which is a different claim from
-linking a runtime and was shipped without a new amendment. `.onnx_external` is
-still reserved and unimplemented (it returns `error.UnsupportedEmbedder`).
-This benchmark has not been re-run through the external path, so what a real
-model would report here — including for the two configurations that score
-0.0000 — remains unmeasured.
+What actually happened when the BM25 sparse arm landed
+(`src/retrieval/bm25.zig`):
+
+| | before | after |
+|---|---|---|
+| combined accuracy, full padding | 0.0417 | **0.7083** |
+| retrieval hit rate, full padding | 0.0729 | **1.0000** |
+| `exhaustive_nn_hit_rate` | 0.6042 | 0.6042 (unchanged, as expected) |
+
+The padded configurations were not failing because the embedder could not rank
+them and not because HNSW could not navigate — they were failing because
+**there was no lexical path at all**, and as the store grew with distractors the
+dense arm's noise simply drowned the signal. A retrieval hit rate of 0.0729
+looked like index collapse and was not; it was a missing arm.
+
+The external-model question has also been answered. `--embedder-cmd` was run
+against `all-MiniLM-L6-v2` (ONNX, local, via `onnxruntime`), and
+`exhaustive_nn_hit_rate` moves 0.6042 → **0.7812** — the stronger embedder does
+place better. End-to-end combined accuracy does **not** follow: flat to within
+0.01 across every configuration. With a lexical arm in the fusion, this
+benchmark is not embedding-bound any more, and the remaining gap to the
+constitutional 80% is somewhere other than both the embedder and the index.
+
+Note for whoever repeats this: `--embedder-cmd` sends **hex-encoded** text, not
+raw text. See `scripts/embedder_adapter_example.py`.
 
 ---
 

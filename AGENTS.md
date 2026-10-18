@@ -123,10 +123,11 @@ tests/
 | `mem3 bench` | ✅ | Fast in-process smoke suite; the release gate is `zig build bench` |
 | `mem3 serve` | ✅ | HTTP daemon with /healthz /metrics /api/sync /api/memcells /api/memcells/:id |
 | `mem3 mcp` | ✅ | MCP server over stdio (JSON-RPC 2.0, hand-written, zero deps). 5 tools: `memory_add` / `memory_query` / `goal_list` / `memory_forget` / `memory_stats`. **Dual-era**: modern `2026-07-28` (per-request `_meta`, `resultType`, `server/discover`) and the legacy handshake, decided per request. Accepts JSON-RPC batches. Checked by `scripts/mcp_conformance.py` against the live binary. **No real MCP host has run against it yet** |
-| Embedding | ✅ | Built-in hashed lexer is the default and is byte-identical to pre-MCP builds. `--embedder-cmd` delegates to a long-lived external program over a line protocol (the "optional tier"); no new link dependency either way |
+| Embedding | ✅ | Built-in hashed lexer is the default and is byte-identical to pre-MCP builds. `--embedder-cmd` delegates to a long-lived external program over a line protocol (the "optional tier"); no new link dependency either way. Requests are **hex-encoded**, not raw text — see `scripts/embedder_adapter_example.py` |
+| Lexical arm | ✅ | `src/retrieval/bm25.zig`, Okapi BM25 over unigrams + bigrams, max-normalised inside the existing `λ_dense=0.5 / λ_sparse=0.2 / λ_graph=0.3` sum. Rebuilt from cells on snapshot restore, never serialised. Identifiers that live only in an `atomic_facts` triple went from 1/12 recall to 12/12 |
 | Persistence | ✅ | WAL-first + snapshot. WAL truncated on sync. |
-| Tests | ✅ | 432: 349 (`src/main.zig`-rooted) + 83 (`tests/main.zig`-rooted), plus 12 constitution invariants as a separate gate, 0 leaks |
-| Binary | ✅ | 914,456 bytes `ReleaseFast` / 4,404,808 bytes Debug, only links libSystem |
+| Tests | ✅ | 451: 368 (`src/main.zig`-rooted) + 83 (`tests/main.zig`-rooted), plus 12 constitution invariants as a separate gate, 0 leaks |
+| Binary | ✅ | 963,704 bytes `ReleaseFast` / 4,569,032 bytes Debug, only links libSystem. The lexical arm added 49 KB ReleaseFast (+5.4%) over the 914,456 B measured before it |
 | Toolchain | ✅ | Pinned via `.zigversion` (Zig 0.17.0) |
 | Platforms | ✅ | macOS + Linux (x86_64 and aarch64). Windows/WASM refused at compile time — see [Platforms](#platforms) |
 
@@ -198,10 +199,10 @@ real gap, not a rounding error.
 | HNSW build 100K vectors | < 30s | 430.6 s (dim=384, efc=200, whole-index build) | **MISS — 14x over** |
 | 3-hop traversal | < 5ms (1K seeds) | 0.000 ms/seed | pass |
 | Cold-start | < 200ms | 0.077 ms | pass |
-| RSS at 100K cells | < 500MB | not measured at 100K | **UNVERIFIED** |
-| Binary size | < 10MB stripped | 914,456 bytes ReleaseFast | pass |
+| RSS at 100K cells | < 500MB | 687.6 MB (whole-process peak RSS, built-in embedder, no WAL, no consolidation; marginal ~27 KB/cell) | **MISS** |
+| Binary size | < 10MB stripped | 963,704 bytes ReleaseFast | pass |
 | External deps (ldd) | 0 | `otool -L` lists only `libSystem` | pass |
-| LongMemEval accuracy | ≥ 80% | 0.646 core / 0.000 padded (offline reimplementation) | **MISS** |
+| LongMemEval accuracy | ≥ 80% | 0.7292 core / 0.7083 padded (offline reimplementation, BM25 sparse arm active) | **MISS** |
 
 The write-throughput miss is **HNSW insert**, not fsync: `hnsw.insert` is
 ~899 µs/op, comparable to the ~1.2 ms WAL fsync and above the whole

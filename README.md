@@ -21,14 +21,88 @@ zig build
 
 Most agent-memory setups need a database, a vector index, and usually an
 embedding service running alongside your agent. That is a reasonable choice on a
-server. It is not available on a laptop with no network, on an air-gapped
-machine, or on a device with 64 MB of RAM.
+server. It is not available on a laptop with no network or on an air-gapped
+machine.
+
+It is also, as measured below, too heavy for a 64 MB device. mem3 costs about
+**27 KB of resident memory per cell**, so a 64 MB budget covers roughly
+**2,000–3,000 cells**. An earlier version of this README named 64 MB as a
+supported target; the measurement does not support it, and the table that
+replaces it is below.
 
 mem3 takes the opposite constraint: the whole memory layer must compile into one
 static-ish binary that links nothing but the OS. Everything usually delegated to
 a dependency — the log-structured write path, the vector index, the persistence
 format, the embedder — is implemented in-tree in Zig. `otool -L
 zig-out/bin/mem3` lists exactly one library, `libSystem`.
+
+### How much memory it actually takes
+
+This is whole-process **peak RSS** (`getrusage` `ru_maxrss`) for a store filled
+through `Store.addRaw` and still resident in memory. Each row is one process,
+one scale, measured on an Apple M1 Pro (arm64, macOS 26.6.2), `-Doptimize=ReleaseFast`,
+on an otherwise idle host.
+
+| Cells | Peak RSS | of which HNSW vectors + edge IDs | marginal cost per cell |
+|---|---|---|---|
+| 1,000 | 26.1 MB | 1.7 MB | — |
+| 2,000 | 53.2 MB | 3.4 MB | 27.7 KB |
+| **3,000** | **79.4 MB** | 5.2 MB | 26.8 KB |
+| 5,000 | 132.8 MB | 8.6 MB | 27.4 KB |
+| 10,000 | 266.9 MB | 17.2 MB | 27.5 KB |
+| 20,000 | 405.4 MB | 34.3 MB | 14.2 KB |
+| 50,000 | 695.0 MB | 85.9 MB | 9.9 KB |
+| 100,000 | 687.6 MB | 171.7 MB | −0.2 KB |
+
+**The conditions these numbers carry.** An RSS figure without them is not a
+measurement, so they are stated rather than implied — the benchmark also emits
+them as a `conditions` object in its own JSON:
+
+- **Embedder: the built-in hashed lexer** (`embedder_cmd = null`). No external
+  embedder process is spawned and no model weights are resident. These figures
+  do **not** bound a `--embedder-cmd` run, which pays for whatever model you point it at.
+- **Dim: 384** (`f32`), so 1,536 bytes of vector per cell before any indexing overhead.
+- **Index: built incrementally.** Every `addRaw` inserts into the live HNSW, so
+  the graph is fully linked at the end. No separate build or rebuild pass.
+- **Consolidation: never runs.** No abstracts, no consolidation working set, no
+  decay sweep. A long-running daemon that also holds abstracts is larger.
+- **WAL: none.** `data_dir = null`, so the WAL contributes 0 bytes to RSS and 0
+  to disk. No snapshot is taken.
+- **Allocator: `std.heap.DebugAllocator(.{ .thread_safe = true })`** — the same
+  allocator the shipped `mem3` binary uses, so this is not a bench-harness
+  artifact. It does carry per-allocation debug metadata and caches freed pages
+  rather than returning them, which is what makes the marginal cost collapse
+  above 20K cells. Do not read the flattening as a property of the data model.
+- **Not measured here:** on-disk footprint, durable/WAL mode, `--embedder-cmd`,
+  and steady-state RSS of a consolidating daemon. Those are different numbers.
+
+Reproduce any row:
+
+```bash
+zig build -Doptimize=ReleaseFast
+/usr/bin/time -l ./zig-out/bin/mem3-bench footprint --cells=10000
+```
+
+Use the external `/usr/bin/time -l` figure, not the benchmark's self-report.
+On a memory-pressured host macOS purges and compresses pages, and in-process
+`ru_maxrss` then reads **low** — this measurement was caught reporting 71.7 MB
+for a store whose vectors alone are 73.2 MB, which is impossible. Under load
+the in-process and external readings diverged by as much as 4×. On an idle host
+the two agree exactly and repeated runs are bit-identical; every row above was
+checked for that agreement. Treat any RSS number taken on a busy host as
+unverified.
+
+Two honest readings of the table:
+
+1. **64 MB holds 2,000 cells and does not hold 3,000.** The crossover sits
+   between those two points, and it stayed there across every replicate taken
+   while this was measured — 3,000 cells was never observed below 67.6 MB.
+2. **100K cells is 687.6 MB, which misses the project's own < 500 MB
+   target** recorded in `AGENTS.md`. That row was previously marked UNVERIFIED;
+   it is now measured, and the answer is a miss, not a pass. Repeated
+   measurements of the 100K point ranged from 608.7 MB to 1,644.6 MB on a
+   loaded host; every single one exceeded 500 MB, so the miss does not depend on
+   which run you believe.
 
 This is early software. It has no external users, no published benchmarks, and
 several known gaps listed under [Status and limitations](#status-and-limitations).
@@ -45,8 +119,8 @@ zig build            # binaries land in zig-out/bin/
 
 `zig build` produces `mem3` (the CLI + daemon), `mem3-bench`, `mem3-longrun`,
 `mem3-hnsw-recall`, `mem3-forgetting-eval`, `notebook`, and `loadtest`. The
-default Debug build of `mem3` is **4,404,808 bytes** and `-Doptimize=ReleaseFast`
-is **914,456 bytes**; both link only `libSystem` (both measured on this tree,
+default Debug build of `mem3` is **4,569,032 bytes** and `-Doptimize=ReleaseFast`
+is **963,704 bytes**; both link only `libSystem` (both measured on this tree,
 Apple M1 Pro / arm64).
 
 Artifacts:
@@ -512,6 +586,16 @@ zig build
 | Consolidate latency, last pass | **20,257.6 ms at 44,909 cells** |
 | RSS at stop | 151 MB |
 
+The `RSS at stop` row is **not reconciled with
+[the measured store footprint](#how-much-memory-it-actually-takes)** and should
+not be combined with it. 151 MB at 46,958 live cells is roughly 4× smaller than
+the 695 MB measured for a 50,000-cell in-memory store, and the two runs are not
+like-for-like: this one is durable, ingest-then-consolidate, and carries a
+consolidation working set, while the sweep inserts only through `addRaw`. A
+number that disagrees with another number by 4× is a reason to re-measure, not
+a reason to pick the smaller one. The long-run RSS has not been re-taken with an
+external observer and is reported here exactly as recorded.
+
 Two things fall out of this, and both are recorded as misses in
 [Known misses](#known-misses):
 
@@ -635,17 +719,17 @@ Known and measured, not discovered after the fact:
   embedder or synthetic geometry, so the numbers do not describe the external
   path; and bridging to a local model costs one adapter, because Ollama and
   llama.cpp both speak HTTP and this protocol speaks lines.
-- **The sparse arm of "hybrid" is a copy of the dense one.** `recall` really
-  does fuse three signals (`src/retrieval/hybrid_retriever.zig`, weights
-  `λ_dense=0.5, λ_sparse=0.2, λ_graph=0.3`) and the graph arm is genuine
-  multi-hop expansion. But there is no lexical index anywhere in the tree — no
-  BM25, no FTS, no inverted index — and the sparse score is assigned
-  `dense_score`, so `λ_sparse` currently *re-weights* the dense arm (effectively
-  0.7/0.3) rather than adding a keyword path. BM25 fused with vectors is what
-  the competition ships (`local-memory-mcp` v2,
-  `@studiomeyer/local-memory-mcp`), and a keyword miss on an exact identifier —
-  an error code, a file name, a version — is the failure a lexical fallback is
-  for. The skeleton and the weights are there; only the arm is missing.
+- **Hybrid retrieval exists now, and it changed the benchmark by an order of
+  magnitude.** `recall` fuses three signals (`src/retrieval/hybrid_retriever.zig`,
+  weights `λ_dense=0.5, λ_sparse=0.2, λ_graph=0.3`) over word unigrams and
+  bigrams with Okapi BM25 (`src/retrieval/bm25.zig`), multi-hop expansion, and
+  vectors. Until this landed the sparse score was a copy of the dense one, so
+  `λ_sparse` merely re-weighted the dense arm. On identifiers that appear only
+  in an `atomic_facts` triple — which the dense arm embeds *from the episode
+  text alone*, so it is structurally blind to them — recall went from **1/12 to
+  12/12**. What BM25 did not fix is equally worth stating: for an identifier in
+  the episode prose, the built-in embedder's char 3-grams already ranked it
+  correctly, and the score stayed 12/12 before and after.
 - **Switching embedders invalidates a persisted index.** Vectors are not
   persisted, only ids and graph topology — see [Retrieval](#retrieval).
 - **`--foresight` is accepted and discarded.** The cell is written without it;
@@ -818,28 +902,39 @@ locally generated case set, a deterministic surface reader, no LLM judge, no
 network. The output says so in a `disclaimer` field every run. Against the
 constitutional ≥80% target it reports `met_target: false`.
 
-Every number in that table is a measurement of the **built-in** embedder. Since
-`--embedder-cmd` landed, a real model can replace it, and this benchmark has not
-been re-run that way — so the table bounds the default path, not the project.
+Both arms were re-measured on the same tree, same seed (`--seed=42`), with the
+BM25 sparse arm active. The external arm is `sentence-transformers/all-MiniLM-L6-v2`
+(ONNX, run locally via `onnxruntime`) behind
+[`scripts/embedder_adapter_example.py`](scripts/embedder_adapter_example.py);
+**it is not a boundary in the abstract** — that script is the whole of the
+integration.
 
-| Configuration | Cells | combined accuracy (answerable) | retrieval hit rate |
-|---|---|---|---|
-| core, no distractor padding | 144 | **0.6458** | 0.8542 |
-| quarter padding | 1,144 | **0.0000** | 0.0000 |
-| full padding | 4,144 | **0.0000** | 0.0000 |
+| Configuration | Cells | built-in comb. | built-in retr. | MiniLM comb. | MiniLM retr. |
+|---|---|---|---|---|---|
+| core, no distractor padding | 144 | **0.7292** | 0.9896 | 0.7188 | 1.0000 |
+| quarter padding | 1,144 | **0.7188** | 0.9896 | 0.7083 | 0.9896 |
+| full padding | 4,144 | **0.7083** | 1.0000 | 0.7083 | 0.9688 |
+| full padding, hypergraph disabled | 4,144 | **0.6979** | 1.0000 | 0.6979 | 0.9688 |
 
-`exhaustive_nn_hit_rate` is **0.6042 and identical across all four
-configurations**, including the hypergraph-disabled control. That control is
-index-independent: it scores whether the gold cell is the exact cosine nearest
-neighbour over every indexed vector. It does not move when the index changes, so
-the failure is upstream of HNSW — **`lexical_hash` never placed the question and
-its answer in the same neighbourhood.** The retrieval layer is not the
-bottleneck here; the embedder is. Swapping the embedder is the only change that
-moves this number. A real model is now reachable through `--embedder-cmd`, but
-this benchmark has not been re-run that way, so nobody here knows what it would
-report — including whether a stronger embedder fixes the padded configurations,
-which fail at 0.0000 and look like a different failure than the 0.6458 core
-score does. (The `.onnx_external` embedder kind remains reserved and returns
+Two things in that table are worth more than the numbers themselves.
+
+**The padded configurations are no longer at zero, and BM25 is why.** Before the
+lexical arm landed, the same benchmark reported 0.0417 for full padding and a
+retrieval hit rate of 0.0729 — the query stopped finding its answer entirely as
+the store grew. Both arms now sit at 0.7083 with a hit rate of 1.0000. The
+previous README attributed that collapse to `lexical_hash` never placing a
+question and its answer in the same neighbourhood. **That diagnosis was wrong**:
+HNSW recall at 4k cells was never the problem, and a 0.0729 hit rate was the
+signature of a missing lexical path, not a failing graph.
+
+**A real semantic embedder bought nothing here.** `exhaustive_nn_hit_rate` — the
+index-independent score of whether the gold cell is the exact cosine nearest
+neighbour over every vector — moves from 0.6042 to **0.7812**, so the stronger
+embedder demonstrably places better. End-to-end combined accuracy does not
+follow: it is flat to within 0.01 on every configuration, and slightly *lower*
+on core. With a lexical arm in the fusion, this benchmark's ceiling is not the
+embedding. Anyone reaching for a semantic model to move this number should read
+that first. (`.onnx_external` remains reserved and returns
 `error.UnsupportedEmbedder`; `--embedder-cmd` is the path that works.)
 
 ## License
