@@ -65,6 +65,7 @@ const retrieval = @import("../retrieval/mod.zig");
 const RerankContext = @import("../retrieval/reranker.zig").RerankContext;
 const HNSW = retrieval.HNSW;
 const Embedder = retrieval.Embedder;
+const BM25 = @import("../retrieval/bm25.zig").BM25;
 const WAL = @import("../storage/wal.zig").WAL;
 const WALRecord = @import("../storage/wal.zig").WALRecord;
 const Snapshot = @import("../storage/snapshot.zig");
@@ -164,6 +165,10 @@ pub const Store = struct {
     hymem: HyMem,
     /// HNSW vector index over episode embeddings.
     hnsw: *HNSW,
+    /// BM25 lexical index over the same cells. The sparse arm of
+    /// recall, and — like `hnsw` — derived state, not stored truth: the
+    /// cells are the truth and this is rebuilt from them on restore.
+    bm25: *BM25,
     /// Stub embedder (deterministic xxhash3-based).
     emb: Embedder,
     /// id → cell pointer. The fast path for `getCell`.
@@ -198,6 +203,7 @@ pub const Store = struct {
             .lc = undefined,
             .hymem = undefined,
             .hnsw = undefined,
+            .bm25 = undefined,
             .emb = undefined,
             .cell_index = std.AutoHashMap(u64, *MemCell).init(alloc),
             .wal = null,
@@ -286,6 +292,17 @@ pub const Store = struct {
         hnsw_ptr.* = HNSW.init(alloc, .{}, opts.embed_dim);
         errdefer hnsw_ptr.deinit();
         self.hnsw = hnsw_ptr;
+
+        // BM25 lexical index — the sparse arm. Born here rather than
+        // being lazily created on first query, so that a store whose
+        // cells were restored from a snapshot has an index over exactly
+        // those cells instead of an empty one that silently reports "no
+        // lexical hits" for every query until something is inserted.
+        const bm25_ptr = try alloc.create(BM25);
+        errdefer alloc.destroy(bm25_ptr);
+        bm25_ptr.* = BM25.init(alloc, lc_ptr.cfg.bm25_k1, lc_ptr.cfg.bm25_b);
+        errdefer bm25_ptr.deinit();
+        self.bm25 = bm25_ptr;
         // An external runtime is opt-in and is not reachable from a Config,
         // so it is a separate constructor: `init(kind, dim)` has no way to
         // learn a program path. A backend that cannot start, or that
@@ -305,7 +322,14 @@ pub const Store = struct {
         // `HybridRetriever.init` it would have hashed queries with
         // `.stub_xxhash` against an index built with `.lexical_hash` and
         // silently returned noise.
-        self.hybrid = retrieval.HybridRetriever.init(alloc, lc_ptr.cfg, self.emb, self.hnsw, &self.hymem);
+        self.hybrid = retrieval.HybridRetriever.initWithSparse(
+            alloc,
+            lc_ptr.cfg,
+            self.emb,
+            self.hnsw,
+            &self.hymem,
+            self.bm25,
+        );
 
         // Persistence (optional)
         if (opts.data_dir) |dir| {
@@ -341,6 +365,8 @@ pub const Store = struct {
         self.alloc.destroy(self.world);
         self.hnsw.deinit();
         self.alloc.destroy(self.hnsw);
+        self.bm25.deinit();
+        self.alloc.destroy(self.bm25);
         self.lc.fuzzy.deinit();
         self.alloc.destroy(self.lc);
         self.hymem.deinit();
@@ -500,6 +526,14 @@ pub const Store = struct {
             // from here on, so the candidate is skipped — this is about the
             // index agreeing with the cell map.
             _ = self.hnsw.markDeleted(id);
+            // Same for the lexical index. A forgotten cell that keeps
+            // its postings keeps returning itself for the identifier
+            // queries the sparse arm was added to answer — and unlike
+            // the vector index, the lexical arm introduces ids into the
+            // candidate set that the dense arm never proposed, so
+            // "retrieval is already safe because getCell misses" is not
+            // enough on its own here.
+            self.bm25.remove(id);
 
             if (self.wal) |wal| {
                 // `.forget` (0x20) has been in the record enum since the
@@ -569,6 +603,7 @@ pub const Store = struct {
         self.hnsw.insert(id, v) catch |err| {
             log.warn("consolidate: hnsw insert failed for abstract {d}: {}", .{ id, err });
         };
+        self.indexLexicalText(id, cell);
 
         // Journal last. The abstract is already observable in memory,
         // so a WAL failure here means it will not survive a restart
@@ -1106,8 +1141,48 @@ pub const Store = struct {
         };
     }
 
+    /// The text one cell contributes to the BM25 lexical index.
+    ///
+    /// Episode **and** atomic facts, deliberately not symmetric with the
+    /// vector index (which embeds `episode` alone). The sparse arm exists
+    /// to answer exact-identifier queries, and an identifier that was
+    /// only ever extracted into a fact triple — `user|hit|ENOENT` — is
+    /// invisible to a lexical index built from the episode that produced
+    /// it. The two arms seeing different text is the point of having two
+    /// arms.
+    ///
+    /// Failures are logged, never propagated: a store whose lexical index
+    /// missed a cell still answers queries correctly through the dense
+    /// and graph arms, and turning an allocation failure on one derived
+    /// index into a failed insert would make the write path depend on a
+    /// structure that is itself only a cache over the cells.
+    fn indexLexicalText(self: *Store, id: u64, cell: *const MemCell) void {
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(self.alloc);
+        buf.appendSlice(self.alloc, cell.episode) catch |err| {
+            log.warn("bm25 index: buffer alloc failed for id={d}: {}", .{ id, err });
+            return;
+        };
+        for (cell.atomic_facts) |f| {
+            buf.ensureUnusedCapacity(self.alloc, 3 + f.subject.len + f.predicate.len + f.object.len) catch |err| {
+                log.warn("bm25 index: buffer alloc failed for id={d}: {}", .{ id, err });
+                return;
+            };
+            buf.appendAssumeCapacity(' ');
+            buf.appendSliceAssumeCapacity(f.subject);
+            buf.appendAssumeCapacity(' ');
+            buf.appendSliceAssumeCapacity(f.predicate);
+            buf.appendAssumeCapacity(' ');
+            buf.appendSliceAssumeCapacity(f.object);
+        }
+        self.bm25.index(id, buf.items) catch |err| {
+            log.warn("bm25 index failed for id={d}: {}", .{ id, err });
+        };
+    }
+
     fn commitBuiltCell(self: *Store, id: u64, built: BuiltCell) !void {
         _ = try self.lc.addCell(id, built.cell.*);
+
         // Note: built.fact_list / goal_list / cell are NOT freed here.
         // The caller owns them and is responsible for calling
         // `built.deinit(alloc)` on both success and failure paths.
@@ -1121,6 +1196,11 @@ pub const Store = struct {
             self.hnsw.insert(id, v) catch |err| {
                 log.warn("hnsw insert failed: {}", .{err});
             };
+            // The lexical index is maintained at the same four points as
+            // the vector index — here, `indexAbstract`, `loadSnapshot` and
+            // `forget` — so the two arms cannot disagree about which
+            // cells exist.
+            self.indexLexicalText(id, stored);
             // 外拓. Everything above this line is the World layer's
             // storage job; everything GHW does with the memory happens
             // here, and it happens in layer order.
@@ -1542,6 +1622,16 @@ pub fn encodeGoalWALPayloadRaw(
                 self.hnsw.insert(cs.id, v) catch |err| {
                     std.log.warn("snapshot: hnsw insert failed for id={d}: {}", .{ cs.id, err });
                 };
+                // The lexical arm rides the exact same restore path, for
+                // the exact same reason. Rebuilding it from the cells —
+                // rather than persisting a posting list alongside the
+                // snapshot — costs one tokenisation pass per restored
+                // cell and cannot produce an index that disagrees with
+                // the cells it describes. Vectors are not persisted for
+                // the same reason and the argument does not weaken one
+                // bit for postings, which are cheaper to rebuild than
+                // embeddings are to recompute.
+                self.indexLexicalText(cs.id, stored);
             }
         }
         for (data.fuzzy_cells) |cs| {
@@ -3987,4 +4077,153 @@ test "Store: the external embedder is opt-in, off by default, and its failures r
         dead.addRaw(.matter, "hello world", "user|likes|coffee", 1, 0.7),
     );
     try std.testing.expectEqual(@as(usize, 0), dead.hnsw.count);
+}
+
+test "Store: a snapshot restore rebuilds the lexical index, not just the vectors" {
+    // Companion to "a snapshot restore rebuilds the vector index".
+    //
+    // `sync` is snapshot-and-truncate, so after it the WAL is unlinked
+    // and `loadSnapshot` is the only thing that runs on restart. If the
+    // lexical index were not rebuilt there — the same silent failure the
+    // vector index used to have — the store would come back with cells,
+    // vectors, and an empty BM25 index, and every identifier query would
+    // quietly return nothing. No error, no warning, just a store that
+    // has forgotten how to read.
+    const alloc = std.testing.allocator;
+    var dir_buf: [128]u8 = undefined;
+    const data_dir = testDataDir(&dir_buf, "snaplexidx");
+    wipeStoreDir(data_dir);
+    defer wipeStoreDir(data_dir);
+
+    const seeded = blk: {
+        var store = try Store.init(alloc, .{ .data_dir = data_dir, .seed_default_goals = false });
+        defer store.deinit();
+
+        // Identifiers live in the FACT triples, not in the episodes, so
+        // this cannot pass by accident on the dense arm: the episodes
+        // are interchangeable prose.
+        const ids = [_]u64{
+            try store.addRaw(.matter, "an unrelated note about the quarterly audit that the engineer logged", "system|reported|ENOENT", 0, 0.5),
+            try store.addRaw(.matter, "another unrelated note about the inventory count that nobody read", "disk|needed|fsync", 0, 0.5),
+            try store.addRaw(.matter, "a third unrelated note about the office plants and the window light", "parser|hit|mmap", 0, 0.5),
+        };
+        try store.sync();
+        break :blk ids;
+    };
+
+    var store = try Store.init(alloc, .{ .data_dir = data_dir, .seed_default_goals = false });
+    defer store.deinit();
+
+    // Both indexes came back with the cells.
+    try std.testing.expectEqual(@as(usize, 3), store.cellCount());
+    try std.testing.expectEqual(@as(usize, 3), store.hnsw.count);
+    try std.testing.expectEqual(@as(usize, 3), store.bm25.count());
+
+    // The vector index alone cannot answer these — the episodes never
+    // contain the identifiers. Proved rather than assumed, so this test
+    // cannot pass by the dense arm doing the lexical arm's job.
+    const q = try store.emb.embed(alloc, "ENOENT");
+    defer alloc.free(q);
+    const dense_hits = try store.hnsw.search(alloc, q, 3);
+    defer alloc.free(dense_hits);
+    for (dense_hits) |h| {
+        const cell = store.getCell(h.id) orelse continue;
+        try std.testing.expect(std.mem.indexOf(u8, cell.episode, "ENOENT") == null);
+    }
+
+    // The lexical index answers them, by cell id.
+    const lex = try store.bm25.search(alloc, "ENOENT", 3);
+    defer alloc.free(lex);
+    try std.testing.expect(lex.len > 0);
+    try std.testing.expectEqual(seeded[0], lex[0].id);
+
+    const lex2 = try store.bm25.search(alloc, "fsync", 3);
+    defer alloc.free(lex2);
+    try std.testing.expect(lex2.len > 0);
+    try std.testing.expectEqual(seeded[1], lex2[0].id);
+
+    // And the restored index is reachable through recall, which is the
+    // only path a user ever takes.
+    const cands = try store.hybrid.recall(alloc, "ENOENT", 10);
+    defer alloc.free(cands);
+    try std.testing.expect(cands.len > 0);
+    try std.testing.expectEqual(seeded[0], cands[0].cell_id);
+}
+
+test "Store: forgetting a cell takes its postings out of the lexical index" {
+    // The vector index has a `forget`-path test; the lexical one did not
+    // need one while it did not exist. A forgotten cell that keeps its
+    // postings keeps answering the identifier queries the sparse arm
+    // exists to answer, and — unlike the dense arm — the lexical arm
+    // introduces ids into the candidate set on its own, so "getCell
+    // misses so retrieval is already safe" is not a sufficient answer.
+    const alloc = std.testing.allocator;
+    var dir_buf: [128]u8 = undefined;
+    const data_dir = testDataDir(&dir_buf, "forgetlexidx");
+    wipeStoreDir(data_dir);
+    defer wipeStoreDir(data_dir);
+
+    var store = try Store.init(alloc, .{ .data_dir = data_dir, .seed_default_goals = false });
+    defer store.deinit();
+
+    var ids: [6]u64 = undefined;
+    for (&ids, 0..) |*slot, i| {
+        var buf: [96]u8 = undefined;
+        slot.* = try store.addRaw(
+            .matter,
+            try std.fmt.bufPrint(&buf, "an episode number {d} about a routine deployment in the cluster", .{i}),
+            try std.fmt.bufPrint(&buf, "user|ran|deploymarker{d}", .{i}),
+            0,
+            0.5,
+        );
+    }
+    try std.testing.expectEqual(@as(usize, 6), store.bm25.count());
+
+    // Each identifier resolves to exactly one cell before the sweep.
+    for (ids, 0..) |id, i| {
+        var buf: [64]u8 = undefined;
+        const term = try std.fmt.bufPrint(&buf, "deploymarker{d}", .{i});
+        const hits = try store.bm25.search(alloc, term, 8);
+        defer alloc.free(hits);
+        try std.testing.expectEqual(@as(usize, 1), hits.len);
+        try std.testing.expectEqual(id, hits[0].id);
+    }
+
+    // Age the first two past the forgetting threshold, exactly as
+    // "forgetting a cell takes its vector out of the index" does. Without
+    // this the sweep removes nothing and every assertion below would
+    // pass vacuously — which is what the first version of this test did.
+    const old_ms = 120 * 86_400_000;
+    const now_ms = @import("../utils/time.zig").nowMs();
+    for (ids[0..2]) |id| {
+        const cell = store.mgr.get(id) orelse return error.TestExpectedCellMissing;
+        cell.metadata.created_at = now_ms - old_ms;
+    }
+
+    const swept = try store.forget(false);
+    try std.testing.expectEqual(@as(usize, 2), swept.fuzzied);
+    try std.testing.expectEqual(@as(usize, 4), store.cellCount());
+
+    // The indexes agree with the cell map. This is the invariant; which
+    // specific ids died is the decay schedule's business.
+    try std.testing.expectEqual(store.cellCount(), store.bm25.count());
+    try std.testing.expectEqual(@as(usize, 4), store.hnsw.count);
+
+    for (ids, 0..) |id, i| {
+        var buf: [64]u8 = undefined;
+        const term = try std.fmt.bufPrint(&buf, "deploymarker{d}", .{i});
+        const hits = try store.bm25.search(alloc, term, 8);
+        defer alloc.free(hits);
+        if (store.getCell(id) != null) {
+            // Still a cell: it must still be findable, by that cell.
+            try std.testing.expectEqual(@as(usize, 1), hits.len);
+            try std.testing.expectEqual(id, hits[0].id);
+        } else {
+            // Gone: it must not be findable at all. This is the
+            // assertion that goes red if `forget` forgets to call
+            // `BM25.remove` — the postings would survive and a deleted
+            // memory would keep answering its own identifier forever.
+            try std.testing.expectEqual(@as(usize, 0), hits.len);
+        }
+    }
 }

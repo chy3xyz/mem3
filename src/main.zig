@@ -142,6 +142,13 @@ comptime {
     _ = @import("retrieval/hnsw.zig");
     _ = @import("retrieval/embedder.zig");
     _ = @import("retrieval/hybrid_retriever.zig");
+    // The BM25 sparse arm. Named here for the reason every other entry
+    // in this block is named: `retrieval/mod.zig` re-exports it, and a
+    // re-export builds the module without ever registering its `test`
+    // blocks with the runner. Without this line the sparse arm's twelve
+    // tests would compile nowhere and run nowhere while `hybrid_retriever`
+    // — which imports it — looked thoroughly tested.
+    _ = @import("retrieval/bm25.zig");
     _ = @import("utils/hashing.zig");
     _ = @import("utils/time.zig");
     _ = @import("utils/jsonl.zig");

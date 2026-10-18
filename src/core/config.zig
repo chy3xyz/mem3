@@ -33,6 +33,26 @@ pub const Config = struct {
     recall_lambda_sparse: f32 = 0.2,
     recall_lambda_graph: f32 = 0.3,
 
+    // BM25 sparse arm (`retrieval/bm25.zig`).
+    //
+    // `1.2` / `0.75` are the Robertson–Sparck-Jones defaults and are not
+    // tuned to this corpus: the sparse arm's job is to catch exact
+    // identifiers, and the shape of the tf curve barely moves which of
+    // two documents that mentions `module_not_found` wins. Exposed
+    // because `b=0` and `k1=0` are the two degenerate settings the
+    // scoring tests pin, not because anyone is expected to sweep them.
+    bm25_k1: f32 = 1.2,
+    bm25_b: f32 = 0.75,
+    /// Candidates the sparse arm over-fetches, as a multiple of `topk`.
+    ///
+    /// The dense arm over-fetches 3x for the same reason and with the
+    /// same rationale: HNSW's graph walk is approximate and BM25's
+    /// postings are not sorted globally, so the top-k of the *candidate
+    /// set* is only as good as the window it was drawn from. `recall`
+    /// truncates to `topk` after fusion, where the graph arm can pull an
+    /// id in from outside the lexical top-k entirely.
+    sparse_overfetch: usize = 5,
+
     // GHW-prioritized rerank
     goal_bonus_weight: f32 = 0.4,
     existence_bonus_weight: f32 = 0.3,
@@ -106,4 +126,31 @@ test "Config: scoring weights sum to 1" {
     try std.testing.expectApproxEqAbs(@as(f32, 1.0), sum, 1e-5);
     const rsum = c.recall_lambda_dense + c.recall_lambda_sparse + c.recall_lambda_graph;
     try std.testing.expectApproxEqAbs(@as(f32, 1.0), rsum, 1e-5);
+}
+
+test "Config: bm25 knobs are in their usable ranges" {
+    const c: Config = .{};
+    // k1 >= 0: k1 = 0 is the "saturate immediately" degenerate case the
+    // scoring test pins, and a negative k1 would make the tf term
+    // negative for long documents.
+    try std.testing.expect(c.bm25_k1 >= 0.0);
+    // 0 <= b <= 1: b > 1 would reward longer documents for being long,
+    // inverting the length normalisation.
+    try std.testing.expect(c.bm25_b >= 0.0);
+    try std.testing.expect(c.bm25_b <= 1.0);
+    // The sparse arm has to over-fetch: a window of 1 would truncate the
+    // lexical ranking to a single hit before fusion ever saw it, which
+    // is the dense arm's mistake in a different place.
+    try std.testing.expect(c.sparse_overfetch >= 1);
+}
+
+test "Config: the documented three-way fusion weights are unchanged" {
+    // λ_dense = 0.5, λ_sparse = 0.2, λ_graph = 0.3 is the constitutional
+    // split. The sparse arm became real; the weights did not move, so
+    // this pins them against a well-meaning future "fix" to the 0.7/0.3
+    // split the placeholder accidentally produced.
+    const c: Config = .{};
+    try std.testing.expectEqual(@as(f32, 0.5), c.recall_lambda_dense);
+    try std.testing.expectEqual(@as(f32, 0.2), c.recall_lambda_sparse);
+    try std.testing.expectEqual(@as(f32, 0.3), c.recall_lambda_graph);
 }

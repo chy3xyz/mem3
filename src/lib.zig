@@ -105,6 +105,7 @@ pub const StubEmbedder = retrieval.StubEmbedder;
 pub const LexicalEmbedder = retrieval.LexicalEmbedder;
 pub const Embedder = retrieval.Embedder;
 pub const HybridRetriever = retrieval.HybridRetriever;
+pub const BM25 = retrieval.BM25;
 pub const Candidate = retrieval.Candidate;
 pub const RerankContext = retrieval.RerankContext;
 pub const ScoredCell = retrieval.ScoredCell;

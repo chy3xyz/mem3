@@ -2,6 +2,7 @@
 
 pub const hnsw = @import("hnsw.zig");
 pub const embedder = @import("embedder.zig");
+pub const bm25 = @import("bm25.zig");
 pub const hybrid_retriever = @import("hybrid_retriever.zig");
 pub const reranker = @import("reranker.zig");
 
@@ -11,6 +12,8 @@ pub const LexicalEmbedder = embedder.LexicalEmbedder;
 /// The dispatch union callers should actually hold. Either variant can
 /// be selected at build time; `Embedder.init` picks one.
 pub const Embedder = embedder.Embedder;
+pub const BM25 = bm25.BM25;
+pub const BM25Hit = bm25.Hit;
 pub const HybridRetriever = hybrid_retriever.HybridRetriever;
 pub const Candidate = hybrid_retriever.Candidate;
 pub const RerankContext = reranker.RerankContext;
