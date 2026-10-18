@@ -265,6 +265,59 @@ pub fn run(alloc: Allocator, init: std.process.Init.Minimal) !void {
     try j.key("embed_dim");
     try j.int(DIM);
 
+    // An RSS number without its conditions is not a measurement, it is a
+    // rumour. Everything a reader needs in order to decide whether this
+    // figure transfers to their own run is stated here, next to the number
+    // it qualifies.
+    try j.key("conditions");
+    try j.beginObject();
+    try j.key("embedder");
+    try j.str("built-in hashed lexer (BuildOptions.embedder_cmd = null). No " ++
+        "external embedder process is spawned, so no model weights are " ++
+        "resident. These figures do NOT bound --embedder-cmd runs.");
+    try j.key("embed_dim");
+    try j.int(DIM);
+    try j.key("index");
+    try j.str("built incrementally: every addRaw inserts into the live HNSW, " ++
+        "so the graph is fully linked at the end of the run. No separate " ++
+        "build phase and no rebuild pass.");
+    try j.key("consolidation");
+    try j.str("never runs. This benchmark only calls Store.addRaw, so there " ++
+        "are no abstracts, no consolidation working set, and no decay " ++
+        "sweep. A long run with consolidation resident will be larger.");
+    try j.key("wal");
+    try j.str(if (durable)
+        "WAL opened and retained uncompacted; no snapshot is taken, so the " ++
+            "WAL grows monotonically and nothing is reclaimed."
+    else
+        "no WAL at all (data_dir=null), so the WAL contributes 0 bytes to " ++
+            "both RSS and disk.");
+    try j.key("allocator");
+    try j.str("std.heap.DebugAllocator(.{ .thread_safe = true }) — byte-for-byte " ++
+        "the allocator the shipped mem3 binary uses (src/main.zig), so this " ++
+        "is not a bench-harness artifact, but it does carry per-allocation " ++
+        "debug metadata and caches freed pages rather than returning them.");
+    try j.key("what_this_number_is");
+    try j.str("Whole-process peak RSS (getrusage ru_maxrss) for a store " ++
+        "filled through addRaw and still in memory. It is NOT the on-disk " ++
+        "footprint, and NOT the steady-state RSS of a long-running daemon " ++
+        "that also holds abstracts and a consolidation working set.");
+    try j.key("measurement_method");
+    try j.str("In-process ru_maxrss, cross-checked against an external " ++
+        "observer: /usr/bin/time -l ./mem3-bench footprint --cells=N. The " ++
+        "external figure is the one to trust under memory pressure — see " ++
+        "the caveat on rss_measurement_caveat below.");
+    try j.key("rss_measurement_caveat");
+    try j.str("ru_maxrss is a high-water mark, and on a memory-pressured host " ++
+        "macOS purges and compresses pages, which makes in-process RSS read " ++
+        "LOW (observed: 71.7 MB reported for a store whose vectors alone are " ++
+        "73.2 MB, which is impossible). Under load the in-process and " ++
+        "external readings diverged by up to 4x. On an idle host the two " ++
+        "agree exactly and repeated runs are bit-identical. Report the " ++
+        "external figure, and treat any single RSS number from a busy host " ++
+        "as unverified.");
+    try j.endObject();
+
     try j.key("rss");
     try j.beginObject();
     try j.key("baseline_kb");
@@ -379,6 +432,26 @@ pub fn run(alloc: Allocator, init: std.process.Init.Minimal) !void {
 
     try harness.finish(alloc, &j);
 }
+
+// ## KNOWN GAP: the two tests at the bottom of this file are not collected
+//
+// `zig build test` runs 451 tests and none of them are these two.
+// `zig test` collects test blocks from files reachable by `@import` from
+// the root source file, exactly one layer deep, and only what a root
+// *names directly*. `bench/main.zig` is a dispatcher with no comptime
+// block, and `tests/main.zig` cannot reach `../bench/` — importing it
+// fails with "import of file outside module path".
+//
+// Exposing this file to the tests-rooted binary as a named module does
+// not work either: a *module* import is not a *file* import, and a
+// module's test blocks are not collected. That was tried and reverted;
+// a green build with the module wired in is worse than an honest gap,
+// because it reads as coverage that does not exist.
+//
+// To actually run them: `/usr/bin/time -l ./zig-out/bin/mem3-bench
+// footprint --cells=300`. Closing this properly means restructuring
+// `bench/` into the library module, which is a larger change than the
+// two assertions are worth.
 
 test "footprint: RSS grows monotonically and the growth table records it" {
     var gpa: std.heap.DebugAllocator(.{}) = .init;
