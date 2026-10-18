@@ -954,16 +954,36 @@ const RunResult = struct {
     }
 };
 
+/// How the store embeds for one run. `cmd == null` is the built-in
+/// `lexical_hash` path and is byte-identical to before this existed: the
+/// two fields below are only read when `cmd` is non-null, and `dim`
+/// defaults to the Store's own default.
+const EmbedderRun = struct {
+    cmd: ?[]const u8 = null,
+    args: []const []const u8 = &.{},
+    /// Required width when `cmd` is set. The store probes the backend at
+    /// construction, so a mismatch fails `Store.init` — before a cell is
+    /// indexed — rather than mid-query.
+    dim: u16 = DEFAULT_EMBED_DIM,
+};
+
 fn evaluate(
     alloc: Allocator,
     label: []const u8,
     ds: Dataset,
     cells_to_load: usize,
     with_hypergraph: bool,
+    emb: EmbedderRun,
 ) !RunResult {
     const t_build = harness.clockNs();
 
-    const store = try mem3.Store.init(alloc, .{ .data_dir = null, .seed_default_goals = true });
+    const store = try mem3.Store.init(alloc, .{
+        .data_dir = null,
+        .seed_default_goals = true,
+        .embed_dim = emb.dim,
+        .embedder_cmd = emb.cmd,
+        .embedder_args = emb.args,
+    });
     defer store.deinit();
 
     const cell_ids = try alloc.alloc(u64, ds.stmts.len);
@@ -1009,12 +1029,18 @@ fn evaluate(
     // built from Config defaults: the index was built with this
     // embedder, so querying with another one would compare vectors
     // from two different spaces.
-    var retriever = mem3.HybridRetriever.init(
+    var retriever = mem3.HybridRetriever.initWithSparse(
         alloc,
         mem3.Config{},
         store.emb,
         store.hnsw,
         &store.hymem,
+        // The Store already owns the lexical index and keeps it in step
+        // with the cells. Passing `null` here would measure a retriever
+        // the product never runs -- one with the sparse arm silently
+        // off -- and quietly report numbers for a configuration nobody
+        // ships. This benchmark exists to measure the shipped path.
+        store.bm25,
     );
 
     var total = Tally{};
@@ -1179,11 +1205,20 @@ fn writeRun(j: *harness.Json, r: RunResult) !void {
 
 const DEFAULT_WORLDS: usize = 16;
 const DEFAULT_PAD: usize = 4_000;
+/// Matches `Store.init`'s own default width, so omitting `--embed-dim`
+/// is the same store a built-in run builds.
+const DEFAULT_EMBED_DIM: u16 = 384;
 
 pub fn run(alloc: Allocator, init: std.process.Init.Minimal) !void {
     var common = harness.CommonArgs{};
     var worlds: ?usize = null;
     var pad: ?usize = null;
+
+    // External embedder opt-in. Owns the collected arguments so the
+    // slices outlive the argv iterator.
+    var emb = EmbedderRun{};
+    var emb_args = std.ArrayList([]const u8).empty;
+    defer emb_args.deinit(alloc);
 
     var it = harness.argIterator(init);
     while (it.next()) |arg| {
@@ -1192,6 +1227,12 @@ pub fn run(alloc: Allocator, init: std.process.Init.Minimal) !void {
             worlds = try std.fmt.parseInt(usize, arg["--worlds=".len..], 10);
         } else if (std.mem.startsWith(u8, arg, "--pad=")) {
             pad = try std.fmt.parseInt(usize, arg["--pad=".len..], 10);
+        } else if (std.mem.startsWith(u8, arg, "--embedder-cmd=")) {
+            emb.cmd = try alloc.dupe(u8, arg["--embedder-cmd=".len..]);
+        } else if (std.mem.startsWith(u8, arg, "--embedder-arg=")) {
+            try emb_args.append(alloc, try alloc.dupe(u8, arg["--embedder-arg=".len..]));
+        } else if (std.mem.startsWith(u8, arg, "--embed-dim=")) {
+            emb.dim = try std.fmt.parseInt(u16, arg["--embed-dim=".len..], 10);
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             harness.out(
                 \\longmemeval — offline LongMemEval protocol re-implementation
@@ -1201,13 +1242,22 @@ pub fn run(alloc: Allocator, init: std.process.Init.Minimal) !void {
                 \\  --scale=F    multiply the defaults; --quick is 0.1
                 \\  --seed=N     PRNG seed (the whole case set is derived from it)
                 \\
-                , .{ DEFAULT_WORLDS, DEFAULT_PAD });
+                \\  --embedder-cmd=PATH   embed with an external program instead of
+                \\                         lexical_hash (see --embed-arg)
+                \\  --embedder-arg=ARG    one argument for that program; repeatable,
+                \\                         passed verbatim with no shell
+                \\  --embed-dim=N         required vector width for the external
+                \\                         program (default {d}); a backend that
+                \\                         answers with another width fails at startup
+                \\
+                , .{ DEFAULT_WORLDS, DEFAULT_PAD, DEFAULT_EMBED_DIM });
             return;
         } else {
             harness.out("longmemeval: unknown argument {s}\n", .{arg});
             return error.UnknownArgument;
         }
     }
+    emb.args = emb_args.items;
 
     const n_worlds = harness.scaled(worlds orelse DEFAULT_WORLDS, common);
     const n_pad = harness.scaled(pad orelse DEFAULT_PAD, common);
@@ -1230,11 +1280,11 @@ pub fn run(alloc: Allocator, init: std.process.Init.Minimal) !void {
             else => "full padding",
         };
         harness.progress("longmemeval: {s}, {d} cells...\n", .{ label, cells });
-        runs[n_runs] = try evaluate(alloc, label, ds, cells, true);
+        runs[n_runs] = try evaluate(alloc, label, ds, cells, true, emb);
         n_runs += 1;
     }
     harness.progress("longmemeval: hypergraph-disabled control...\n", .{});
-    runs[n_runs] = try evaluate(alloc, "full padding, hypergraph disabled", ds, core + n_pad, false);
+    runs[n_runs] = try evaluate(alloc, "full padding, hypergraph disabled", ds, core + n_pad, false, emb);
     n_runs += 1;
     defer for (runs[0..n_runs]) |r| r.deinit(alloc);
 
@@ -1298,7 +1348,16 @@ pub fn run(alloc: Allocator, init: std.process.Init.Minimal) !void {
         "official protocol uses. Its limits are why retrieval_hit is " ++
         "reported alongside accuracy.");
     try j.key("embedder");
-    try j.str("lexical_hash (the Store default)");
+    try j.str(if (emb.cmd) |c|
+        std.fmt.allocPrint(
+            alloc,
+            "external: {s} (width {d}, probed at Store.init)",
+            .{ c, emb.dim },
+        ) catch "external (description unavailable)"
+    else
+        "lexical_hash (the Store default)");
+    try j.key("embedder_kind");
+    try j.str(if (emb.cmd == null) "builtin_lexical_hash" else "external_pipe");
     try j.key("topk");
     try j.int(TOPK);
     try j.endObject();

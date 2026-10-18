@@ -175,6 +175,7 @@ fn runQueries(
     vecs: []const []f32,
     hnsw: *mem3.HNSW,
     hymem: *mem3.HyMem,
+    bm25: *mem3.BM25,
     query_count: usize,
     recall_queries: usize,
     seed: u64,
@@ -185,7 +186,11 @@ fn runQueries(
     // a retriever that hashed with one embedder and searched an index
     // built with another would be scoring two different spaces.
     const qemb = try mem3.Embedder.init(.lexical_hash, DIM);
-    var retriever = mem3.HybridRetriever.init(alloc, mem3.Config{}, qemb, hnsw, hymem);
+    // `initWithSparse`, not `init`: `init` leaves `bm25` null, which
+    // scores every cell's sparse arm at zero. That is a configuration
+    // the product never runs, and a latency benchmark that silently
+    // measured it would report a p95 for the wrong retriever.
+    var retriever = mem3.HybridRetriever.initWithSparse(alloc, mem3.Config{}, qemb, hnsw, hymem, bm25);
 
     const lat = try alloc.alloc(u64, query_count);
     defer alloc.free(lat);
@@ -310,6 +315,13 @@ pub fn run(alloc: Allocator, init: std.process.Init.Minimal) !void {
     var hymem = mem3.HyMem.init(alloc, &ids);
     defer hymem.deinit();
 
+    // The lexical arm, built over the same documents as the vectors so
+    // the retriever below sees all three arms the way the Store wires
+    // them.
+    const bm25_cfg = mem3.Config{};
+    var bm25 = mem3.BM25.init(alloc, bm25_cfg.bm25_k1, bm25_cfg.bm25_b);
+    defer bm25.deinit();
+
     const emb = try mem3.Embedder.init(.lexical_hash, DIM);
 
     // --- build (timed, but reported apart from the latency) -------------
@@ -319,6 +331,7 @@ pub fn run(alloc: Allocator, init: std.process.Init.Minimal) !void {
         defer alloc.free(v);
         vecs[i] = v;
         try hnsw.insert(@intCast(i + 1), v);
+        try bm25.index(@intCast(i + 1), text);
 
         // One associative edge per document to the previous document of
         // the same topic, so the graph arm of the fusion has real
@@ -342,7 +355,7 @@ pub fn run(alloc: Allocator, init: std.process.Init.Minimal) !void {
     const build_ms = harness.nsToMs(harness.sinceNs(build_t0));
     harness.progress("retrieval_p95: indexed {d} docs in {d:.0} ms; querying...\n", .{ n_corpus, build_ms });
 
-    var res = try runQueries(alloc, docs, vecs, &hnsw, &hymem, n_queries, n_recall_q, common.seed);
+    var res = try runQueries(alloc, docs, vecs, &hnsw, &hymem, &bm25, n_queries, n_recall_q, common.seed);
     defer res.recall_lat.deinit(alloc);
     defer res.dense_lat.deinit(alloc);
 
