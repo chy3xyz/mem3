@@ -445,7 +445,11 @@ data is ~3 KB/cell.
   a multi-threaded build (a different design; graph determinism, which the
   fingerprint tests rely on, would need re-proving).
 
-### 2. LongMemEval — 0.646 core, 0.000 padded, against a ≥80% target
+### 2. LongMemEval — 0.729 core / 0.708 padded (offline), against a ≥80% target
+
+> The 0.646 / 0.000 figures in the first table below are historical (before the
+> BM25 arm). Current numbers are in the later table. Official-dataset retrieval
+> metrics: `docs/benchmarks/longmemeval-official.md`.
 
 `./zig-out/bin/mem3-bench longmemeval` reports `met_target: false`.
 

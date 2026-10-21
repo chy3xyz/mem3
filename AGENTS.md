@@ -158,10 +158,13 @@ tests/
   is 886 → 244 µs/op and `store.addRaw_durable` 538 → 275 µs/op (A/B, 5
   interleaved rounds, `docs/roadmap.md` "1a"). The end-to-end cells/sec above
   has not been re-run.
-- LongMemEval offline reimplementation: 0.646 on the core set, 0.000 padded,
-  against a ≥80% target. `exhaustive_nn_hit_rate` is 0.604 and invariant across
-  configurations, so `lexical_hash` — not the HNSW retrieval layer — is the
-  ceiling.
+- LongMemEval offline reimplementation: 0.729 core / 0.708 padded (BM25 arm
+  active), against a ≥80% target. The old 0.646 / 0.000 figures predate the
+  lexical arm. `exhaustive_nn_hit_rate` is 0.604 and invariant across
+  configurations, but an external MiniLM embedder moved it to 0.781 without
+  moving end-to-end accuracy, so the embedder is not the binding limit either.
+  Retrieval on the official dataset (no LLM judge) is in
+  `docs/benchmarks/longmemeval-official.md`.
 
 ## Development Workflow
 

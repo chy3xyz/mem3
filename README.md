@@ -976,7 +976,7 @@ result: hoisting the per-position hash seed is provably bit-identical and
 strictly less work, and it was also slower, because it defeated inlining.
 Neither experiment changed the bit pattern; both changed the wall clock.
 
-**LongMemEval is 0.646 core / 0.000 padded, and the embedder is the ceiling.**
+**The local offline LongMemEval re-implementation reads 0.729 core / 0.708 padded (table below), and the embedder is not what limits it.** The earlier figure of 0.646 / 0.000 predates the BM25 arm. For retrieval measured on the *official* dataset, see [`docs/benchmarks/longmemeval-official.md`](docs/benchmarks/longmemeval-official.md).
 Run `./zig-out/bin/mem3-bench longmemeval`. This is an **offline
 re-implementation of the LongMemEval protocol, not the official benchmark** — a
 locally generated case set, a deterministic surface reader, no LLM judge, no
