@@ -74,6 +74,8 @@ src/
 ├── storage/                  # GHW L4: lsm_store, wal, snapshot
 ├── server/                   # HTTP daemon: http_server, routes, handlers/, middleware,
 │                             #   web_index.html
+├── eval/                     # Evaluation protocols over a Store (official LongMemEval
+│                             # retrieval metrics); not on any product code path.
 ├── utils/                    # Cross-cutting: serializer, allocator, time, logger, jsonl,
 │                             #   hashing, mod
 ├── platform/                 # The compile-time portability layer: fs, clock, stdio, env.

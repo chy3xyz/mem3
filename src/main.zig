@@ -176,6 +176,9 @@ comptime {
     _ = @import("mcp/tools.zig");
     _ = @import("mcp/server.zig");
     _ = @import("cli_commands/mcp.zig");
+    // Official LongMemEval retrieval harness: metric math, dataset parsing,
+    // corpus construction and a Store-backed fixture run.
+    _ = @import("eval/longmemeval_official.zig");
 }
 
 const log = std.log.scoped(.mem3_main);

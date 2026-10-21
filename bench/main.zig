@@ -75,6 +75,7 @@ const multihop_bench = @import("multihop.zig");
 const cold_start_bench = @import("cold_start.zig");
 const footprint_bench = @import("footprint.zig");
 const longmemeval_bench = @import("longmemeval.zig");
+const longmemeval_official_bench = @import("longmemeval_official.zig");
 
 /// Library logging stays quiet so it cannot interleave with bench output.
 pub const std_options: std.Options = .{
@@ -1006,6 +1007,13 @@ const CONSTITUTIONAL_BENCHES = [_]ConstitutionalBench{
         .file = "bench/longmemeval.zig",
         .target = ">= 80% end-to-end accuracy",
         .run = longmemeval_bench.run,
+    },
+    .{
+        .name = "longmemeval-official",
+        .alt_name = "longmemeval_official",
+        .file = "bench/longmemeval_official.zig",
+        .target = "none (retrieval-only; official dataset via --data)",
+        .run = longmemeval_official_bench.run,
     },
 };
 

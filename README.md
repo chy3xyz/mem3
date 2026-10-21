@@ -508,6 +508,13 @@ zig build bench
 ./zig-out/bin/mem3-bench --cells=1000 --queries=400 --seed=42
 ```
 
+- **LongMemEval on the official dataset (retrieval only, no LLM judge):**
+  `./zig-out/bin/mem3-bench longmemeval-official --data=PATH` reports session-
+  and turn-level Recall@k / NDCG@k by question type on the real
+  `longmemeval_s_cleaned.json`. These are *not* QA accuracies and not comparable
+  to published QA numbers; dataset hash, commands, results and limitations are
+  in [`docs/benchmarks/longmemeval-official.md`](docs/benchmarks/longmemeval-official.md).
+
 The `ef` budget bug that used to make beam search sample instead of navigate is
 fixed: the budget is now gated on candidate-set size, which is what `ef` means,
 and cannot underflow. `hnsw.search` is bounded by the `ef` budget
