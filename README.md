@@ -134,8 +134,8 @@ zig build            # binaries land in zig-out/bin/
 
 `zig build` produces `mem3` (the CLI + daemon), `mem3-bench`, `mem3-longrun`,
 `mem3-hnsw-recall`, `mem3-forgetting-eval`, `notebook`, and `loadtest`. The
-default Debug build of `mem3` is **4,569,032 bytes** and `-Doptimize=ReleaseFast`
-is **963,704 bytes**; both link only `libSystem` (both measured on this tree,
+default Debug build of `mem3` is **5,349,720 bytes** and `-Doptimize=ReleaseFast`
+is **1,259,784 bytes**; both link only `libSystem` (both measured on this tree,
 Apple M1 Pro / arm64).
 
 Artifacts:
@@ -183,7 +183,7 @@ rejected at encode time with `SpiritDimMissing`.
 ```bash
 D=/tmp/mem3-demo && mkdir -p $D
 
-# Add one cell per source: matter (物), form (象), spirit (性)
+# Add one cell per source: matter, form, spirit
 ./zig-out/bin/mem3 add --data-dir=$D --source matter \
   --episode "user asked to refactor the persistence layer" \
   --facts "user|prefers|zig" \
@@ -488,7 +488,7 @@ Four layers, each justified by a decision record in [`docs/adr/`](docs/adr/):
 - **Tri-source tag** — every cell carries `matter` / `form` / `spirit`
   (`src/core/types.zig`). The mapping and the rejected alternative naming are in
   [ADR-0001](docs/adr/0001-three-source-ontology.md); the layer mapping
-  (World↔物, Harness↔象, Goal↔性) is in [ADR-0002](docs/adr/0002-ghw-mapping.md).
+  (World↔matter, Harness↔form, Goal↔spirit) is in [ADR-0002](docs/adr/0002-ghw-mapping.md).
 - **WAL-first persistence** — writes are appended to `mem3.wal` and fsynced per
   record; a periodic snapshot compacts them. Why not RocksDB or SQLite:
   [ADR-0004](docs/adr/0004-wal-first-persistence.md).

@@ -1,7 +1,7 @@
 //! The redundancy term of `net_existence`, computed without comparing all
 //! pairs.
 //!
-//! **GHW Layer**: Memory (三源合恰). See `forgetter.zig` for how the term is
+//! **GHW Layer**: Memory (tri-source coherence). See `forgetter.zig` for how the term is
 //! used and ADR 0005 (`docs/adr/0005-existence-gain-forgetting.md`) for why it
 //! is defined this way.
 //!
@@ -12,7 +12,7 @@
 //! cells already visited are the only candidates to cover it. `d` *covers*
 //! `c` when
 //!
-//!   * they have the same source (物/象/性 are not interchangeable),
+//!   * they have the same source (matter, form and spirit are not interchangeable),
 //!   * every goal `c` is bound to, `d` is bound to,
 //!   * every foresight description of `c` is also one of `d`'s,
 //!   * every fact of `c` is also a fact of `d` (so `c` adds nothing a

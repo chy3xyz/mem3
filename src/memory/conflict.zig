@@ -1,6 +1,6 @@
 //! PCR conflict detection: find the older cells a newer cell supersedes.
 //!
-//! **GHW Layer**: Memory (三源合恰). Spec FR-015 / user story 1.4: a new fact
+//! **GHW Layer**: Memory (tri-source coherence). Spec FR-015 / user story 1.4: a new fact
 //! that contradicts an old one is stored, and the old one is marked
 //! `superseded_at` — **never deleted**. This file only *finds* the cells to
 //! mark; marking, journaling and querying live with the callers.

@@ -197,7 +197,7 @@ test "netex: unrelated cells carry no redundancy" {
 test "netex: a duplicate is only redundant when the cell above it carries everything it does" {
     var w = try World.init(testing.allocator, THETA_CFG);
     defer w.deinit();
-    // Same text, but: another source (象 vs 物), another goal, an extra fact.
+    // Same text, but: another source (form vs matter), another goal, an extra fact.
     try w.add(.{ .id = 1, .episode = EP, .importance = 0.9 });
     try w.add(.{ .id = 2, .episode = EP, .importance = 0.5, .source = .form });
     try w.add(.{ .id = 3, .episode = EP, .importance = 0.5, .goal = 77 });

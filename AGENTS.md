@@ -12,7 +12,7 @@
 | Type | Memory operating system, single-binary CLI + HTTP daemon |
 | Language | Zig 0.17.0 (released). The 0.17 point releases disagree on `@typeInfo` payload shapes and `OptimizeMode` literal names, so this is pinned rather than "dev ≥ ...". `./scripts/verify.sh` prints the toolchain it actually used. |
 | Build | `zig build` → one binary, < 10MB, zero external runtime deps |
-| Theory | 三源合恰论 (物/象/性) + GHW 范式 (Goal/Harness/World) |
+| Theory | Tri-Source Coherence Theory (matter / form / spirit) + the GHW paradigm (Goal / Harness / World) |
 | Spec-kit | Initialized; spec at `specs/001-trisource-everos-mvp/` |
 | Platforms | **macOS and Linux only** — Windows and WASM refused at compile time (see [Platforms](#platforms)) |
 | Status | **v0.1.0-alpha** (CLI + MCP + persistence + 675 tests + 12 constitution invariants, all measured). All 7 constitutional principles active. |
@@ -39,13 +39,13 @@
 
 The 7 principles (in order of importance):
 
-1. **三源完整性 (Tri-Source Integrity)** — every memory MUST have a 物/象/性 source tag. No untyped memories. Reject at encoding time.
-2. **GHW 三层耦合 (Goal-Harness-World)** — three layers, no cross-layer shortcuts. Each module declares its layer in file-level doc-comment.
-3. **存在增益驱动 (Existence-Gain-Driven Lifecycle)** — encoding/consolidation/retrieval/forgetting all driven by the existence-gain metric, not by capacity/TTL.
-4. **零依赖 + Zig 0.17 (Zero-Dependency Native)** — no FAISS, no Neo4j, no Redis, no SQLite, no libc wrappers, no external async runtime. Single binary, cross-compiled to macOS and Linux. Windows and WASM are refused at compile time with a stated reason.
-5. **零拷贝 + 编译时零开销 (Zero-Copy + Comptime Zero-Overhead)** — comptime-generated serialization, explicit allocator injection, no runtime reflection.
-6. **测试优先 + 形式化保证 (Test-First + Formal Guarantees)** — tests written BEFORE implementation. The constitution invariants (now 12) are tested on every PR as a separate gate.
-7. **可观测性 + 单二进制调试 (Observability + Single-Binary Debugging)** — structured logs, /metrics endpoint, dump/inspect commands, silent-by-default for long-running modes.
+1. **Tri-Source Integrity** — every memory MUST have a matter / form / spirit source tag. No untyped memories. Reject at encoding time.
+2. **GHW Three-Layer Coupling (Goal-Harness-World)** — three layers, no cross-layer shortcuts. Each module declares its layer in file-level doc-comment.
+3. **Existence-Gain-Driven Lifecycle** — encoding/consolidation/retrieval/forgetting all driven by the existence-gain metric, not by capacity/TTL.
+4. **Zero-Dependency Zig 0.17 Native** — no FAISS, no Neo4j, no Redis, no SQLite, no libc wrappers, no external async runtime. Single binary, cross-compiled to macOS and Linux. Windows and WASM are refused at compile time with a stated reason.
+5. **Zero-Copy + Comptime Zero-Overhead** — comptime-generated serialization, explicit allocator injection, no runtime reflection.
+6. **Test-First + Formal Guarantees** — tests written BEFORE implementation. The constitution invariants (now 12) are tested on every PR as a separate gate.
+7. **Observability + Single-Binary Debugging** — structured logs, /metrics endpoint, dump/inspect commands, silent-by-default for long-running modes.
 
 **Read `.specify/memory/constitution.md` for the full text.**
 
@@ -64,7 +64,7 @@ The 7 principles (in order of importance):
 src/
 ├── main.zig                  # Entry: CLI dispatch (add/query/goal/hyperedge/dump/inspect/
 │                             #   consolidate/forget/serve/bench/help/version)
-├── core/                     # GHW L1 基础层: types, errors, ids, config
+├── core/                     # GHW L1 foundation: types, errors, ids, config
 ├── ghw/                      # GHW L2: goal_tree, goal_node, harness_registry, world_model
 ├── memory/                   # GHW L3: tri_source_manager, lifecycle, encoder, consolidator,
 │                             #   cluster_index (incremental single-linkage state),
@@ -138,7 +138,7 @@ tests/
 | Persistence | ✅ | WAL-first + snapshot. WAL truncated on sync. `--wal-sync=always\|group\|interval:N` (default `always`, byte-identical); `interval` is weaker and documented as such. |
 | Daemon hygiene | ✅ | `serve`/`mcp` exit 0 on SIGINT/SIGTERM (`src/platform/signal.zig`: handler only stores an atomic; loops poll with a timeout). `--log-format`/`--log-every` feed `src/utils/logger.zig`; default is silent and byte-identical. JSONL goes to stderr only. |
 | Tests | ✅ | 675: 491 (`src/main.zig`-rooted) + 184 (`tests/main.zig`-rooted), plus 12 constitution invariants as a separate gate, 0 leaks |
-| Binary | ✅ | 963,704 bytes `ReleaseFast` / 4,569,032 bytes Debug, only links libSystem. The lexical arm added 49 KB ReleaseFast (+5.4%) over the 914,456 B measured before it |
+| Binary | ✅ | 1,259,784 bytes `ReleaseFast` / 5,349,720 bytes Debug (measured 2026-10-22 after the P1/P2 merges), only links libSystem. It was 963,704 bytes ReleaseFast before those merges; the lexical arm alone had added 49 KB (+5.4%) over 914,456 B |
 | Toolchain | ✅ | Pinned via `.zigversion` (Zig 0.17.0) |
 | Platforms | ✅ | macOS + Linux (x86_64 and aarch64). Windows/WASM refused at compile time — see [Platforms](#platforms) |
 
@@ -250,7 +250,7 @@ real gap, not a rounding error.
 | 3-hop traversal | < 5ms (1K seeds) | 0.000 ms/seed | pass |
 | Cold-start | < 200ms | 0.077 ms | pass |
 | RSS at 100K cells | < 500MB | Peak memory footprint (`time -l`, MiB, built-in embedder, no WAL, no consolidation, `mem3-bench footprint --cells=100000`, re-measured 2026-10-22): **551.7** with the `DebugAllocator` the binary used to ship (6 runs, all 551.7), **378.9** with `smp_allocator` (4 runs, all 378.9), 227.3 with `smp_allocator` + int8 vectors (off by default). `ru_maxrss` on this swapped host read 123–318 MB for the same runs and is not used; no quiet host was available. Daemon RSS not measured. Live-allocation floor 280 MiB f32 / 170 MiB int8 | **pass with `smp_allocator` (now used by ReleaseFast/ReleaseSmall `mem3`); was a MISS (551.7) with `DebugAllocator`** |
-| Binary size | < 10MB stripped | 963,704 bytes ReleaseFast | pass |
+| Binary size | < 10MB stripped | 1,259,784 bytes ReleaseFast (not stripped) | pass |
 | External deps (ldd) | 0 | `otool -L` lists only `libSystem` | pass |
 | LongMemEval accuracy | ≥ 80% | 0.7292 core / 0.7083 padded (offline reimplementation, BM25 sparse arm active) | **MISS** |
 
@@ -292,7 +292,7 @@ Rationale and the full sync-impact report:
 
 Located in `docs/adr/`. Read in order:
 - `0001-three-source-ontology.md` — resolves the `matter/form/spirit` vs `sensory/cognitive/action` naming conflict
-- `0002-ghw-mapping.md` — formal mapping Goal↔性, Harness↔象, World↔物
+- `0002-ghw-mapping.md` — formal mapping Goal↔spirit, Harness↔form, World↔matter
 - `0003-hnsw-from-scratch.md` — why we don't use FAISS
 - `0004-wal-first-persistence.md` — why we don't use RocksDB
 - `0005-existence-gain-forgetting.md` — what redundancy and conflict_score *are*, supersession, snapshot v3, measured cost and false-positive rate

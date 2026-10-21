@@ -8,8 +8,8 @@
 > first run; if one has to, the old definition stays in this file and the new one
 > is added as a post-hoc variant.
 
-**Why this exists.** mem3's differentiator is its theory (三源合恰论: every
-memory is 物/象/性-tagged; GHW: Goal–Harness–World layers; existence-gain
+**Why this exists.** mem3's differentiator is its theory (Tri-Source Coherence Theory: every
+memory is matter/form/spirit-tagged; GHW: Goal–Harness–World layers; existence-gain
 driven lifecycle). Until now nothing measured whether any of it changes what a
 query returns. The official LongMemEval retrieval harness
 (`docs/benchmarks/longmemeval-official.md`) gives a fixed, externally defined
@@ -131,16 +131,16 @@ a harness-defined **lexical stand-in for an LLM source tagger**. It is fixed now
 On the lower-cased text of a document (a turn, or a whole session at session
 granularity), first rule that fires wins:
 
-1. **性 spirit** (intent / goal / preference / plan): contains any of
+1. **spirit** (intent / goal / preference / plan): contains any of
    `i want`, `i'd like`, `i would like`, `i plan`, `planning to`, `i hope`,
    `i wish`, `my goal`, `i need to`, `going to`, `i prefer`, `my favorite`,
    `my favourite`, `i love`, `i like`, `i enjoy`, `looking for`, `i'm interested`,
    `i am interested`, `i intend`, `thinking of`, `thinking about`, `next week`,
    `next month`, `tomorrow`.
-2. **象 form** (procedure / structure / rule): contains any of `how to`, `step by step`,
+2. **form** (procedure / structure / rule): contains any of `how to`, `step by step`,
    `steps`, `recipe`, `always`, `usually`, `routine`, `every day`, `every week`,
    `instructions`, `tutorial`, `template`, `algorithm`, `function`, `script`.
-3. **物 matter**: otherwise.
+3. **matter**: otherwise.
 
 This is deliberately crude. It tests *this tagger*, not the best conceivable one;
 that limitation is carried into the verdicts (§8).
@@ -158,25 +158,25 @@ relevance 0.5, default weights.
 
 | Id | Definition |
 |---|---|
-| **A** | current default (all 物, goal 1 @ 0.5) |
+| **A** | current default (all matter, goal 1 @ 0.5) |
 | **B** | tags from §3.1 |
-| **C_form**, **C_spirit** | every cell tagged 象 / 性 (A is the all-物 member of this family) |
+| **C_form**, **C_spirit** | every cell tagged form / spirit (A is the all-matter member of this family) |
 | **D_s1…D_s5** | B's tags shuffled, seeds 1–5 |
-| **E_filter** (tags B) | router = §3.1 heuristic applied to the **question text** (default 物). Stable partition of the full ranking: cells whose source equals the prediction first, the rest after, each in original order (no recall is lost; the whole corpus is still ranked). |
+| **E_filter** (tags B) | router = §3.1 heuristic applied to the **question text** (default matter). Stable partition of the full ranking: cells whose source equals the prediction first, the rest after, each in original order (no recall is lost; the whole corpus is still ranked). |
 | **E_boost** (tags B) | same router; `final_score ×= 1.25` for cells whose source equals the prediction, re-sorted stably |
 | **E_filter_rand**, **E_boost_rand** | the same routers on D\_s1…s5 tags (control: routing with no tag signal) |
 | **F_on** | **goal per session.** One goal per haystack session: name `g<session index>`, description = that session's 12 most frequent content words (lower-case alphabetic, length ≥ 4, a fixed stop-word list, ties broken alphabetically). Every cell is bound to **its own session's goal at relevance 1.0** (the mechanism's maximum strength: if there is no gain at 1.0 there is none below it). Uses only haystack text — **no labels, no `has_answer`, no question type**. The query is routed to a goal by the product's own `ghw.retrieve`. |
 | **F_off** | identical store to F_on, `goal_bonus_weight = 0` (isolates the rerank from the presence of goals; expected bit-identical to A) |
 | **G_flat** | A with `existence_bonus_weight = 0` (sanity; expected identical to A) |
 | **R_off** | A with `recency_bonus_weight = 0` (sanity; expected identical to A) |
-| **G_heur_on** | B tags; every cell the heuristic calls 性 also carries one foresight entry (`"intent"`, valid until now+365 d, confidence 0.8), so the product's own encoder gives it `existential = 1.0` instead of 0.2 → higher `importance_score` |
+| **G_heur_on** | B tags; every cell the heuristic calls spirit also carries one foresight entry (`"intent"`, valid until now+365 d, confidence 0.8), so the product's own encoder gives it `existential = 1.0` instead of 0.2 → higher `importance_score` |
 | **G_heur_off** | identical ingest, `existence_bonus_weight = 0` |
 | **H_off** | A with `λ_graph = 0` on both live weight copies (`hybrid.cfg`, `lc.cfg`); dense/sparse weights unchanged (the ranking is invariant to the common scale) |
 | **H_edges** (turn only) | A plus one `associative` hyperedge per session over that session's ingested turns (confidence 1.0). Natural structure, no labels. Not defined at session granularity (the document *is* the session). |
 | **I_dense**, **I_bm25** | the existing `--arm` references |
 | **J_A** | A, plus **simulated ages**: after ingestion every cell's `created_at` is set to `t_ref − (question_date − session_date)` from `haystack_dates` / `question_date` (unparseable → age 0, counted), so `exp(-λ·age)` is real |
 | **J_B** | J_A with B tags (per-source decay now differs: 0.05 / 0.03 / 0.01 per day) |
-| **J_C_spirit** | J_A with every cell 性 (slowest decay) |
+| **J_C_spirit** | J_A with every cell spirit (slowest decay) |
 | **J_D_s1…s5** | J_A with D tags |
 
 ### 3.3 Reporting rules
@@ -637,9 +637,9 @@ confirms the inventory: the tag only reaches ranking through the recency
 factor, and the factor is the same for every cell when all cells are
 microseconds old. P1 held.
 
-**Routing (E).** The heuristic tagger labels 61 % of session documents 性
-(12,070 of 19,875; 29 % 物, 10 % 象; turn level: 57 % 物, 33 % 性, 10 % 象)
-while the router predicts 物 for 383 of 419 questions (14 象, 22 性). A hard
+**Routing (E).** The heuristic tagger labels 61 % of session documents spirit
+(12,070 of 19,875; 29 % matter, 10 % form; turn level: 57 % matter, 33 % spirit, 10 % form)
+while the router predicts matter for 383 of 419 questions (14 form, 22 spirit). A hard
 partition therefore pushes most answer-bearing sessions below non-answer ones:
 NDCG@10 falls from 0.853 to 0.099 at session level. The boost variant is
 gentler but still negative. The more informative comparison is against the
@@ -662,7 +662,7 @@ most favourable derivation I could define without labels; a goal derivation
 that used the answer would be circular.
 
 **Importance (G).** The one nominal gain, +0.0046 at session level, comes from
-giving documents the heuristic calls 性 an unexpired foresight (existential
+giving documents the heuristic calls spirit an unexpired foresight (existential
 term 0.2 → 1.0), i.e. a prior toward documents containing first-person intent
 phrases. It does not replicate at turn level (−0.0010) or on the derived
 metric (+0.0002), it fails the Bonferroni correction, and it needs a
@@ -764,7 +764,7 @@ Sketch only, not built; every item needs a gold label that LongMemEval lacks.
   active goal. Metric: R_any@k vs the same store with goal bonus off, paired
   per query. Control: queries with the wrong goal scope must *lose* accuracy.
 * **Source-conditioned recall.** Questions that are explicitly "what happened"
-  (物), "how do I" (象), "what do I want" (性), with independently labelled
+  (matter), "how do I" (form), "what do I want" (spirit), with independently labelled
   gold sources and an unbalanced mix. Control: shuffled tags (D), as here.
 * **Existence-gain forgetting under pressure.** A stream longer than a fixed
   capacity, followed by queries about items of known value; compare recall of
@@ -783,7 +783,7 @@ should win**; they check wiring end to end, not usefulness on real data.
 | Check | Setup | Without | With | Chance |
 |---|---|---|---|---|
 | Goal-conditioned | 8 goals × 12 cells; the target phrase is identical across goals; the query names the goal | goal bonus off: **1/8** top-1 | goal bonus on: **8/8** | 1/8 |
-| Source-routed | 10 topics × 3 cells with identical text and tags 物/象/性; the query carries an intent marker | no router: **2/10** top-1 | router on: **10/10** | ≈ 1/3 |
+| Source-routed | 10 topics × 3 cells with identical text and tags matter/form/spirit; the query carries an intent marker | no router: **2/10** top-1 | router on: **10/10** | ≈ 1/3 |
 
 So the goal bonus and the tag do what they are coded to do. The real-data
 runs show that doing it does not help LongMemEval. One by-product: queried at

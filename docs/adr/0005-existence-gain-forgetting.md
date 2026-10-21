@@ -28,7 +28,7 @@ a group is never forgotten whole**, even when similarity is not transitive.
 
 `d` *covers* `c` iff all of:
 
-- same `source` (物/象/性 are not interchangeable);
+- same `source` (matter, form and spirit are not interchangeable);
 - every goal `c` is bound to, `d` is bound to;
 - every foresight description of `c` is also one of `d`'s;
 - every fact of `c` is also a fact of `d` (normalised: trimmed, ASCII
@@ -247,7 +247,7 @@ the whole cost there.
   exists, there is no CLI/HTTP/MCP route.
 - **No delete path.** See deviation 1.
 - **No snapshot downgrade path** (see §5).
-- **No cross-source redundancy** (a 物 cell never covers a 象 cell).
+- **No cross-source redundancy** (a matter cell never covers a form cell).
 - **Consolidation abstracts** carry no `atomic_facts`, so they take no part in
   conflicts, and they are not duplicates of their sources (different text).
 
