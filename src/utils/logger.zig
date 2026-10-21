@@ -157,12 +157,13 @@ test "writeJsonlLine: escapes special characters" {
 
 const platform_fs = @import("../platform/fs.zig");
 
-const Scratch = struct {
+/// Scratch file for tests that read log lines back. Never used outside `test`.
+pub const Scratch = struct {
     path: [96]u8 = undefined,
     path_len: usize = 0,
     fd: c_int = -1,
 
-    fn open(label: []const u8) !Scratch {
+    pub fn open(label: []const u8) !Scratch {
         var s = Scratch{};
         const pid: u64 = @intCast(std.c.getpid());
         const p = try std.fmt.bufPrint(&s.path, "/tmp/mem3_logger_{d}_{s}\x00", .{ pid, label });
@@ -173,14 +174,14 @@ const Scratch = struct {
         return s;
     }
 
-    fn close(self: *Scratch) void {
+    pub fn close(self: *Scratch) void {
         platform_fs.close(self.fd);
         const z: [*:0]const u8 = @ptrCast(&self.path);
         platform_fs.unlink(z) catch {};
     }
 
     /// Everything written so far. Caller frees.
-    fn contents(self: *Scratch, alloc: std.mem.Allocator) ![]u8 {
+    pub fn contents(self: *Scratch, alloc: std.mem.Allocator) ![]u8 {
         const size: usize = @intCast(try platform_fs.sizeOf(self.fd));
         const buf = try alloc.alloc(u8, size);
         errdefer alloc.free(buf);
