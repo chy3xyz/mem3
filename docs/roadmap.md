@@ -514,11 +514,12 @@ raw text. See `scripts/embedder_adapter_example.py`.
   `mach_absolute_time` — and all four still fold. The remaining approach is a
   per-architecture non-foldable cycle counter through inline asm (`rdtsc` /
   `cntvct_el0`), which is **not written**. Update 2026-10-21: a Linux
-  container is available after all (OrbStack), and in it the fold did **not**
-  reproduce on aarch64 — `zig build test -Doptimize=ReleaseFast` passed 551/551
-  there, while the same command on macOS arm64 fails exactly the Timer test
-  (550/551). So the defect is at least macOS-specific as measured; Linux x86_64
-  is unmeasured. CI runs the ReleaseFast test step as `continue-on-error` for
+  container is available after all (OrbStack). The defect is not macOS-only:
+  on Linux aarch64 the Timer test alone fails 186/300 runs in ReleaseFast and
+  0/300 in Debug (so a full-suite ReleaseFast run there passes or fails at
+  random — it passed twice and failed once), and on macOS arm64 it fails every
+  time. Linux x86_64 was only measured under Rosetta (0/300), which is not a
+  native result. CI runs the ReleaseFast test step as `continue-on-error` for
   this reason. Until then, treat min/tail-percentile latencies as unreliable and
   report p50.
 - **Snapshot restore now rebuilds the vector index** (fixed 2026-10-15).

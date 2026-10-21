@@ -185,7 +185,7 @@ tests/
    - `build-and-test`, matrix `ubuntu-latest` (x86_64) / `ubuntu-24.04-arm` (aarch64) / `macos-latest` (arm64), `fail-fast: false`:
      - `zig build`, `zig build test`, `zig build check-constitution` (must be green)
      - `scripts/check_linked_libs.sh` — Linux `ldd` allow-list / macOS `otool -L` allow-list (Constitution IV), self-test first, every installed executable, plus a `linkSystemLibrary` grep on `build.zig`
-     - `zig build test -Doptimize=ReleaseFast` as a `continue-on-error` step: the known `platform.clock.Timer` fold (README "Known misses", `docs/roadmap.md`) fails it on macOS arm64; failures are surfaced as annotations and in the job summary, not hidden
+     - `zig build test -Doptimize=ReleaseFast` as a `continue-on-error` step: the known `platform.clock.Timer` fold (README "Known misses", `docs/roadmap.md`) fails it on macOS arm64 (always) and Linux aarch64 (intermittently); failures are surfaced as annotations and in the job summary, not hidden
      - `zig build bench` as a **smoke step only** — machine-dependent, `continue-on-error`, never a gate
      - Assert the working tree is clean after tests (catches tests writing into the repo)
      - Inject a failing test and assert `zig build test` goes non-zero — the permanent guard against a gate that cannot fail

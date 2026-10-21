@@ -141,8 +141,10 @@ jobs:
       # a gate.
       #
       # Measured locally (not on a runner): macOS arm64 fails exactly this one
-      # test (550/551); Linux aarch64 in a container passes 551/551 — the fold
-      # is not universal, so Linux x86_64 on a real runner may go either way.
+      # test (550/551) every time. Linux aarch64 (container) is intermittent:
+      # 186/300 runs of the test alone failed in ReleaseFast, 0/300 in Debug;
+      # full-suite runs of it passed twice and failed once. Linux x86_64 under
+      # Rosetta: 0/300 (not a native measurement).
       - name: 'zig build test -Doptimize=ReleaseFast (known failure: Timer, docs/roadmap.md)'
         continue-on-error: true
         run: |

@@ -801,7 +801,9 @@ the official Zig 0.17.0 tarball, sha256-checked):
 - `build-and-test` steps, in order, on macOS arm64 (fresh clone) and on Linux
   aarch64 (container): everything passed except the two expected items — the
   ReleaseFast test step (macOS: 550/551, only `Timer measures a non-zero,
-  monotonic duration`; **Linux aarch64: 551/551, the fold did not reproduce**) and
+  monotonic duration`, every time; **Linux aarch64: intermittent** — 3 full runs,
+  Timer passed twice and failed once; alone, 186/300 ReleaseFast runs fail, 0/300
+  Debug) and
   the Linux `zig build test` race below. The gate-can-go-red guard went red on
   both. `python3 scripts/mcp_conformance.py` passes on macOS and, on Linux, passed
 56/56 (aarch64, first run), 56/56 (x86_64 cross-build under Rosetta) and 5/5 reruns;
@@ -821,6 +823,27 @@ next run was 56/56). On Linux the failing check of that one 55/56 run was not ca
   12/12 on `tests/main.zig` and the constitution root after the fix below;
   `src/main.zig` 428 passed / 3 skipped (the pinned HNSW fingerprint tests skip by
   design) with the embedder race failing intermittently.
+
+The Linux runs, reproducibly (aarch64; swap `arm64`/`aarch64` for x86_64 only
+for the cross-built variant, since Zig itself cannot start under Rosetta):
+
+```bash
+# Zig 0.17.0 tarball from https://ziglang.org/download/index.json, sha256-checked, unpacked to $ZIG_DIR
+git clone . /tmp/ci-clone
+docker run --rm --platform linux/arm64 -v $ZIG_DIR:/zig:ro -v /tmp/ci-clone:/repo ubuntu:24.04 bash -c '
+  export PATH=/zig:$PATH; git clone -q /repo /src && cd /src
+  zig build && ./scripts/check_linked_libs.sh --self-test && ./scripts/check_linked_libs.sh zig-out/bin/mem3
+  zig build test; zig build check-constitution; zig build test -Doptimize=ReleaseFast'
+# x86_64: cross-build on the host, run under Rosetta
+zig build -Dtarget=x86_64-linux-gnu --prefix work/zig-out
+zig test -target x86_64-linux-gnu --test-no-exec -femit-bin=work/t --dep mem3 -Mroot=src/main.zig -lc -Mmem3=src/lib.zig -lc
+docker run --rm --platform linux/amd64 -v $PWD/work:/work ubuntu:24.04 /work/t
+```
+
+Final run on the merged tree (2026-10-22): Linux aarch64 `zig build` ok, linked-libs
+ok, `zig build test` 550/551 (embedder race), `check-constitution` 12/12,
+ReleaseFast 549/551 (Timer + embedder race), bench ok, tree clean, red guard
+works, `mcp_conformance` 56/56.
 
 **Written but not run anywhere:** the GitHub-hosted runners themselves
 (`ubuntu-24.04-arm`, `macos-latest`), `mlugg/setup-zig@v2` and its cache, the
@@ -1015,9 +1038,10 @@ x86_64, `cntvct_el0` on aarch64 — read through inline `asm volatile` with an
 output operand, which LLVM cannot fold by construction. That is a real change to
 the platform layer that every benchmark depends on, and **it has not been
 written**. A Linux container turned out to be available (see "Continuous
-integration"), and in it the fold did not reproduce on aarch64
-(`-Doptimize=ReleaseFast` test run: 551/551, versus 550/551 on macOS arm64);
-Linux x86_64 is unmeasured. Shipping an unverified timing primitive would still
+integration"), and in it the fold also shows up on Linux aarch64, but only
+intermittently (the Timer test alone fails 186/300 runs in ReleaseFast and 0/300
+in Debug; macOS arm64 fails every time). Linux x86_64 was measured only under
+Rosetta (0/300), which is not a native result. Shipping an unverified timing primitive would still
 be worse than the bug, because it would fail silently in the same way.
 
 **Write throughput meets its amended target; the old 10,000 figure did not.**
