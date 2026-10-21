@@ -35,6 +35,18 @@
 //!                    Default 0 = off here, so an --ef sweep is a fixed budget
 //!                    (the library default is 64)
 //!   --latency        also time the searches (mean / worst batch of 10, ms/query)
+//!   --threads N      build with HNSW.insertBatch on N threads (default 1 = the
+//!                    sequential insert loop). N > 1 is not graph-reproducible
+//!   --build-quant    build with int8 distances, keep f32 vectors (insertBatch)
+//!   --rescore F      also report recall with exact f32 re-ranking of the index's
+//!                    top k*F: the index is asked for k*F, those candidates are
+//!                    re-scored against the *exact* corpus vectors (what a store
+//!                    that can re-embed a cell would do) and the best k kept.
+//!                    Meaningful with --int8, whose index has no f32 to re-rank with
+//!   --hnsw-seed N    level-assignment seed (default: Config's). Different seeds
+//!                    build different graphs: the spread between them is the
+//!                    noise floor any "same recall" claim has to be read against
+//!   --seed-nodes N   nodes linked one at a time before going parallel (1000)
 
 const std = @import("std");
 const mem3 = @import("mem3");
@@ -63,7 +75,79 @@ const Options = struct {
     int8: bool = false,
     adaptive: u16 = 0,
     latency: bool = false,
+    threads: usize = 1,
+    build_quant: bool = false,
+    seed_nodes: usize = 1000,
+    hnsw_seed: ?u64 = null,
+    rescore: usize = 0,
 };
+
+/// Recall@k when the index's top `k * factor` are re-ranked by exact cosine
+/// against the corpus vectors. Same queries and ground truth as
+/// `recallAgainst`, so the two numbers differ only by the re-rank.
+fn recallRescored(
+    hnsw: *hnsw_mod.HNSW,
+    alloc: std.mem.Allocator,
+    corpus: []const f32,
+    spec: hnsw_mod.OracleSpec,
+    factor: usize,
+) !f32 {
+    const dim: usize = spec.dim;
+    const qv = try alloc.alloc(f32, dim);
+    defer alloc.free(qv);
+    const noise = try alloc.alloc(f32, dim);
+    defer alloc.free(noise);
+    var hits: usize = 0;
+    var q: usize = 0;
+    while (q < spec.queries) : (q += 1) {
+        hnsw_mod.oracleQueryN(qv, noise, corpus, q, spec.n, dim);
+        const truth = try hnsw_mod.oracleTruthN(alloc, corpus, qv, spec.k, spec.n, dim);
+        defer alloc.free(truth);
+        const got = try hnsw.search(alloc, qv, spec.k * factor);
+        defer alloc.free(got);
+        // Exact cosine of every candidate, then keep the best k.
+        for (got) |*g| {
+            const v = corpus[(g.id - 1) * dim ..][0..dim];
+            var dot: f32 = 0;
+            var nv: f32 = 0;
+            var nq: f32 = 0;
+            for (v, qv) |a, b| {
+                dot += a * b;
+                nv += a * a;
+                nq += b * b;
+            }
+            g.score = dot / (@sqrt(nv) * @sqrt(nq));
+        }
+        std.mem.sort(hnsw_mod.HNSW.SearchResult, got, {}, struct {
+            fn lt(_: void, a: hnsw_mod.HNSW.SearchResult, b: hnsw_mod.HNSW.SearchResult) bool {
+                return a.score > b.score;
+            }
+        }.lt);
+        for (got[0..@min(spec.k, got.len)]) |g| {
+            for (truth) |t| {
+                if (g.id == t) {
+                    hits += 1;
+                    break;
+                }
+            }
+        }
+    }
+    return @as(f32, @floatFromInt(hits)) / @as(f32, @floatFromInt(spec.queries * spec.k));
+}
+
+var rescore_factor: usize = 0;
+
+/// Set once in `main`, read by `fill`.
+var batch_opts: hnsw_mod.BatchOptions = .{};
+
+/// Build the corpus into `hnsw`: the sequential insert loop, or
+/// `insertBatch` when `--threads`/`--build-quant` asked for it.
+fn fill(hnsw: *hnsw_mod.HNSW, corpus: []const f32, n: usize, dim: usize) !void {
+    if (batch_opts.threads > 1 or batch_opts.build_quant) {
+        return hnsw_mod.oracleFillBatch(hnsw, corpus, n, dim, batch_opts);
+    }
+    return hnsw_mod.oracleFillN(hnsw, corpus, n, dim);
+}
 
 fn parseU16(s: []const u8) u16 {
     return std.fmt.parseInt(u16, s, 10) catch 0;
@@ -79,6 +163,7 @@ fn applyOverrides(cfg: *mem3.Config, o: Options) void {
     if (o.efc) |v| cfg.hnsw_ef_construction = v;
     if (o.int8) cfg.hnsw_vector_storage = .int8;
     cfg.hnsw_ef_search_divisor = o.adaptive;
+    if (o.hnsw_seed) |v| cfg.hnsw_seed = v;
 }
 
 /// One corpus at one width: build, sweep `efs`, report recall, the layer-0
@@ -118,7 +203,7 @@ fn report(
     defer hnsw.deinit();
     const corpus = try hnsw_mod.oracleCorpusN(alloc, spec.n, spec.dim);
     defer alloc.free(corpus);
-    try hnsw_mod.oracleFillN(&hnsw, corpus, spec.n, spec.dim);
+    try fill(&hnsw, corpus, spec.n, spec.dim);
     const t1 = mem3.platform.clock.monotonicNs();
     const build_ns: i128 = t1 - t0;
 
@@ -138,7 +223,12 @@ fn report(
         cfg.hnsw_ef_search = ef;
         hnsw.cfg.hnsw_ef_search = ef;
         const r = try hnsw_mod.recallAgainst(&hnsw, alloc, corpus, spec);
-        out("  {d:>3}   {d:.4}\n", .{ ef, r });
+        if (rescore_factor > 0) {
+            const rr = try recallRescored(&hnsw, alloc, corpus, spec, rescore_factor);
+            out("  {d:>3}   {d:.4}   rescored x{d}: {d:.4}\n", .{ ef, r, rescore_factor, rr });
+        } else {
+            out("  {d:>3}   {d:.4}\n", .{ ef, r });
+        }
         if (latency) try timeSearches(&hnsw, alloc, corpus, spec);
     }
     if (measure_time and build_ns != 0) {
@@ -199,7 +289,7 @@ fn timeBuild(
     defer hnsw.deinit();
     const corpus = try hnsw_mod.oracleCorpusN(alloc, spec.n, spec.dim);
     defer alloc.free(corpus);
-    try hnsw_mod.oracleFillN(&hnsw, corpus, spec.n, spec.dim);
+    try fill(&hnsw, corpus, spec.n, spec.dim);
     const t1 = mem3.platform.clock.monotonicNs();
     out("    (build {d} nodes -> {d})\n", .{ hnsw.count, hnsw.maxOccupiedLevel() });
     return t1 - t0;
@@ -314,6 +404,16 @@ pub fn main(init: std.process.Init.Minimal) !void {
             o.latency = true;
         } else if (std.mem.eql(u8, a, "--int8")) {
             o.int8 = true;
+        } else if (std.mem.eql(u8, a, "--threads")) {
+            o.threads = parseUsize(args.next() orelse "1");
+        } else if (std.mem.eql(u8, a, "--rescore")) {
+            o.rescore = parseUsize(args.next() orelse "0");
+        } else if (std.mem.eql(u8, a, "--hnsw-seed")) {
+            o.hnsw_seed = std.fmt.parseInt(u64, args.next() orelse "0", 0) catch null;
+        } else if (std.mem.eql(u8, a, "--seed-nodes")) {
+            o.seed_nodes = parseUsize(args.next() orelse "1000");
+        } else if (std.mem.eql(u8, a, "--build-quant")) {
+            o.build_quant = true;
         } else if (std.mem.eql(u8, a, "--build-only")) {
             o.build_only = true;
         }
@@ -321,6 +421,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
     var cfg = mem3.Config{};
     applyOverrides(&cfg, o);
+    rescore_factor = o.rescore;
+    batch_opts = .{ .threads = o.threads, .seed_nodes = o.seed_nodes, .build_quant = o.build_quant };
 
     if (!o.scale_only) try report1(alloc, cfg, o);
     if (!o.scale_off) try report2(alloc, cfg, o);

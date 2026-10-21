@@ -229,6 +229,112 @@ pub const Node = struct {
     }
 };
 
+/// A scored node id, as carried by the search frontier and the bounded
+/// result set. Declared at container scope because Zig has no nested
+/// functions or local type declarations.
+const Cand = struct { id: u64, score: f32 };
+
+/// A neighbour that passed the visited check and is waiting to be scored.
+const Pending = struct { id: u64, idx: u32 };
+
+/// Everything a beam search or a pruning pass writes while it runs.
+///
+/// These used to be a dozen `scratch_*` fields on `HNSW`, which made the
+/// index single-threaded by construction: two searches could not run at
+/// once because both wrote the same frontier. Grouping them lets a
+/// parallel build hand each worker a private set while the single-threaded
+/// paths keep reusing `HNSW.sc` exactly as before.
+const Scratch = struct {
+    /// Reusable beam containers. `searchLayer` runs four times per insert
+    /// and each call used to allocate and free its frontier, its result
+    /// set and its output slice.
+    frontier: std.ArrayList(Cand) = .empty,
+    results: std.ArrayList(Cand) = .empty,
+    out: std.ArrayList(u64) = .empty,
+    /// Neighbours to score for the node currently being expanded: collected
+    /// first so their vectors can be prefetched while the earlier ones are
+    /// being scored.
+    pending: std.ArrayList(Pending) = .empty,
+    /// A copy of one adjacency list, taken under the node's lock so a
+    /// concurrent writer cannot reallocate it mid-read. Unused (and never
+    /// touched) when no lock is held.
+    nbrs: std.ArrayList(u64) = .empty,
+    /// Working buffers of `shrinkConnections`.
+    cands: std.ArrayList(Cand) = .empty,
+    kept: std.ArrayList(u64) = .empty,
+    /// The quantised form of the vector being inserted or searched.
+    q8: std.ArrayList(i8) = .empty,
+    /// This scratch's own "seen" stamps. Empty for `HNSW.sc`, which uses
+    /// `HNSW.visit_stamp` so the single-threaded layout is unchanged.
+    stamps: std.ArrayList(u32) = .empty,
+    /// Generation counter for the stamps, bumped per `searchLayer`.
+    /// Wraps at 2^32 calls and clears the array on the wrap.
+    gen: u32 = 0,
+
+    fn deinit(self: *Scratch, alloc: Allocator) void {
+        self.frontier.deinit(alloc);
+        self.results.deinit(alloc);
+        self.out.deinit(alloc);
+        self.pending.deinit(alloc);
+        self.nbrs.deinit(alloc);
+        self.cands.deinit(alloc);
+        self.kept.deinit(alloc);
+        self.q8.deinit(alloc);
+        self.stamps.deinit(alloc);
+    }
+};
+
+/// A fixed set of libc mutexes, one chosen per node by its dense index.
+///
+/// Zig 0.17 has no `std.Thread.Mutex`, and `std.Io.Mutex` needs an `Io`;
+/// `src/server/http_server.zig` makes the same choice for the same reason
+/// and uses a plain `pthread_mutex_t`. Striping rather than one mutex per
+/// node keeps the table at a few KB instead of 64 bytes per node. Two nodes
+/// that share a stripe only contend, they cannot deadlock, because no code
+/// path holds one node's lock while taking another's.
+const StripedLocks = struct {
+    const stripes: usize = 4096;
+    mu: []std.c.pthread_mutex_t,
+
+    fn init(alloc: Allocator) !StripedLocks {
+        const mu = try alloc.alloc(std.c.pthread_mutex_t, stripes);
+        for (mu) |*m| m.* = std.c.PTHREAD_MUTEX_INITIALIZER;
+        return .{ .mu = mu };
+    }
+
+    fn deinit(self: *StripedLocks, alloc: Allocator) void {
+        for (self.mu) |*m| _ = std.c.pthread_mutex_destroy(m);
+        alloc.free(self.mu);
+    }
+
+    fn lock(self: *StripedLocks, idx: u32) void {
+        _ = std.c.pthread_mutex_lock(&self.mu[idx % stripes]);
+    }
+
+    fn unlock(self: *StripedLocks, idx: u32) void {
+        _ = std.c.pthread_mutex_unlock(&self.mu[idx % stripes]);
+    }
+};
+
+/// Knobs of `HNSW.insertBatch`. The defaults reproduce `insert` in a loop.
+pub const BatchOptions = struct {
+    /// Worker threads linking nodes concurrently. 1 (or 0) runs everything
+    /// on the calling thread, with no locks. More than 1 requires the
+    /// index's allocator to be thread-safe (`DebugAllocator` with
+    /// `thread_safe = true`, `smp_allocator`, `page_allocator`,
+    /// `std.testing.allocator`): link lists grow from worker threads.
+    threads: usize = 1,
+    /// The first this-many nodes of the index (counting nodes already in
+    /// it) are linked one at a time on the calling thread. A young graph
+    /// has few places to attach, so concurrent inserts into it cannot see
+    /// each other's nodes and the early topology suffers; later the
+    /// inserts in flight are a vanishing fraction of the graph.
+    seed_nodes: usize = 1000,
+    /// Build with int8 distances while keeping f32 vectors. See `bq`.
+    /// Ignored when the index stores int8 vectors, which already does.
+    build_quant: bool = false,
+};
+
 pub const HNSW = struct {
     alloc: Allocator,
     cfg: Config,
@@ -260,8 +366,9 @@ pub const HNSW = struct {
     /// code — the "hierarchical" graph was flat.
     prng: std.Random.DefaultPrng,
 
-    /// `visit_stamp[i]` equals `visit_gen` while node `i` has been seen in
-    /// the beam search currently running.
+    /// `visit_stamp[i]` equals the current `Scratch.gen` of `HNSW.sc` while
+    /// node `i` has been seen in the beam search currently running. (A
+    /// parallel build's workers keep stamps of their own, in `Scratch.stamps`.)
     ///
     /// This replaces an `AutoHashMap(u64, void)` that `searchLayer` built
     /// and tore down on every call. One insert runs `searchLayer` four
@@ -277,9 +384,6 @@ pub const HNSW = struct {
     /// lookup happened anyway on the next line, so nothing is added — a
     /// hash *insert* per marked node is simply gone.
     visit_stamp: std.ArrayList(u32) = .empty,
-    /// Generation counter for `visit_stamp`, bumped per `searchLayer`.
-    /// Wraps at 2^32 calls and clears the array on the wrap.
-    visit_gen: u32 = 0,
 
     /// Contiguous-id fast path for `nodeFor`.
     ///
@@ -334,23 +438,25 @@ pub const HNSW = struct {
     vec_stride: usize = 0,
     /// `cfg.hnsw_vector_storage == .int8`, fixed at `init`.
     int8: bool = false,
-    /// The quantised form of the vector being inserted or searched.
-    scratch_q8: std.ArrayList(i8) = .empty,
 
-    /// Neighbours to score for the node currently being expanded: collected
-    /// first so their vectors can be prefetched while the earlier ones are
-    /// being scored.
-    scratch_pending: std.ArrayList(Pending) = .empty,
-    /// Working buffers of `shrinkConnections`.
-    scratch_cands: std.ArrayList(Cand) = .empty,
-    scratch_kept: std.ArrayList(u64) = .empty,
+    /// The scratch the single-threaded paths (`insert`, `search`) work in.
+    /// A parallel `insertBatch` gives every worker its own `Scratch`, so
+    /// nothing a beam search writes is shared between threads.
+    sc: Scratch = .{},
 
-    /// Reusable beam containers. `searchLayer` runs four times per insert
-    /// and each call used to allocate and free its frontier, its result
-    /// set and its output slice.
-    scratch_frontier: std.ArrayList(Cand) = .empty,
-    scratch_results: std.ArrayList(Cand) = .empty,
-    scratch_out: std.ArrayList(u64) = .empty,
+    /// Construction-only int8 view (`BatchOptions.build_quant`): the
+    /// quantised form of *every* node, flat `dim` bytes per dense index,
+    /// and its integer norms. Empty except for the duration of an
+    /// `insertBatch` that asked for it; while set, the beam searches and
+    /// the pruning heuristic of the *build* score with it. The stored f32
+    /// vectors, and every query after the build, are unaffected.
+    bq: []i8 = &.{},
+    bq_norms: []f32 = &.{},
+
+    /// Striped node locks, set only while worker threads are inside the
+    /// graph. Null on every single-threaded path, where a lock would be
+    /// pure overhead.
+    locks: ?*StripedLocks = null,
 
     pub fn init(alloc: Allocator, cfg: Config, dim: u16) HNSW {
         // About 1 MiB per chunk, at least one vector, a power of two so the
@@ -383,15 +489,9 @@ pub const HNSW = struct {
         self.vec_chunks.deinit(self.alloc);
         self.by_idx.deinit(self.alloc);
         self.norms.deinit(self.alloc);
-        self.scratch_pending.deinit(self.alloc);
-        self.scratch_cands.deinit(self.alloc);
-        self.scratch_q8.deinit(self.alloc);
-        self.scratch_kept.deinit(self.alloc);
+        self.sc.deinit(self.alloc);
         self.visit_stamp.deinit(self.alloc);
         self.dense.deinit(self.alloc);
-        self.scratch_frontier.deinit(self.alloc);
-        self.scratch_results.deinit(self.alloc);
-        self.scratch_out.deinit(self.alloc);
     }
 
     /// Resolve an id to its dense index: an array read when the
@@ -437,15 +537,16 @@ pub const HNSW = struct {
         return std.mem.bytesAsSlice(i8, self.vectorBytes(idx));
     }
 
-    /// Prepare `v` for scoring against this index: its norm, and in int8
-    /// mode its quantised form (held in `scratch_q8`, valid until the next
-    /// `prepare`).
-    fn prepare(self: *HNSW, v: []const f32) !Query {
+    /// Prepare `v` for scoring against this index: its norm, and when the
+    /// scoring is int8 (int8 storage, or a `build_quant` build in progress)
+    /// its quantised form, held in `sc.q8` and valid until the next
+    /// `prepare` on the same scratch.
+    fn prepare(self: *HNSW, sc: *Scratch, v: []const f32) !Query {
         var q = Query.of(v);
-        if (self.int8) {
-            try self.scratch_q8.resize(self.alloc, v.len);
-            q.q8_norm = quantizeInto(self.scratch_q8.items, v);
-            q.q8 = self.scratch_q8.items;
+        if (self.int8 or self.bq.len != 0) {
+            try sc.q8.resize(self.alloc, v.len);
+            q.q8_norm = quantizeInto(sc.q8.items, v);
+            q.q8 = sc.q8.items;
         }
         return q;
     }
@@ -458,6 +559,11 @@ pub const HNSW = struct {
             if (denom == 0.0) return 0.0;
             return @as(f32, @floatFromInt(dotI8(q.q8, self.vector8At(idx)))) / denom;
         }
+        if (self.bq.len != 0) {
+            const denom = q.q8_norm * self.bq_norms[idx];
+            if (denom == 0.0) return 0.0;
+            return @as(f32, @floatFromInt(dotI8(q.q8, self.bqAt(idx)))) / denom;
+        }
         const denom = q.norm * self.norms.items[idx];
         if (denom == 0.0) return 0.0;
         return dotProduct(q.vec, self.vectorAt(idx)) / denom;
@@ -466,17 +572,35 @@ pub const HNSW = struct {
     /// Cosine between two indexed nodes, both norms cached. Used by the
     /// diversity rule in `shrinkConnections`.
     fn simIdx(self: *const HNSW, a: u32, b: u32) f32 {
+        if (self.int8) {
+            const denom = self.norms.items[a] * self.norms.items[b];
+            if (denom == 0.0) return 0.0;
+            return @as(f32, @floatFromInt(dotI8(self.vector8At(a), self.vector8At(b)))) / denom;
+        }
+        if (self.bq.len != 0) {
+            const denom = self.bq_norms[a] * self.bq_norms[b];
+            if (denom == 0.0) return 0.0;
+            return @as(f32, @floatFromInt(dotI8(self.bqAt(a), self.bqAt(b)))) / denom;
+        }
         const denom = self.norms.items[a] * self.norms.items[b];
         if (denom == 0.0) return 0.0;
-        if (self.int8) return @as(f32, @floatFromInt(dotI8(self.vector8At(a), self.vector8At(b)))) / denom;
         return dotProduct(self.vectorAt(a), self.vectorAt(b)) / denom;
+    }
+
+    /// The `dim` build-time quantised components of node `idx`.
+    fn bqAt(self: *const HNSW, idx: u32) []const i8 {
+        const d: usize = self.dim;
+        return self.bq[@as(usize, idx) * d ..][0..d];
     }
 
     /// Ask the cache for a vector before it is scored. One hint per line:
     /// the hardware prefetcher would pick up a sequential stream after a
     /// couple of misses, but those misses are the cost being avoided.
     fn prefetchVector(self: *const HNSW, idx: u32) void {
-        const bytes = self.vectorBytes(idx);
+        const bytes: []const u8 = if (self.bq.len != 0 and !self.int8)
+            std.mem.sliceAsBytes(self.bqAt(idx))
+        else
+            self.vectorBytes(idx);
         var off: usize = 0;
         while (off < bytes.len) : (off += 64) {
             @prefetch(bytes.ptr + off, .{ .rw = .read, .locality = 3, .cache = .data });
@@ -485,9 +609,6 @@ pub const HNSW = struct {
 
     const no_slot: u32 = std.math.maxInt(u32);
     const chunk_target_bytes: usize = 1 << 20;
-
-    /// A neighbour that passed the visited check and is waiting to be scored.
-    const Pending = struct { id: u64, idx: u32 };
 
     /// Widest hole worth stepping over before deciding the id space is
     /// sparse. 1024 slots is 4 KB, once, before the table gives up.
@@ -533,17 +654,23 @@ pub const HNSW = struct {
         self.dense.items[@intCast(off)] = idx;
     }
 
+    /// The "seen" stamps `sc` marks: the index's own `visit_stamp` for the
+    /// shared scratch, the scratch's private array for a worker's.
+    fn stampsOf(self: *HNSW, sc: *Scratch) []u32 {
+        return if (sc.stamps.items.len != 0) sc.stamps.items else self.visit_stamp.items;
+    }
+
     /// Open a fresh "seen" generation for one beam search.
     ///
     /// A wrap means every live stamp could alias the new generation, so
     /// the array is cleared instead. Once per 4 billion searches.
-    fn beginVisit(self: *HNSW) u32 {
-        self.visit_gen +%= 1;
-        if (self.visit_gen == 0) {
-            @memset(self.visit_stamp.items, 0);
-            self.visit_gen = 1;
+    fn beginVisit(sc: *Scratch, stamps: []u32) u32 {
+        sc.gen +%= 1;
+        if (sc.gen == 0) {
+            @memset(stamps, 0);
+            sc.gen = 1;
         }
-        return self.visit_gen;
+        return sc.gen;
     }
 
     /// Insert a vector with a given id. Computes the level via exponential
@@ -583,71 +710,89 @@ pub const HNSW = struct {
         // Before any allocation: a rejected insert has nothing to free.
         if (id <= self.max_id and self.nodes.contains(id)) return errors.DuplicateId;
 
-        const q = try self.prepare(vector);
+        const q = try self.prepare(&self.sc, vector);
         const level = self.randomLevel();
-        // The errdefers below are scoped to this block on purpose. Once the
-        // node is committed, `nodes` owns it: an error from the linking
-        // work further down must not free a node the index can still reach.
-        // (They used to live in the function scope, so a failed `searchLayer`
-        // destroyed a node that was already in the map, and `deinit` then
-        // walked a dangling pointer.)
-        _ = blk: {
-            const n = try self.alloc.create(Node);
-            errdefer self.alloc.destroy(n);
+        const n = try self.commitNode(id, vector, level);
+        try self.linkNode(&self.sc, n, q);
+    }
 
-            const idx: u32 = @intCast(self.visit_stamp.items.len);
-            // A fresh chunk is kept even if a later step fails: the next insert
-            // takes the same `idx` and finds it already there.
-            if ((idx >> self.chunk_shift) == self.vec_chunks.items.len) {
-                const per_chunk: usize = @as(usize, 1) << self.chunk_shift;
-                try self.vec_chunks.ensureUnusedCapacity(self.alloc, 1);
-                const chunk = try self.alloc.alignedAlloc(u8, .@"64", per_chunk * self.vec_stride);
-                self.vec_chunks.appendAssumeCapacity(chunk);
-            }
-            const neighbors = try self.alloc.alloc(std.ArrayList(u64), level + 1);
-            errdefer self.alloc.free(neighbors);
-            for (neighbors) |*list| list.* = .empty;
+    /// Make a node exist: its arena slot, its bookkeeping rows, its entry in
+    /// the id map. It is not linked to anything yet, so no search can reach
+    /// it. Shared by `insert` and by phase A of `insertBatch`.
+    fn commitNode(self: *HNSW, id: u64, vector: []const f32, level: u8) errors!*Node {
+        // The errdefers below are scoped to this function on purpose: once
+        // the node is committed, `nodes` owns it, and an error from the
+        // linking work (a separate function) must not free a node the index
+        // can still reach. (They used to live in `insert`'s own scope, so a
+        // failed `searchLayer` destroyed a node that was already in the map,
+        // and `deinit` then walked a dangling pointer.)
+        const n = try self.alloc.create(Node);
+        errdefer self.alloc.destroy(n);
 
-            // Every fallible step that mutates shared state happens before the
-            // first mutation: capacity for the per-node arrays and the map is
-            // reserved up front and the commit below cannot fail, so an
-            // allocation failure leaves the index exactly as it was and
-            // `visit_stamp`, `by_idx` and `norms` stay in lockstep.
-            try self.visit_stamp.ensureUnusedCapacity(self.alloc, 1);
-            try self.by_idx.ensureUnusedCapacity(self.alloc, 1);
-            try self.norms.ensureUnusedCapacity(self.alloc, 1);
-            try self.nodes.ensureUnusedCapacity(1);
-            try self.trackDense(id, idx);
+        const idx: u32 = @intCast(self.visit_stamp.items.len);
+        // A fresh chunk is kept even if a later step fails: the next insert
+        // takes the same `idx` and finds it already there.
+        if ((idx >> self.chunk_shift) == self.vec_chunks.items.len) {
+            const per_chunk: usize = @as(usize, 1) << self.chunk_shift;
+            try self.vec_chunks.ensureUnusedCapacity(self.alloc, 1);
+            const chunk = try self.alloc.alignedAlloc(u8, .@"64", per_chunk * self.vec_stride);
+            self.vec_chunks.appendAssumeCapacity(chunk);
+        }
+        const neighbors = try self.alloc.alloc(std.ArrayList(u64), level + 1);
+        errdefer self.alloc.free(neighbors);
+        for (neighbors) |*list| list.* = .empty;
 
-            // int8 storage keeps no float copy: `Node.vector` is empty and the
-            // quantised bytes live only in the arena.
-            var vec_copy: []f32 = &.{};
-            var norm: f32 = undefined;
-            if (self.int8) {
-                norm = quantizeInto(self.vector8At(idx), vector);
-            } else {
-                vec_copy = self.vectorAt(idx);
-                @memcpy(vec_copy, vector);
-                norm = normOf(vec_copy);
-            }
-            n.* = .{
-                .id = id,
-                .vector = vec_copy,
-                .norm = norm,
-                .dense_idx = idx,
-                .level = level,
-                .neighbors = neighbors,
-            };
-            // A stamp slot per node, in lockstep with `dense_idx`. No node is
-            // ever removed from this index, so the arrays only grow.
-            self.visit_stamp.appendAssumeCapacity(0);
-            self.by_idx.appendAssumeCapacity(n);
-            self.norms.appendAssumeCapacity(n.norm);
-            self.nodes.putAssumeCapacity(id, n);
-            self.count += 1;
-            if (id > self.max_id) self.max_id = id;
-            break :blk n;
+        // Every fallible step that mutates shared state happens before the
+        // first mutation: capacity for the per-node arrays and the map is
+        // reserved up front and the commit below cannot fail, so an
+        // allocation failure leaves the index exactly as it was and
+        // `visit_stamp`, `by_idx` and `norms` stay in lockstep.
+        try self.visit_stamp.ensureUnusedCapacity(self.alloc, 1);
+        try self.by_idx.ensureUnusedCapacity(self.alloc, 1);
+        try self.norms.ensureUnusedCapacity(self.alloc, 1);
+        try self.nodes.ensureUnusedCapacity(1);
+        try self.trackDense(id, idx);
+
+        // int8 storage keeps no float copy: `Node.vector` is empty and the
+        // quantised bytes live only in the arena.
+        var vec_copy: []f32 = &.{};
+        var norm: f32 = undefined;
+        if (self.int8) {
+            norm = quantizeInto(self.vector8At(idx), vector);
+        } else {
+            vec_copy = self.vectorAt(idx);
+            @memcpy(vec_copy, vector);
+            norm = normOf(vec_copy);
+        }
+        n.* = .{
+            .id = id,
+            .vector = vec_copy,
+            .norm = norm,
+            .dense_idx = idx,
+            .level = level,
+            .neighbors = neighbors,
         };
+        // A stamp slot per node, in lockstep with `dense_idx`. No node is
+        // ever removed from this index, so the arrays only grow.
+        self.visit_stamp.appendAssumeCapacity(0);
+        self.by_idx.appendAssumeCapacity(n);
+        self.norms.appendAssumeCapacity(n.norm);
+        self.nodes.putAssumeCapacity(id, n);
+        self.count += 1;
+        if (id > self.max_id) self.max_id = id;
+        return n;
+    }
+
+    /// Link an already-committed node into the graph, and promote the entry
+    /// point if the node is taller than anything before it.
+    ///
+    /// Everything it writes outside `sc` is a neighbour list, and when
+    /// `self.locks` is set each of those is written under its node's lock.
+    /// It writes `entry_point` / `max_level` only when `level > max_level`,
+    /// which `insertBatch` never lets happen on a worker thread.
+    fn linkNode(self: *HNSW, sc: *Scratch, node: *Node, q: Query) errors!void {
+        const id = node.id;
+        const level = node.level;
 
         if (self.entry_point == null) {
             self.entry_point = id;
@@ -673,7 +818,7 @@ pub const HNSW = struct {
 
         var lc: i32 = @intCast(self.max_level);
         while (lc > @as(i32, @intCast(level))) : (lc -= 1) {
-            const hop = try self.searchLayer(q, entry, 1, @intCast(lc));
+            const hop = try self.searchLayer(sc, q, entry, 1, @intCast(lc));
             if (hop.len > 0) entry = hop[0];
         }
 
@@ -681,6 +826,7 @@ pub const HNSW = struct {
         while (l >= 0) : (l -= 1) {
             const ul: u8 = @intCast(l);
             const candidates = try self.searchLayer(
+                sc,
                 q,
                 entry,
                 @intCast(self.cfg.hnsw_ef_construction),
@@ -691,7 +837,7 @@ pub const HNSW = struct {
             var linked: usize = 0;
             for (candidates) |cid| {
                 if (cid == id) continue;
-                try self.connect(id, cid, ul, q);
+                try self.connect(sc, id, cid, ul, q);
                 linked += 1;
                 if (linked >= limit) break;
             }
@@ -702,7 +848,7 @@ pub const HNSW = struct {
         // Promote the entry point only once the node is fully linked.
         //
         // Doing this before the links are built makes the multi-layer
-        // branch below descend from the node being inserted, whose
+        // branch above descend from the node being inserted, whose
         // neighbour lists at those levels are still empty — so the
         // descent has nowhere to go and the upper layers stay
         // unpopulated. It used to be fixed at the very first insert for
@@ -713,6 +859,264 @@ pub const HNSW = struct {
             self.max_level = level;
             self.entry_point = id;
         }
+    }
+
+    /// Insert many vectors at once, optionally linking them from several
+    /// threads. `vectors` is `ids.len * dim` floats, row `i` belonging to
+    /// `ids[i]`.
+    ///
+    /// ## What stays the same
+    ///
+    /// With the defaults (`threads = 1`, `build_quant = false`) this is
+    /// `insert` in a loop and builds the identical graph. Levels are always
+    /// drawn from the persistent PRNG in batch order, so the *level
+    /// structure* of the graph does not depend on the thread count either.
+    ///
+    /// Ids are validated first: a batch that repeats an id, or names one the
+    /// index already holds, returns `DuplicateId` having changed nothing.
+    ///
+    /// ## How the parallel build works
+    ///
+    /// *Phase A, one thread.* Every node is committed — arena slot, norm,
+    /// level, id-map entry — but not linked. All the per-node tables are
+    /// therefore final before any worker starts and are only read afterwards,
+    /// so workers need no lock to resolve an id or read a vector.
+    ///
+    /// *Phase B, `threads` workers.* Each claims the next unlinked node and
+    /// runs the ordinary insert algorithm on it with a private `Scratch`.
+    /// The only shared mutable state is the adjacency lists. A list is read
+    /// (copied) and written under its node's stripe lock, and no code holds
+    /// two locks at once.
+    ///
+    /// Two kinds of node are linked one at a time on the calling thread
+    /// instead: the first `seed_nodes` nodes of the index, and any node taller
+    /// than every node before it (it must move the entry point, which workers
+    /// never write). The latter are about log_M(n) nodes in total; the workers
+    /// are respawned around each one.
+    ///
+    /// ## What does not hold
+    ///
+    /// With `threads > 1` the graph is *not* reproducible: which nodes are in
+    /// flight together depends on scheduling. Recall and connectivity are
+    /// what is preserved, and `docs/roadmap.md` records how they were
+    /// measured. Do not use a parallel build where a fingerprint is promised.
+    ///
+    /// On error the batch may be partly applied. Every node that was
+    /// committed is in the index and counted; linking is attempted for those
+    /// before the error is returned, but a node whose linking itself failed
+    /// can be unreachable from searches.
+    pub fn insertBatch(self: *HNSW, ids: []const u64, vectors: []const f32, opts: BatchOptions) errors!void {
+        const dim: usize = self.dim;
+        if (vectors.len != ids.len * dim) return errors.InvalidQuery;
+        if (ids.len == 0) return;
+        try self.checkBatchIds(ids);
+
+        const threads = @max(opts.threads, 1);
+        const quant = opts.build_quant and !self.int8;
+        if (threads == 1 and !quant) {
+            for (ids, 0..) |id, i| try self.insert(id, vectors[i * dim ..][0..dim]);
+            return;
+        }
+
+        // Phase A. Capacity first, so the commits below do not reallocate
+        // the tables one node at a time.
+        const base: usize = self.visit_stamp.items.len;
+        try self.visit_stamp.ensureUnusedCapacity(self.alloc, ids.len);
+        try self.by_idx.ensureUnusedCapacity(self.alloc, ids.len);
+        try self.norms.ensureUnusedCapacity(self.alloc, ids.len);
+        try self.nodes.ensureUnusedCapacity(@intCast(ids.len));
+
+        var committed: usize = 0;
+        var commit_err: ?errors = null;
+        for (ids, 0..) |id, i| {
+            const level = self.randomLevel();
+            _ = self.commitNode(id, vectors[i * dim ..][0..dim], level) catch |e| {
+                commit_err = e;
+                break;
+            };
+            committed += 1;
+        }
+
+        const linked = self.linkBatch(base, committed, vectors, threads, opts.seed_nodes, quant);
+        if (commit_err) |e| return e;
+        try linked;
+    }
+
+    /// Reject a batch that cannot be applied atomically: a repeated id, or
+    /// an id already in the index.
+    fn checkBatchIds(self: *HNSW, ids: []const u64) errors!void {
+        for (ids) |id| {
+            if (id <= self.max_id and self.nodes.contains(id)) return errors.DuplicateId;
+        }
+        const sorted = try self.alloc.dupe(u64, ids);
+        defer self.alloc.free(sorted);
+        std.mem.sort(u64, sorted, {}, std.sort.asc(u64));
+        for (sorted[1..], 0..) |id, i| {
+            if (id == sorted[i]) return errors.DuplicateId;
+        }
+    }
+
+    /// Per-batch state shared by the workers of one parallel segment.
+    const ParSegment = struct {
+        hnsw: *HNSW,
+        vectors: []const f32,
+        base: usize,
+        end: usize,
+        next: std.atomic.Value(usize),
+        failed: std.atomic.Value(bool) = .init(false),
+        err_code: std.atomic.Value(u16) = .init(0),
+
+        fn work(self: *ParSegment, sc: *Scratch) void {
+            while (!self.failed.load(.acquire)) {
+                const i = self.next.fetchAdd(1, .monotonic);
+                if (i >= self.end) return;
+                self.hnsw.linkBatchNode(sc, self.vectors, self.base, i) catch |e| {
+                    self.err_code.store(@intFromError(e), .monotonic);
+                    self.failed.store(true, .release);
+                    return;
+                };
+            }
+        }
+    };
+
+    fn linkBatchNode(self: *HNSW, sc: *Scratch, vectors: []const f32, base: usize, i: usize) errors!void {
+        const dim: usize = self.dim;
+        const node = self.by_idx.items[base + i];
+        const q = try self.prepare(sc, vectors[i * dim ..][0..dim]);
+        try self.linkNode(sc, node, q);
+    }
+
+    /// Phase B of `insertBatch`: link the `count` nodes committed at dense
+    /// indices `base ..`.
+    fn linkBatch(
+        self: *HNSW,
+        base: usize,
+        count: usize,
+        vectors: []const f32,
+        threads: usize,
+        seed_nodes: usize,
+        quant: bool,
+    ) errors!void {
+        if (count == 0) return;
+        const total = self.visit_stamp.items.len;
+
+        if (quant) try self.beginQuantView();
+        defer self.endQuantView();
+
+        var locks: StripedLocks = undefined;
+        var scs: []Scratch = &.{};
+        if (threads > 1) {
+            locks = try StripedLocks.init(self.alloc);
+            errdefer locks.deinit(self.alloc);
+            scs = try self.alloc.alloc(Scratch, threads);
+            for (scs) |*sc| sc.* = .{};
+            errdefer {
+                for (scs) |*sc| sc.deinit(self.alloc);
+                self.alloc.free(scs);
+            }
+            // Each worker marks nodes seen in its own array: 4 bytes a node
+            // a worker, zeroed once.
+            for (scs) |*sc| try sc.stamps.appendNTimes(self.alloc, 0, total);
+        }
+        defer if (threads > 1) {
+            for (scs) |*sc| sc.deinit(self.alloc);
+            self.alloc.free(scs);
+            locks.deinit(self.alloc);
+        };
+
+        // The level of the tallest node linked so far, as `max_level` will
+        // stand when the next node starts: a node above it must be linked
+        // alone.
+        var run_max: i32 = if (self.entry_point == null) -1 else self.max_level;
+        var seg_start: usize = 0;
+        var first_err: ?errors = null;
+
+        var i: usize = 0;
+        while (i < count and first_err == null) : (i += 1) {
+            const node = self.by_idx.items[base + i];
+            const alone = threads == 1 or (base + i) < seed_nodes or @as(i32, node.level) > run_max;
+            run_max = @max(run_max, @as(i32, node.level));
+            if (!alone) continue;
+
+            if (i > seg_start) first_err = self.linkSegment(scs, &locks, vectors, base, seg_start, i, threads);
+            if (first_err != null) break;
+            seg_start = i + 1;
+            if (self.linkBatchNode(&self.sc, vectors, base, i)) |_| {} else |e| first_err = e;
+        }
+        if (first_err == null and count > seg_start) {
+            first_err = self.linkSegment(scs, &locks, vectors, base, seg_start, count, threads);
+        }
+        if (first_err) |e| return e;
+    }
+
+    /// Link batch nodes `[from, to)`, all of which are at or below the
+    /// current top level, concurrently. Returns the first worker error.
+    fn linkSegment(
+        self: *HNSW,
+        scs: []Scratch,
+        locks: *StripedLocks,
+        vectors: []const f32,
+        base: usize,
+        from: usize,
+        to: usize,
+        threads: usize,
+    ) ?errors {
+        // Too few nodes to repay starting threads: do them here, unlocked.
+        if (threads <= 1 or to - from < 4 * threads) {
+            for (from..to) |i| {
+                self.linkBatchNode(&self.sc, vectors, base, i) catch |e| return e;
+            }
+            return null;
+        }
+
+        var seg = ParSegment{
+            .hnsw = self,
+            .vectors = vectors,
+            .base = base,
+            .end = to,
+            .next = .init(from),
+        };
+        self.locks = locks;
+        defer self.locks = null;
+
+        var spawned: [64]?std.Thread = @splat(null);
+        const extra = @min(threads - 1, spawned.len);
+        for (spawned[0..extra], 1..) |*slot, w| {
+            // A thread that cannot be started is not an error: the others
+            // drain the queue, only more slowly.
+            slot.* = std.Thread.spawn(.{}, ParSegment.work, .{ &seg, &scs[w] }) catch null;
+        }
+        seg.work(&scs[0]);
+        for (spawned[0..extra]) |slot| {
+            if (slot) |t| t.join();
+        }
+
+        if (seg.failed.load(.acquire)) {
+            const code = seg.err_code.load(.monotonic);
+            return @errorCast(@errorFromInt(code));
+        }
+        return null;
+    }
+
+    /// Quantise every node into the build-time int8 view.
+    fn beginQuantView(self: *HNSW) !void {
+        const dim: usize = self.dim;
+        const n = self.by_idx.items.len;
+        const bq = try self.alloc.alloc(i8, n * dim);
+        errdefer self.alloc.free(bq);
+        const bq_norms = try self.alloc.alloc(f32, n);
+        for (0..n) |i| {
+            bq_norms[i] = quantizeInto(bq[i * dim ..][0..dim], self.vectorAt(@intCast(i)));
+        }
+        self.bq = bq;
+        self.bq_norms = bq_norms;
+    }
+
+    fn endQuantView(self: *HNSW) void {
+        if (self.bq.len != 0) self.alloc.free(self.bq);
+        if (self.bq_norms.len != 0) self.alloc.free(self.bq_norms);
+        self.bq = &.{};
+        self.bq_norms = &.{};
     }
 
     /// Tombstone a node and drop it from the searchable set.
@@ -755,7 +1159,7 @@ pub const HNSW = struct {
     pub fn search(self: *HNSW, alloc: Allocator, query: []const f32, k: usize) errors![]SearchResult {
         if (query.len != self.dim) return errors.InvalidQuery;
         if (self.entry_point == null) return &.{};
-        const q = try self.prepare(query);
+        const q = try self.prepare(&self.sc, query);
         // Over-fetch, because tombstoned candidates are dropped below and
         // a swept store would otherwise come back short. Three times is
         // arbitrary but bounded; returning fewer than `k` live hits is not
@@ -766,7 +1170,7 @@ pub const HNSW = struct {
         }
         const want = @max(k, ef);
         const fetch = @min(self.count, want + want / 2);
-        const cands = try self.searchInternal(q, fetch, 0);
+        const cands = try self.searchInternal(&self.sc, q, fetch, 0);
 
         var out = std.ArrayList(SearchResult).empty;
         errdefer out.deinit(alloc);
@@ -826,14 +1230,14 @@ pub const HNSW = struct {
     /// scores the visit order, and therefore the graph, is identical to the
     /// scan version (`graphFingerprint` tests pin it); with exact ties the
     /// choice among equals is now by id instead of by slot.
-    fn searchLayer(self: *HNSW, q: Query, start: u64, ef: usize, level: u8) errors![]u64 {
+    fn searchLayer(self: *HNSW, sc: *Scratch, q: Query, start: u64, ef: usize, level: u8) errors![]u64 {
         const budget = @max(ef, 1);
 
-        const gen = self.beginVisit();
-        const stamps = self.visit_stamp.items;
+        const gen = beginVisit(sc, self.stampsOf(sc));
+        const stamps = self.stampsOf(sc);
 
-        var frontier = &self.scratch_frontier;
-        var results = &self.scratch_results;
+        var frontier = &sc.frontier;
+        var results = &sc.results;
         frontier.clearRetainingCapacity();
         results.clearRetainingCapacity();
         try frontier.ensureTotalCapacity(self.alloc, budget);
@@ -855,14 +1259,28 @@ pub const HNSW = struct {
 
             const node = self.nodeFor(c.id) orelse continue;
             if (level >= node.neighbors.len) continue;
+            const cur_idx = node.dense_idx;
 
             // Pass 1: resolve and mark every unseen neighbour, and ask the
             // cache for its vector. Pass 2 scores them in the same order a
             // single pass would have, so the walk is unchanged — only the
             // memory latency of the later vectors now overlaps the
             // arithmetic on the earlier ones.
-            const nbrs = node.neighbors[level].items;
-            var pending = &self.scratch_pending;
+            //
+            // Under a lock the list is copied out first: a concurrent writer
+            // may grow or shrink it the moment the lock drops, and the walk
+            // below must not follow a slice that has been reallocated.
+            var nbrs: []const u64 = undefined;
+            if (self.locks) |lk| {
+                lk.lock(cur_idx);
+                defer lk.unlock(cur_idx);
+                sc.nbrs.clearRetainingCapacity();
+                try sc.nbrs.appendSlice(self.alloc, node.neighbors[level].items);
+                nbrs = sc.nbrs.items;
+            } else {
+                nbrs = node.neighbors[level].items;
+            }
+            var pending = &sc.pending;
             pending.clearRetainingCapacity();
             try pending.ensureTotalCapacity(self.alloc, nbrs.len);
             for (nbrs) |nid| {
@@ -900,29 +1318,29 @@ pub const HNSW = struct {
         // The result aliases the index's scratch buffer: valid until the
         // next `searchLayer`. Every caller here consumes the slice before
         // searching again, so nothing copies it and nothing frees it.
-        self.scratch_out.clearRetainingCapacity();
-        try self.scratch_out.ensureTotalCapacity(self.alloc, @min(results.items.len, budget));
+        sc.out.clearRetainingCapacity();
+        try sc.out.ensureTotalCapacity(self.alloc, @min(results.items.len, budget));
         for (results.items[0..@min(results.items.len, budget)]) |r| {
-            self.scratch_out.appendAssumeCapacity(r.id);
+            sc.out.appendAssumeCapacity(r.id);
         }
-        return self.scratch_out.items;
+        return sc.out.items;
     }
 
     /// Descend from the entry point down to `level`, then beam-search there.
     ///
     /// The layers above `level` are cheap greedy hops (ef = 1); the target
     /// layer gets the real budget.
-    fn searchInternal(self: *HNSW, q: Query, ef: usize, level: u8) errors![]u64 {
+    fn searchInternal(self: *HNSW, sc: *Scratch, q: Query, ef: usize, level: u8) errors![]u64 {
         const ep = self.entry_point orelse return &.{};
         if (level > self.max_level) return &.{};
 
         var current: u64 = ep;
         var l: i32 = @intCast(self.max_level);
         while (l > @as(i32, @intCast(level))) : (l -= 1) {
-            const hop = try self.searchLayer(q, current, 1, @intCast(l));
+            const hop = try self.searchLayer(sc, q, current, 1, @intCast(l));
             if (hop.len > 0) current = hop[0];
         }
-        return self.searchLayer(q, current, ef, level);
+        return self.searchLayer(sc, q, current, ef, level);
     }
 
     pub const SearchResult = struct {
@@ -968,11 +1386,6 @@ pub const HNSW = struct {
         }
         return visited;
     }
-
-    /// A scored node id, as carried by the search frontier and the
-    /// bounded result set. Declared at container scope because Zig has no
-    /// nested functions or local type declarations.
-    const Cand = struct { id: u64, score: f32 };
 
     /// Total order on candidates: higher score first, then smaller id.
     fn candBetter(a: Cand, b: Cand) bool {
@@ -1096,14 +1509,14 @@ pub const HNSW = struct {
     ///
     /// Ids missing from `self.nodes` are dropped rather than carried: the
     /// adjacency lists must never point at a node the index no longer holds.
-    fn shrinkConnections(self: *HNSW, node: *Node, q: Query, level: u8, limit: usize) !void {
+    fn shrinkConnections(self: *HNSW, sc: *Scratch, node: *Node, q: Query, level: u8, limit: usize) !void {
         const list = &node.neighbors[level];
         const src = list.items;
 
         // Pass 1: resolve every candidate and ask the cache for its vector,
         // so the 33 loads overlap instead of queueing behind the arithmetic.
         // Pass 2 scores them in list order, as before.
-        var pending = &self.scratch_pending;
+        var pending = &sc.pending;
         pending.clearRetainingCapacity();
         try pending.ensureTotalCapacity(self.alloc, src.len);
         for (src) |cid| {
@@ -1116,7 +1529,7 @@ pub const HNSW = struct {
         // Both buffers are the index's own scratch, reused across calls: this
         // runs ~32 times per insert, and it used to allocate and free three
         // lists each time.
-        var cands = &self.scratch_cands;
+        var cands = &sc.cands;
         cands.clearRetainingCapacity();
         try cands.ensureTotalCapacity(self.alloc, pending.items.len);
         for (pending.items) |pn| {
@@ -1131,7 +1544,7 @@ pub const HNSW = struct {
             }
         }.lt);
 
-        var kept = &self.scratch_kept;
+        var kept = &sc.kept;
         kept.clearRetainingCapacity();
         try kept.ensureTotalCapacity(self.alloc, @min(limit, cands.items.len));
 
@@ -1195,8 +1608,17 @@ pub const HNSW = struct {
     /// The "never dangle" guarantee is unchanged and now holds by
     /// construction: `connect` returns early if either endpoint is absent
     /// from the index, so `link` is never handed one.
-    fn link(self: *HNSW, node: *Node, nb: u64, level: u8, q: Query) !void {
+    fn link(self: *HNSW, sc: *Scratch, node: *Node, nb: u64, level: u8, q: Query) !void {
         if (level >= node.neighbors.len) return; // node has no such layer
+        if (self.locks) |lk| {
+            lk.lock(node.dense_idx);
+            defer lk.unlock(node.dense_idx);
+            return self.linkLocked(sc, node, nb, level, q);
+        }
+        return self.linkLocked(sc, node, nb, level, q);
+    }
+
+    fn linkLocked(self: *HNSW, sc: *Scratch, node: *Node, nb: u64, level: u8, q: Query) !void {
         const list = &node.neighbors[level];
         if (containsId(list.items, nb)) return; // already linked
 
@@ -1210,16 +1632,16 @@ pub const HNSW = struct {
         }
         list.appendAssumeCapacity(nb);
         if (list.items.len > limit) {
-            try self.shrinkConnections(node, q, level, limit);
+            try self.shrinkConnections(sc, node, q, level, limit);
         }
     }
 
-    fn connect(self: *HNSW, a: u64, b: u64, level: u8, q: Query) !void {
+    fn connect(self: *HNSW, sc: *Scratch, a: u64, b: u64, level: u8, q: Query) !void {
         if (a == b) return;
         const a_node = self.nodeFor(a) orelse return;
         const b_node = self.nodeFor(b) orelse return;
-        try self.link(a_node, b, level, q);
-        try self.link(b_node, a, level, q);
+        try self.link(sc, a_node, b, level, q);
+        try self.link(sc, b_node, a, level, q);
     }
 
     fn randomLevel(self: *HNSW) u8 {
@@ -1631,6 +2053,14 @@ pub fn oracleFillN(hnsw: *HNSW, corpus: []const f32, n: usize, dim: usize) !void
     for (0..n) |i| {
         try hnsw.insert(@intCast(i + 1), corpus[i * dim ..][0..dim]);
     }
+}
+
+/// `oracleFillN` through `insertBatch`: ids 1..n in corpus order, in one call.
+pub fn oracleFillBatch(hnsw: *HNSW, corpus: []const f32, n: usize, dim: usize, opts: BatchOptions) !void {
+    const ids = try hnsw.alloc.alloc(u64, n);
+    defer hnsw.alloc.free(ids);
+    for (ids, 0..) |*id, i| id.* = @intCast(i + 1);
+    try hnsw.insertBatch(ids, corpus[0 .. n * dim], opts);
 }
 
 pub fn oracleFill(hnsw: *HNSW, corpus: []const f32) !void {
@@ -2352,7 +2782,7 @@ test "HNSW: graph fingerprint, small m and efc, 1500 x 24" {
 
 test "HNSW: candidate heaps pop in total order, ties broken by id" {
     const alloc = std.testing.allocator;
-    var heap = std.ArrayList(HNSW.Cand).empty;
+    var heap = std.ArrayList(Cand).empty;
     defer heap.deinit(alloc);
 
     // Scores drawn from 5 values so most entries tie; ids are distinct.
@@ -2365,7 +2795,7 @@ test "HNSW: candidate heaps pop in total order, ties broken by id" {
         HNSW.heapUp(heap.items, heap.items.len - 1, HNSW.candBetter);
     }
 
-    var prev: ?HNSW.Cand = null;
+    var prev: ?Cand = null;
     while (heap.items.len > 0) {
         const c = HNSW.heapPop(heap.items, HNSW.candBetter);
         heap.items.len -= 1;
@@ -2379,7 +2809,7 @@ test "HNSW: candidate heaps pop in total order, ties broken by id" {
         try heap.append(alloc, .{ .id = j, .score = @floatFromInt(j % 7) });
         HNSW.heapUp(heap.items, heap.items.len - 1, HNSW.candWorse);
     }
-    var prev_w: ?HNSW.Cand = null;
+    var prev_w: ?Cand = null;
     while (heap.items.len > 0) {
         const c = HNSW.heapPop(heap.items, HNSW.candWorse);
         heap.items.len -= 1;
@@ -2567,4 +2997,282 @@ test "HNSW: adaptive ef_search buys recall at a small budget, and is inert when 
     // Measured 0.96 fixed, 1.00 adaptive.
     try std.testing.expect(adaptive > fixed);
     try std.testing.expect(adaptive >= 0.99);
+}
+
+// =============================================================================
+// Batch and parallel build
+// =============================================================================
+//
+// `insertBatch` has two promises and they are tested separately. With one
+// thread (or a seed that covers the whole batch) it is `insert` in a loop,
+// and that is checked bit-for-bit against the graph fingerprint. With more
+// threads the graph is *not* reproducible, so what is asserted instead is
+// what a caller relies on: every node is there, every adjacency list obeys
+// the same structural invariants as a sequential build, the graph stays
+// connected through layer 0, and recall against an exhaustive scan is not
+// worse than the sequential build's by more than the noise floor of the
+// measurement.
+
+fn batchIds(alloc: std.mem.Allocator, n: usize, first: u64) ![]u64 {
+    const ids = try alloc.alloc(u64, n);
+    for (ids, 0..) |*x, i| x.* = first + @as(u64, @intCast(i));
+    return ids;
+}
+
+/// The structural invariants `adjacency degree stays bounded` asserts on a
+/// sequential build, for any index: bounded lists, no self loop, no
+/// duplicate, no dangling id, a non-empty layer-0 list on every node.
+fn expectStructurallySane(hnsw: *HNSW) !void {
+    var it = hnsw.nodes.iterator();
+    while (it.next()) |entry| {
+        const nd = entry.value_ptr.*;
+        for (nd.neighbors, 0..) |list, layer| {
+            try std.testing.expect(list.items.len <= hnsw.maxDegree(@intCast(layer)));
+            if (layer == 0) try std.testing.expect(hnsw.count <= 1 or list.items.len > 0);
+            for (list.items, 0..) |nb, i| {
+                try std.testing.expect(nb != nd.id);
+                try std.testing.expect(hnsw.nodes.contains(nb));
+                for (list.items[i + 1 ..]) |later| try std.testing.expect(later != nb);
+            }
+        }
+    }
+    try std.testing.expectEqual(hnsw.count, hnsw.nodes.count());
+    try std.testing.expectEqual(hnsw.count, hnsw.by_idx.items.len);
+    try std.testing.expectEqual(hnsw.count, hnsw.visit_stamp.items.len);
+}
+
+test "HNSW: insertBatch with default options builds exactly the graph insert builds" {
+    const alloc = std.testing.allocator;
+    const n: usize = 400;
+    const dim: u16 = 32;
+    const corpus = try oracleCorpusN(alloc, n, dim);
+    defer alloc.free(corpus);
+    const ids = try batchIds(alloc, n, 1);
+    defer alloc.free(ids);
+
+    var seq = HNSW.init(alloc, .{}, dim);
+    defer seq.deinit();
+    try oracleFillN(&seq, corpus, n, dim);
+
+    var bat = HNSW.init(alloc, .{}, dim);
+    defer bat.deinit();
+    try bat.insertBatch(ids, corpus, .{});
+
+    try std.testing.expectEqual(try seq.graphFingerprint(alloc), try bat.graphFingerprint(alloc));
+}
+
+test "HNSW: a seed that covers the batch keeps the build sequential at any thread count" {
+    // Phase A commits every node before phase B links any, so the dense table
+    // and the arrays are fuller while the first nodes are linked. None of
+    // that is reachable through the graph, which is what this pins.
+    const alloc = std.testing.allocator;
+    const n: usize = 600;
+    const dim: u16 = 32;
+    const corpus = try oracleCorpusN(alloc, n, dim);
+    defer alloc.free(corpus);
+    const ids = try batchIds(alloc, n, 1);
+    defer alloc.free(ids);
+
+    var seq = HNSW.init(alloc, .{}, dim);
+    defer seq.deinit();
+    try oracleFillN(&seq, corpus, n, dim);
+
+    var bat = HNSW.init(alloc, .{}, dim);
+    defer bat.deinit();
+    try bat.insertBatch(ids, corpus, .{ .threads = 4, .seed_nodes = 1000 });
+    try std.testing.expectEqual(try seq.graphFingerprint(alloc), try bat.graphFingerprint(alloc));
+}
+
+test "HNSW: parallel build is connected, structurally sound, and recalls as well as the sequential build" {
+    const alloc = std.testing.allocator;
+    const spec = OracleSpec{ .n = 2500, .dim = 48, .queries = 60, .k = 10 };
+    const corpus = try oracleCorpusN(alloc, spec.n, spec.dim);
+    defer alloc.free(corpus);
+    const ids = try batchIds(alloc, spec.n, 1);
+    defer alloc.free(ids);
+
+    var seq = HNSW.init(alloc, .{}, spec.dim);
+    defer seq.deinit();
+    try oracleFillN(&seq, corpus, spec.n, spec.dim);
+    const r_seq = try recallAgainst(&seq, alloc, corpus, spec);
+
+    var par = HNSW.init(alloc, .{}, spec.dim);
+    defer par.deinit();
+    try par.insertBatch(ids, corpus, .{ .threads = 4, .seed_nodes = 200 });
+
+    try std.testing.expectEqual(spec.n, par.count);
+    try expectStructurallySane(&par);
+    // Same level draws as the sequential build, whatever the scheduling.
+    try std.testing.expectEqual(seq.max_level, par.max_level);
+    try std.testing.expectEqual(seq.entry_point, par.entry_point);
+
+    const reached = try par.level0Reachable(alloc);
+    try std.testing.expect(reached * 1000 >= spec.n * 995);
+
+    // A loose floor, not the 0.5 pt acceptance gate: 60 queries at this size
+    // resolve about 2 pt. The gate is measured at 10k and 30k by
+    // `mem3-hnsw-recall --threads` and recorded in docs/roadmap.md.
+    const r_par = try recallAgainst(&par, alloc, corpus, spec);
+    try std.testing.expect(r_par >= r_seq - 0.03);
+    try std.testing.expect(r_par >= 0.9);
+}
+
+test "HNSW: a parallel batch can be appended to an index that already holds nodes" {
+    const alloc = std.testing.allocator;
+    const dim: u16 = 32;
+    const n: usize = 1500;
+    const corpus = try oracleCorpusN(alloc, n, dim);
+    defer alloc.free(corpus);
+
+    var idx = HNSW.init(alloc, .{}, dim);
+    defer idx.deinit();
+    try oracleFillN(&idx, corpus, 300, dim);
+
+    const ids = try batchIds(alloc, n - 300, 301);
+    defer alloc.free(ids);
+    try idx.insertBatch(ids, corpus[300 * dim ..], .{ .threads = 3, .seed_nodes = 100 });
+
+    try std.testing.expectEqual(n, idx.count);
+    try expectStructurallySane(&idx);
+    try std.testing.expect((try idx.level0Reachable(alloc)) * 1000 >= n * 995);
+    const spec = OracleSpec{ .n = n, .dim = dim, .queries = 40, .k = 10 };
+    try std.testing.expect((try recallAgainst(&idx, alloc, corpus, spec)) >= 0.9);
+
+    // A later single insert still works on the batch-built index.
+    var v: [32]f32 = undefined;
+    oracleCorpusVec(&v, 5000);
+    try idx.insert(5000, &v);
+    try std.testing.expectEqual(n + 1, idx.count);
+}
+
+test "HNSW: insertBatch rejects a repeated or already-present id and changes nothing" {
+    const alloc = std.testing.allocator;
+    const dim: u16 = 16;
+    const corpus = try oracleCorpusN(alloc, 50, dim);
+    defer alloc.free(corpus);
+
+    var idx = HNSW.init(alloc, .{}, dim);
+    defer idx.deinit();
+    try oracleFillN(&idx, corpus, 10, dim);
+    const before = try idx.graphFingerprint(alloc);
+
+    // Repeats an id inside the batch.
+    var dup = [_]u64{ 11, 12, 13, 12 };
+    try std.testing.expectError(errors.DuplicateId, idx.insertBatch(&dup, corpus[10 * dim ..][0 .. 4 * dim], .{ .threads = 2 }));
+    // Names an id the index holds.
+    var held = [_]u64{ 11, 5, 13, 14 };
+    try std.testing.expectError(errors.DuplicateId, idx.insertBatch(&held, corpus[10 * dim ..][0 .. 4 * dim], .{ .threads = 2 }));
+    // Wrong vector length.
+    var ok = [_]u64{ 11, 12 };
+    try std.testing.expectError(errors.InvalidQuery, idx.insertBatch(&ok, corpus[10 * dim ..][0 .. 3 * dim], .{}));
+
+    try std.testing.expectEqual(@as(usize, 10), idx.count);
+    try std.testing.expectEqual(@as(usize, 10), idx.visit_stamp.items.len);
+    try std.testing.expectEqual(before, try idx.graphFingerprint(alloc));
+}
+
+test "HNSW: a parallel batch over a sparse id space falls back to the map and stays sound" {
+    const alloc = std.testing.allocator;
+    const dim: u16 = 24;
+    const n: usize = 600;
+    const corpus = try oracleCorpusN(alloc, n, dim);
+    defer alloc.free(corpus);
+    const ids = try alloc.alloc(u64, n);
+    defer alloc.free(ids);
+    for (ids, 0..) |*x, i| x.* = 7 + @as(u64, @intCast(i)) * 5000;
+
+    var idx = HNSW.init(alloc, .{}, dim);
+    defer idx.deinit();
+    try idx.insertBatch(ids, corpus, .{ .threads = 3, .seed_nodes = 50 });
+    try std.testing.expect(!idx.dense_ok);
+    try std.testing.expectEqual(n, idx.count);
+    try expectStructurallySane(&idx);
+    try std.testing.expect((try idx.level0Reachable(alloc)) * 1000 >= n * 995);
+}
+
+test "HNSW: parallel build over int8 storage" {
+    const alloc = std.testing.allocator;
+    const dim: u16 = 48;
+    const n: usize = 1200;
+    const corpus = try oracleCorpusN(alloc, n, dim);
+    defer alloc.free(corpus);
+    const ids = try batchIds(alloc, n, 1);
+    defer alloc.free(ids);
+
+    var cfg = Config{};
+    cfg.hnsw_vector_storage = .int8;
+    var idx = HNSW.init(alloc, cfg, dim);
+    defer idx.deinit();
+    try idx.insertBatch(ids, corpus, .{ .threads = 3, .seed_nodes = 100, .build_quant = true });
+    try std.testing.expectEqual(@as(usize, 0), idx.bq.len); // ignored: already int8
+    try std.testing.expectEqual(n, idx.count);
+    try expectStructurallySane(&idx);
+    try std.testing.expect((try idx.level0Reachable(alloc)) * 1000 >= n * 995);
+    const spec = OracleSpec{ .n = n, .dim = dim, .queries = 40, .k = 10 };
+    try std.testing.expect((try recallAgainst(&idx, alloc, corpus, spec)) >= 0.9);
+}
+
+test "HNSW: build_quant builds with int8 distances, stores and queries in f32, and leaves no view behind" {
+    const alloc = std.testing.allocator;
+    const dim: u16 = 64;
+    const n: usize = 800;
+    const corpus = try oracleCorpusN(alloc, n, dim);
+    defer alloc.free(corpus);
+    const ids = try batchIds(alloc, n, 1);
+    defer alloc.free(ids);
+
+    var idx = HNSW.init(alloc, .{}, dim);
+    defer idx.deinit();
+    try idx.insertBatch(ids, corpus, .{ .build_quant = true });
+
+    // The build view is a build-time object only.
+    try std.testing.expectEqual(@as(usize, 0), idx.bq.len);
+    try std.testing.expectEqual(@as(usize, 0), idx.bq_norms.len);
+    // Stored vectors are the exact f32 input.
+    for ([_]usize{ 0, 1, 399, 799 }) |i| {
+        try std.testing.expectEqualSlices(f32, corpus[i * dim ..][0..dim], idx.nodes.get(@intCast(i + 1)).?.vector);
+    }
+    try expectStructurallySane(&idx);
+    try std.testing.expect((try idx.level0Reachable(alloc)) >= n - 2);
+
+    // Queries score in f32: a member's own score is exactly its f32 cosine.
+    var hits: usize = 0;
+    for (0..n) |i| {
+        const res = try idx.search(alloc, corpus[i * dim ..][0..dim], 1);
+        defer alloc.free(res);
+        if (res.len == 1 and res[0].id == i + 1) {
+            hits += 1;
+            try std.testing.expect(res[0].score > 0.9999);
+        }
+    }
+    try std.testing.expect(hits >= n * 99 / 100);
+
+    const spec = OracleSpec{ .n = n, .dim = dim, .queries = 50, .k = 10 };
+    try std.testing.expect((try recallAgainst(&idx, alloc, corpus, spec)) >= 0.95);
+}
+
+test "HNSW: a failed batch leaves the per-node arrays in lockstep and leaks nothing" {
+    const dim: u16 = 8;
+    const n: usize = 40;
+    const corpus = try oracleCorpusN(std.testing.allocator, n, dim);
+    defer std.testing.allocator.free(corpus);
+    const ids = try batchIds(std.testing.allocator, n, 1);
+    defer std.testing.allocator.free(ids);
+
+    // Fail the k-th allocation for every k a batch can reach.
+    var k: usize = 0;
+    while (k < 120) : (k += 1) {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = k });
+        const alloc = failing.allocator();
+        var hnsw = HNSW.init(alloc, .{}, dim);
+        defer hnsw.deinit();
+        hnsw.chunk_shift = 1;
+        hnsw.insertBatch(ids, corpus, .{ .build_quant = true }) catch {};
+        try std.testing.expectEqual(hnsw.visit_stamp.items.len, hnsw.by_idx.items.len);
+        try std.testing.expectEqual(hnsw.visit_stamp.items.len, hnsw.norms.items.len);
+        try std.testing.expectEqual(hnsw.count, hnsw.nodes.count());
+        try std.testing.expectEqual(hnsw.count, hnsw.by_idx.items.len);
+        // The build-time view never outlives the call, success or not.
+        try std.testing.expectEqual(@as(usize, 0), hnsw.bq.len);
+    }
 }

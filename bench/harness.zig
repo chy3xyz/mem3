@@ -76,6 +76,19 @@ pub fn cpuTimeMs() ?f64 {
     return (user_usec + sys_usec) / 1e3;
 }
 
+/// User-mode CPU milliseconds consumed by this process so far, summed over
+/// every thread. Wall time on a loaded host mostly measures the host; this
+/// is much less sensitive to it, and for a multi-threaded build it is the
+/// total work, so `user / wall` reads as the parallelism actually obtained.
+pub fn userCpuMs() ?f64 {
+    var usage: std.c.rusage = undefined;
+    if (std.c.getrusage(std.c.rusage.SELF, &usage) != 0) return null;
+    const T = @TypeOf(usage.utime);
+    const sec: i64 = if (@hasField(T, "sec")) usage.utime.sec else usage.utime.tv_sec;
+    const usec: i64 = if (@hasField(T, "usec")) usage.utime.usec else usage.utime.tv_usec;
+    return @as(f64, @floatFromInt(@max(sec, 0))) * 1e3 + @as(f64, @floatFromInt(@max(usec, 0))) / 1e3;
+}
+
 /// Peak resident set size in KB (`ru_maxrss`; bytes on macOS, KB on
 /// Linux). This is the high-water mark for the whole process, which is
 /// the honest number for a "< 500MB RSS" budget.

@@ -194,9 +194,22 @@ comptime {
 const log = std.log.scoped(.mem3_main);
 
 pub fn main(init: std.process.Init.Minimal) !void {
-    var gpa: std.heap.DebugAllocator(.{ .thread_safe = true }) = .init;
-    defer _ = gpa.deinit();
-    const alloc = gpa.allocator();
+    // Debug and ReleaseSafe keep the leak-checking DebugAllocator. In
+    // ReleaseFast/ReleaseSmall its safety is compiled out, so it checks
+    // nothing and only costs: a mutex, power-of-two size classes (a 264 B
+    // neighbour list takes a 512 B slot) and page caching. Measured at 100K
+    // cells: peak memory footprint 551.7 MB with it, 378.9 MB with
+    // `smp_allocator` (docs/roadmap.md, "1b"). `smp_allocator` is pure Zig
+    // and thread-safe, so the daemon's worker threads are covered.
+    var debug_gpa: std.heap.DebugAllocator(.{ .thread_safe = true }) = .init;
+    const checked = switch (builtin.mode) {
+        .Debug, .ReleaseSafe => true,
+        .ReleaseFast, .ReleaseSmall => false,
+    };
+    defer if (checked) {
+        _ = debug_gpa.deinit();
+    };
+    const alloc: std.mem.Allocator = if (checked) debug_gpa.allocator() else std.heap.smp_allocator;
 
     var args_iter = std.process.Args.iterate(init.args);
     _ = args_iter.next(); // skip exe name

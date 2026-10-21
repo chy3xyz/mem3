@@ -15,7 +15,7 @@
 | Theory | 三源合恰论 (物/象/性) + GHW 范式 (Goal/Harness/World) |
 | Spec-kit | Initialized; spec at `specs/001-trisource-everos-mvp/` |
 | Platforms | **macOS and Linux only** — Windows and WASM refused at compile time (see [Platforms](#platforms)) |
-| Status | **v0.1.0-alpha** (CLI + MCP + persistence + 665 tests + 12 constitution invariants, all measured). All 7 constitutional principles active. |
+| Status | **v0.1.0-alpha** (CLI + MCP + persistence + 675 tests + 12 constitution invariants, all measured). All 7 constitutional principles active. |
 
 ## Read Order for New Agents
 
@@ -137,7 +137,7 @@ tests/
 | Lexical arm | ✅ | `src/retrieval/bm25.zig`, Okapi BM25 over unigrams + bigrams, max-normalised inside the existing `λ_dense=0.5 / λ_sparse=0.2 / λ_graph=0.3` sum. Rebuilt from cells on snapshot restore, never serialised. Identifiers that live only in an `atomic_facts` triple went from 1/12 recall to 12/12 |
 | Persistence | ✅ | WAL-first + snapshot. WAL truncated on sync. `--wal-sync=always\|group\|interval:N` (default `always`, byte-identical); `interval` is weaker and documented as such. |
 | Daemon hygiene | ✅ | `serve`/`mcp` exit 0 on SIGINT/SIGTERM (`src/platform/signal.zig`: handler only stores an atomic; loops poll with a timeout). `--log-format`/`--log-every` feed `src/utils/logger.zig`; default is silent and byte-identical. JSONL goes to stderr only. |
-| Tests | ✅ | 665: 481 (`src/main.zig`-rooted) + 184 (`tests/main.zig`-rooted), plus 12 constitution invariants as a separate gate, 0 leaks |
+| Tests | ✅ | 675: 491 (`src/main.zig`-rooted) + 184 (`tests/main.zig`-rooted), plus 12 constitution invariants as a separate gate, 0 leaks |
 | Binary | ✅ | 963,704 bytes `ReleaseFast` / 4,569,032 bytes Debug, only links libSystem. The lexical arm added 49 KB ReleaseFast (+5.4%) over the 914,456 B measured before it |
 | Toolchain | ✅ | Pinned via `.zigversion` (Zig 0.17.0) |
 | Platforms | ✅ | macOS + Linux (x86_64 and aarch64). Windows/WASM refused at compile time — see [Platforms](#platforms) |
@@ -246,10 +246,10 @@ real gap, not a rounding error.
 |---|---|---|---|
 | MemCell write throughput | ≥ 1K/sec MVP / 1.75K/sec release (amended 2026-10-15, worst window) | worst window 1,863–2,438/sec; mean 3,116–3,898/sec | **pass** |
 | Top-10 query P95 | < 50ms MVP / < 10ms release (100K corpus) | 0.624 ms p95 (600-cell corpus) | not comparable — wrong corpus size |
-| HNSW build 100K vectors | < 30s | 115.3 s median, 105.9–120.6 (dim=384, efc=200, whole-index build; interleaved against `main` at 543.4 s, 437.3–580.0, same loaded host; was 430.6 s before the HNSW rework) | **MISS — 3.8x over** |
+| HNSW build 100K vectors | < 30s | **13.3 s median, 10.4–19.9** with `insertBatch` on 8 threads + construction-time int8 distances (`mem3-bench hnsw-build --threads=8 --build-quant` reports `met_target: true`; 3 interleaved rounds, 10-core M1 Pro, load 16–64; direct runs at load ~12–17: 13.3, 14.3 s). **Not** the live-store path: single thread is 62.2 s with `--build-quant` (57.2–71.9) and 142.6 s without (`main`, 123.7–189.7, same rounds; user CPU 125 s). 8 threads without `--build-quant`: 39.4 s median (23.4–49.3). Parallel graph is not reproducible; recall@10 within 0.5 pt of single-thread at 10k/30k. x86_64/Linux not run | **pass only in that configuration; default single-thread path MISS: 2.1x over with `--build-quant`, 4.8x over without** |
 | 3-hop traversal | < 5ms (1K seeds) | 0.000 ms/seed | pass |
 | Cold-start | < 200ms | 0.077 ms | pass |
-| RSS at 100K cells | < 500MB | 687.6 MB (idle host, before the HNSW rework; whole-process peak RSS, built-in embedder, no WAL, no consolidation). **Not re-verified since**: on a loaded host `time -l` read 426–2,768 MB for `main` and 331–579 MB for the branch at 100k, which is noise, not a result. Deterministic live-allocation floor: ~294 MB f32 / ~178 MB int8 (excludes allocator overhead) | **MISS (last idle-host measurement); unverified after rework** |
+| RSS at 100K cells | < 500MB | Peak memory footprint (`time -l`, MiB, built-in embedder, no WAL, no consolidation, `mem3-bench footprint --cells=100000`, re-measured 2026-10-22): **551.7** with the `DebugAllocator` the binary used to ship (6 runs, all 551.7), **378.9** with `smp_allocator` (4 runs, all 378.9), 227.3 with `smp_allocator` + int8 vectors (off by default). `ru_maxrss` on this swapped host read 123–318 MB for the same runs and is not used; no quiet host was available. Daemon RSS not measured. Live-allocation floor 280 MiB f32 / 170 MiB int8 | **pass with `smp_allocator` (now used by ReleaseFast/ReleaseSmall `mem3`); was a MISS (551.7) with `DebugAllocator`** |
 | Binary size | < 10MB stripped | 963,704 bytes ReleaseFast | pass |
 | External deps (ldd) | 0 | `otool -L` lists only `libSystem` | pass |
 | LongMemEval accuracy | ≥ 80% | 0.7292 core / 0.7083 padded (offline reimplementation, BM25 sparse arm active) | **MISS** |
@@ -320,7 +320,7 @@ The current spec-kit artifacts:
 ## Testing
 
 ```bash
-# All tests: 665 (481 src/main.zig-rooted + 184 tests/main.zig-rooted)
+# All tests: 675 (491 src/main.zig-rooted + 184 tests/main.zig-rooted)
 zig build test
 
 # Just the constitution invariants (12, separate root)
@@ -340,7 +340,7 @@ without re-executing**. When you need a count you can trust, drive the roots
 directly:
 
 ```bash
-zig test --dep mem3 -Mroot=src/main.zig  -Mmem3=src/lib.zig   # All 481 tests passed.
+zig test --dep mem3 -Mroot=src/main.zig  -Mmem3=src/lib.zig   # All 491 tests passed.
 zig test --dep mem3 -Mroot=tests/main.zig -Mmem3=src/lib.zig   # All 184 tests passed.
 zig test --dep mem3 -Mroot=tests/constitution/main.zig -Mmem3=src/lib.zig  # All 12 tests passed.
 ```
