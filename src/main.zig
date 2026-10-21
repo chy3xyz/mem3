@@ -177,6 +177,8 @@ comptime {
     _ = @import("mcp/tools.zig");
     _ = @import("mcp/server.zig");
     _ = @import("cli_commands/mcp.zig");
+    // The daemon entry point: banner, logger selection and signal wiring.
+    _ = @import("cli_commands/serve.zig");
 }
 
 const log = std.log.scoped(.mem3_main);

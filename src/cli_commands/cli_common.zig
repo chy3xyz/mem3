@@ -30,6 +30,7 @@ pub fn openStore(alloc: std.mem.Allocator, parsed: cli.Parsed) !*Store {
         .seed_default_goals = true,
         .embedder_cmd = parsed.embedder_cmd,
         .embedder_args = parsed.embedder_args.items,
+        .wal_sync = parsed.wal_sync,
     });
 }
 
