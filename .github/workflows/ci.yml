@@ -22,9 +22,9 @@ name: CI
 # Jobs:
 #   build-and-test       native build + every gate, on ubuntu x86_64, ubuntu
 #                        aarch64 (GitHub-hosted arm runner) and macOS arm64.
-#   cross-compile        the whole project (CLI, lib, bench, examples) compiled
-#                        for the four supported targets; compile-only, nothing
-#                        foreign is executed.
+#   cross-compile        the whole project (CLI, lib, bench, examples) AND the
+#                        three test roots compiled for the four supported
+#                        targets; compile-only, nothing foreign is executed.
 #   unsupported-targets  Windows and WASM must keep being REFUSED, with the
 #                        documented message. A refusal that silently rots into
 #                        an obscure compile error is a regression.
@@ -103,6 +103,13 @@ jobs:
       - name: Check linked libraries (Constitution IV)
         run: |
           set -euo pipefail
+          # Source-level tripwire (T073): nobody asks the linker for a system
+          # library or framework. The binary check below is the real gate; this
+          # one fails earlier and names the offending line.
+          if grep -n -E 'linkSystemLibrary|linkFramework' build.zig; then
+            echo "::error::build.zig links a system library/framework (Constitution IV)"
+            exit 1
+          fi
           ./scripts/check_linked_libs.sh --self-test
           for bin in zig-out/bin/*; do
             echo "::group::$bin"
@@ -132,6 +139,10 @@ jobs:
       # ReleaseFast failure is visible as an extra line. When the Timer fix
       # lands, delete `continue-on-error` and this comment: this step becomes
       # a gate.
+      #
+      # Measured locally (not on a runner): macOS arm64 fails exactly this one
+      # test (550/551); Linux aarch64 in a container passes 551/551 — the fold
+      # is not universal, so Linux x86_64 on a real runner may go either way.
       - name: 'zig build test -Doptimize=ReleaseFast (known failure: Timer, docs/roadmap.md)'
         continue-on-error: true
         run: |

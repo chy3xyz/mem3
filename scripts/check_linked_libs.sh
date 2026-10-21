@@ -143,6 +143,7 @@ self_test() {
 	self="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
 	dir="$(mktemp -d "${TMPDIR:-/tmp}/linked-libs-selftest.XXXXXX")"
 	# Expanded now, not at exit: `dir` is local and is gone by the time EXIT fires.
+	# shellcheck disable=SC2064
 	trap "rm -rf '$dir'" EXIT
 	: > "$dir/fakebin"
 
