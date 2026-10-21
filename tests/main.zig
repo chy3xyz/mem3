@@ -21,6 +21,7 @@ comptime {
     // Unit tests — per-module focused coverage of core algorithms.
     _ = @import("unit/coherence.zig");
     _ = @import("unit/consolidator.zig");
+    _ = @import("unit/consolidator_incremental.zig");
     _ = @import("unit/hnsw.zig");
     // The CLI argument parser. Zero tests previously, across 223 lines of
     // hand-rolled flag handling; three real parser bugs were found the day
