@@ -558,10 +558,23 @@ pub const HNSW = struct {
     /// search *samples* a slice of the corpus instead of navigating to the
     /// neighbourhood.
     ///
-    /// Both containers stay bounded (`frontier` by `budget`, because a node
-    /// only joins the frontier as it joins W), so the linear scans below
-    /// are far cheaper than the cosine evaluations they gate. A heap would
-    /// only move the constant factor.
+    /// Both containers are binary heaps. They used to be flat arrays scanned
+    /// linearly — once per pop to find the best frontier entry, once per
+    /// displacement to find the worst incumbent — on the theory that the
+    /// scans were "far cheaper than the cosine evaluations they gate". They
+    /// were not: measured by profile on a 12,000-vector build (dim 384,
+    /// efc 200), the frontier scan (avg 437 entries, 217 pops per insert)
+    /// was 16.9% of insert time and the worst-incumbent scan (avg 198
+    /// entries, 655 per insert) was 25.5%, against 40.6% for the cosine
+    /// kernel itself. `frontier` is not bounded by `budget` — an entry
+    /// joins it each time it displaces an incumbent — which is why its scan
+    /// was longer than `ef`.
+    ///
+    /// Equal scores are ordered by id (smaller id is "better"), so a
+    /// duplicate vector no longer depends on array position. With distinct
+    /// scores the visit order, and therefore the graph, is identical to the
+    /// scan version (`graphFingerprint` tests pin it); with exact ties the
+    /// choice among equals is now by id instead of by slot.
     fn searchLayer(self: *HNSW, q: Query, start: u64, ef: usize, level: u8) errors![]u64 {
         const budget = @max(ef, 1);
 
@@ -582,33 +595,15 @@ pub const HNSW = struct {
         try results.append(self.alloc, .{ .id = start, .score = start_score });
 
         while (frontier.items.len > 0) {
-            // Pop the closest unexpanded candidate.
-            var best_i: usize = 0;
-            for (frontier.items, 0..) |c, i| {
-                if (c.score > frontier.items[best_i].score) best_i = i;
-            }
-            const c = frontier.swapRemove(best_i);
+            // Pop the closest unexpanded candidate: the root of a max-heap.
+            const c = heapPop(frontier.items, candBetter);
+            frontier.items.len -= 1;
 
-            if (results.items.len >= budget and c.score < results.items[worstIdx(results.items)].score) break;
+            // `results` is a min-heap, so its root is the worst incumbent.
+            if (results.items.len >= budget and c.score < results.items[0].score) break;
 
             const node = self.nodeFor(c.id) orelse continue;
             if (level >= node.neighbors.len) continue;
-
-            // Locate the incumbent to displace once per expansion rather
-            // than once per neighbour: rescanning `results` inside the
-            // neighbour loop made the inner loop O(ef * degree) — 200 * 32
-            // comparisons for every node expanded at construction time,
-            // which dominated the whole search.
-            //
-            // `worst_valid` matters: while the beam is still filling, the
-            // cached index is meaningless and MUST be recomputed on the
-            // first neighbour seen *after* it fills. Caching it from the
-            // pre-fill state silently compared every candidate against
-            // `results[0]` and overwrote the best entry instead of the
-            // worst — measured as recall@10 dropping 0.5660 -> 0.5420 at
-            // ef = 10 before this was caught.
-            var worst: usize = 0;
-            var worst_valid = false;
 
             for (node.neighbors[level].items) |nid| {
                 const n = self.nodeFor(nid) orelse continue;
@@ -618,25 +613,21 @@ pub const HNSW = struct {
 
                 if (results.items.len < budget) {
                     try results.append(self.alloc, .{ .id = nid, .score = s });
+                    heapUp(results.items, results.items.len - 1, candWorse);
                     try frontier.append(self.alloc, .{ .id = nid, .score = s });
-                } else {
-                    if (!worst_valid) {
-                        worst = worstIdx(results.items);
-                        worst_valid = true;
-                    }
-                    if (s > results.items[worst].score) {
-                        results.items[worst] = .{ .id = nid, .score = s };
-                        try frontier.append(self.alloc, .{ .id = nid, .score = s });
-                        worst = worstIdx(results.items);
-                    }
+                    heapUp(frontier.items, frontier.items.len - 1, candBetter);
+                } else if (s > results.items[0].score) {
+                    results.items[0] = .{ .id = nid, .score = s };
+                    heapDown(results.items, 0, candWorse);
+                    try frontier.append(self.alloc, .{ .id = nid, .score = s });
+                    heapUp(frontier.items, frontier.items.len - 1, candBetter);
                 }
             }
         }
 
         std.mem.sort(Cand, results.items, {}, struct {
             fn lt(_: void, a: Cand, b: Cand) bool {
-                if (a.score != b.score) return a.score > b.score;
-                return a.id < b.id;
+                return candBetter(a, b);
             }
         }.lt);
 
@@ -717,14 +708,56 @@ pub const HNSW = struct {
     /// nested functions or local type declarations.
     const Cand = struct { id: u64, score: f32 };
 
-    /// Index of the lowest-scoring entry — the one a full result set
-    /// displaces when a better neighbour shows up.
-    fn worstIdx(items: []const Cand) usize {
-        var w: usize = 0;
-        for (items, 0..) |r, i| {
-            if (r.score < items[w].score) w = i;
+    /// Total order on candidates: higher score first, then smaller id.
+    fn candBetter(a: Cand, b: Cand) bool {
+        if (a.score != b.score) return a.score > b.score;
+        return a.id < b.id;
+    }
+
+    /// The reverse order, for the results min-heap whose root is the worst.
+    fn candWorse(a: Cand, b: Cand) bool {
+        return candBetter(b, a);
+    }
+
+    /// Restore the heap property upward from `i`. `first(a, b)` is true when
+    /// `a` belongs nearer the root than `b`.
+    fn heapUp(items: []Cand, start: usize, comptime first: fn (Cand, Cand) bool) void {
+        var i = start;
+        const item = items[i];
+        while (i > 0) {
+            const parent = (i - 1) / 2;
+            if (!first(item, items[parent])) break;
+            items[i] = items[parent];
+            i = parent;
         }
-        return w;
+        items[i] = item;
+    }
+
+    /// Restore the heap property downward from `i`.
+    fn heapDown(items: []Cand, start: usize, comptime first: fn (Cand, Cand) bool) void {
+        const n = items.len;
+        var i = start;
+        const item = items[i];
+        while (true) {
+            var child = 2 * i + 1;
+            if (child >= n) break;
+            if (child + 1 < n and first(items[child + 1], items[child])) child += 1;
+            if (!first(items[child], item)) break;
+            items[i] = items[child];
+            i = child;
+        }
+        items[i] = item;
+    }
+
+    /// Remove and return the root of the heap in `items`. The caller then
+    /// shrinks its list by one: the last slot is left stale.
+    fn heapPop(items: []Cand, comptime first: fn (Cand, Cand) bool) Cand {
+        const top = items[0];
+        const last = items.len - 1;
+        if (last == 0) return top;
+        items[0] = items[last];
+        heapDown(items[0..last], 0, first);
+        return top;
     }
 
     /// Maximum adjacency-list length at `level`.
@@ -2035,4 +2068,42 @@ test "HNSW: graph fingerprint, small m and efc, 1500 x 24" {
     if (comptime !fingerprint_pinned) return error.SkipZigTest;
     const fp = try fingerprintOf(std.testing.allocator, 1500, 24, cfg);
     try std.testing.expectEqual(@as(u64, 2861090809599722439), fp);
+}
+
+test "HNSW: candidate heaps pop in total order, ties broken by id" {
+    const alloc = std.testing.allocator;
+    var heap = std.ArrayList(HNSW.Cand).empty;
+    defer heap.deinit(alloc);
+
+    // Scores drawn from 5 values so most entries tie; ids are distinct.
+    var seed: u64 = 0xC0FFEE;
+    var i: u64 = 0;
+    while (i < 500) : (i += 1) {
+        seed = seed *% 6364136223846793005 +% 1442695040888963407;
+        const sc: f32 = @floatFromInt((seed >> 33) % 5);
+        try heap.append(alloc, .{ .id = i, .score = sc });
+        HNSW.heapUp(heap.items, heap.items.len - 1, HNSW.candBetter);
+    }
+
+    var prev: ?HNSW.Cand = null;
+    while (heap.items.len > 0) {
+        const c = HNSW.heapPop(heap.items, HNSW.candBetter);
+        heap.items.len -= 1;
+        if (prev) |p| try std.testing.expect(HNSW.candBetter(p, c));
+        prev = c;
+    }
+
+    // The min-heap view: root is the worst, so draining yields ascending.
+    var j: u64 = 0;
+    while (j < 100) : (j += 1) {
+        try heap.append(alloc, .{ .id = j, .score = @floatFromInt(j % 7) });
+        HNSW.heapUp(heap.items, heap.items.len - 1, HNSW.candWorse);
+    }
+    var prev_w: ?HNSW.Cand = null;
+    while (heap.items.len > 0) {
+        const c = HNSW.heapPop(heap.items, HNSW.candWorse);
+        heap.items.len -= 1;
+        if (prev_w) |p| try std.testing.expect(HNSW.candWorse(p, c));
+        prev_w = c;
+    }
 }
