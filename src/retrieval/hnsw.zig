@@ -954,6 +954,39 @@ pub const HNSW = struct {
         return top;
     }
 
+    /// Order-independent-of-layout digest of the graph's *structure*: entry
+    /// point, top level, and for every id (ascending) its level and each
+    /// layer's neighbour list in stored order. Vectors are not hashed.
+    ///
+    /// Exists so a performance change that claims "same graph" has to prove
+    /// it: two builds from the same corpus and seed either agree on this
+    /// number or they built different indexes. It reads only ids and list
+    /// order, so it does not move when the storage behind them does.
+    pub fn graphFingerprint(self: *HNSW, alloc: Allocator) !u64 {
+        const ids = try alloc.alloc(u64, self.nodes.count());
+        defer alloc.free(ids);
+        var it = self.nodes.keyIterator();
+        var i: usize = 0;
+        while (it.next()) |k| : (i += 1) ids[i] = k.*;
+        std.mem.sort(u64, ids, {}, std.sort.asc(u64));
+
+        var h = std.hash.Wyhash.init(0x6D65_6D33);
+        const ep: u64 = self.entry_point orelse 0;
+        h.update(std.mem.asBytes(&ep));
+        h.update(std.mem.asBytes(&self.max_level));
+        for (ids) |id| {
+            const n = self.nodes.get(id).?;
+            h.update(std.mem.asBytes(&id));
+            h.update(std.mem.asBytes(&n.level));
+            for (n.neighbors) |list| {
+                const len: u32 = @intCast(list.items.len);
+                h.update(std.mem.asBytes(&len));
+                h.update(std.mem.sliceAsBytes(list.items));
+            }
+        }
+        return h.final();
+    }
+
     pub fn cosineSim(self: *HNSW, a: []const f32, b: []const f32) f32 {
         _ = self;
         const denom = normOf(a) * normOf(b);
@@ -1954,4 +1987,52 @@ test "HNSW: max_id high-water mark tracks the largest accepted id" {
     try std.testing.expectEqual(@as(u64, 9), hnsw.max_id);
     try std.testing.expectEqual(@as(usize, 3), hnsw.count);
     try assertCountMatchesDistinctIds(&hnsw);
+}
+
+// =============================================================================
+// Graph-structure fingerprint
+// =============================================================================
+//
+// A change to the distance kernel, the candidate containers or the vector
+// storage is supposed to be invisible to the graph. "Invisible" is checked
+// here, not argued: the constants below were taken from the tree *before*
+// the first HNSW performance change (commit 03e588f) and a refactor that
+// claims bit-identity must reproduce them. A change that deliberately
+// alters the graph (a different pruning rule, a different default) must
+// update them in the same commit and say why.
+//
+// Both corpora are tie-free (splitmix64-derived, distinct scores), so the
+// result does not depend on how equal-scored candidates are ordered.
+
+// The constants were taken on aarch64. `@reduce(.Add)` in `dotProduct` is
+// free to sum its lanes in a target-specific order, so an x86-64 build can
+// round a score one ULP differently, and a one-ULP difference is enough to
+// flip a near-tie in the pruning heuristic and legitimately build a
+// different graph. Off aarch64 the tests skip (and say so) rather than pin a
+// number that is only true on one ISA.
+const fingerprint_pinned = @import("builtin").cpu.arch == .aarch64;
+
+fn fingerprintOf(alloc: std.mem.Allocator, n: usize, dim: u16, cfg: Config) !u64 {
+    var hnsw = HNSW.init(alloc, cfg, dim);
+    defer hnsw.deinit();
+    const corpus = try oracleCorpusN(alloc, n, dim);
+    defer alloc.free(corpus);
+    try oracleFillN(&hnsw, corpus, n, dim);
+    return hnsw.graphFingerprint(alloc);
+}
+
+test "HNSW: graph fingerprint, shipped config, 400 x 32" {
+    if (comptime !fingerprint_pinned) return error.SkipZigTest;
+    const fp = try fingerprintOf(std.testing.allocator, 400, 32, .{});
+    try std.testing.expectEqual(@as(u64, 5441432509814034711), fp);
+}
+
+test "HNSW: graph fingerprint, small m and efc, 1500 x 24" {
+    var cfg = Config{};
+    cfg.hnsw_m = 8;
+    cfg.hnsw_m_max0 = 16;
+    cfg.hnsw_ef_construction = 64;
+    if (comptime !fingerprint_pinned) return error.SkipZigTest;
+    const fp = try fingerprintOf(std.testing.allocator, 1500, 24, cfg);
+    try std.testing.expectEqual(@as(u64, 2861090809599722439), fp);
 }
