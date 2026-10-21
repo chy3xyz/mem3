@@ -1,13 +1,13 @@
 //! Three-source coherence: C_tri = C_MF · C_FS · C_SM.
 //!
-//! **GHW Layer**: Memory (三源合恰). Implements the Coherence
-//! Calculator described in the paper §4.2 (L2 三源合恰记忆层).
+//! **GHW Layer**: Memory (tri-source coherence). Implements the Coherence
+//! Calculator described in the paper §4.2 (L2 tri-source coherence memory layer).
 //!
 //! ## Constitution compliance
-//! - Principle I (三源完整性): the three pairwise cosines are computed
+//! - Principle I (Tri-Source Integrity): the three pairwise cosines are computed
 //!   from explicit fields of the cell (episode, atomic_facts,
 //!   foresight, goal_associations) — no field is invented.
-//! - Principle V (零拷贝): all comparisons operate on borrowed slices;
+//! - Principle V (zero-copy): all comparisons operate on borrowed slices;
 //!   no per-call allocations beyond a single token-bitset buffer.
 //!
 //! ## Algorithm
@@ -96,7 +96,7 @@ pub const CoherenceCalculator = struct {
     /// Compute C_SM: spirit ↔ matter coherence, Jaccard similarity
     /// of the token sets of `foresight + goal_associations` (spirit)
     /// and `episode` (matter). The closing of the triangle
-    /// (matter→form→spirit→matter) gives the "三源合恰" property
+    /// (matter→form→spirit→matter) gives the "tri-source coherence" property
     /// its name.
     pub fn spiritMatterCoherence(self: *CoherenceCalculator, cell: *const MemCell) f32 {
         @memset(&self.scratch_a, 0);

@@ -1,6 +1,6 @@
 //! GoalNode — a single node in the Goal Poset.
 //!
-//! **GHW Layer**: Goal (性源).
+//! **GHW Layer**: Goal (spirit source).
 
 const std = @import("std");
 const core_types = @import("../core/types.zig");

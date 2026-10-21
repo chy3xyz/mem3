@@ -1,6 +1,6 @@
 //! JSON writing helpers for the MCP server's response side.
 //!
-//! **GHW layer**: Harness 层 (象源).
+//! **GHW layer**: Harness layer (form source).
 //!
 //! `src/utils/jsonl.zig` owns the escaping rules (`writeJsonString`).
 //! This module owns the *shape* of a response: how to open an object,

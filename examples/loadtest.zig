@@ -46,9 +46,9 @@ pub fn main() !void {
     const episode_templates = [_][]const u8{
         "zig 0.17 std.Io release notes",
         "GHW architecture mapping",
-        "存在增益 dynamics derivation",
-        "双向通演 mechanism description",
-        "三源合恰 ontology definition",
+        "existence gain dynamics derivation",
+        "bidirectional communication mechanism description",
+        "Tri-Source Coherence ontology definition",
         "compaction strategy for SSTable",
         "HNSW beam search parameter tuning",
         "WAL recovery semantics",

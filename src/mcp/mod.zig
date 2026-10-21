@@ -6,7 +6,7 @@
 //! channel: the market for a memory tool is reached through MCP, and
 //! nothing about `mem3 serve` speaks it. This is the surface that lets
 //! Claude Code — or any other MCP client — attach mem3 as a tool
-//! server and keep a real 三源 memory between sessions.
+//! server and keep a real tri-source memory between sessions.
 //!
 //! ## Layering
 //!
@@ -14,12 +14,12 @@
 //!
 //! | File         | Layer | Role |
 //! |--------------|-------|------|
-//! | `json.zig`   | Harness (象) | parse an incoming envelope |
-//! | `framing.zig`| Harness (象) | decide what a *message* is |
-//! | `protocol.zig`| Harness (象) | JSON-RPC validation and response shapes |
+//! | `json.zig`   | Harness (form) | parse an incoming envelope |
+//! | `framing.zig`| Harness (form) | decide what a *message* is |
+//! | `protocol.zig`| Harness (form) | JSON-RPC validation and response shapes |
 //! | `tools.zig`  | all three      | the tools, which cross Goal → Harness → World inside `Store` |
-//! | `json_out.zig`| Harness (象) | response writing and float safety |
-//! | `server.zig` | Harness (象) | the stdio loop |
+//! | `json_out.zig`| Harness (form) | response writing and float safety |
+//! | `server.zig` | Harness (form) | the stdio loop |
 //!
 //! No file here reaches into another layer's state: every memory
 //! operation goes through `store.Store`, which owns the traversal.
@@ -31,7 +31,7 @@
 //!
 //! ## Why the parser is hand-written
 //!
-//! Constitution IV (零依赖) forbids adding an MCP or JSON library, and
+//! Constitution IV (zero dependency) forbids adding an MCP or JSON library, and
 //! `src/utils/jsonl.zig` is a *writer*. `json.zig` is the reader, with
 //! two size caps, an explicit escape policy (unknown escapes are
 //! preserved, never dropped — the `utils/logger.zig` bug) and a

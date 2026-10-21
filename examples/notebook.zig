@@ -16,7 +16,7 @@ pub fn main() !void {
     const alloc = gpa.allocator();
 
     std.debug.print("=== mem3 example: researcher's notebook ===\n", .{});
-    std.debug.print("(三源合恰 + GHW 范式 end-to-end demo)\n\n", .{});
+    std.debug.print("(Tri-Source Coherence + GHW paradigm end-to-end demo)\n\n", .{});
 
     // 1. Goal Poset
     var next_id: std.atomic.Value(u64) = .init(1);
@@ -48,8 +48,8 @@ pub fn main() !void {
         .{ .source = .spirit, .episode = "ship v0.1.0-alpha", .goal_id = g_mem3, .relevance = 1.0 },
         .{ .source = .spirit, .episode = "release tag planned for next week", .goal_id = g_mem3, .relevance = 0.8 },
         .{ .source = .matter, .episode = "GHW paper §3.2 mapping table", .goal_id = g_ghw, .relevance = 0.85 },
-        .{ .source = .form, .episode = "存在增益 dynamics equation", .goal_id = g_ghw, .relevance = 0.95 },
-        .{ .source = .form, .episode = "双向通演 mechanism", .goal_id = g_ghw, .relevance = 0.9 },
+        .{ .source = .form, .episode = "existence gain dynamics equation", .goal_id = g_ghw, .relevance = 0.95 },
+        .{ .source = .form, .episode = "bidirectional communication mechanism", .goal_id = g_ghw, .relevance = 0.9 },
         .{ .source = .spirit, .episode = "compose self-evolution cycle", .goal_id = g_ghw, .relevance = 1.0 },
         .{ .source = .spirit, .episode = "agent kernel design philosophy", .goal_id = g_ghw, .relevance = 0.95 },
         .{ .source = .matter, .episode = "knowledge graph schema v2", .goal_id = g_learn3, .relevance = 0.7 },
@@ -59,7 +59,7 @@ pub fn main() !void {
         .{ .source = .matter, .episode = "WAL recovery semantics", .goal_id = g_mem3, .relevance = 0.7 },
         .{ .source = .form, .episode = "HNSW algorithm analysis", .goal_id = g_ghw, .relevance = 0.5 },
         .{ .source = .form, .episode = "category theory semantics", .goal_id = g_ghw, .relevance = 0.6 },
-        .{ .source = .spirit, .episode = "三源合恰 philosophy essay", .goal_id = g_ghw, .relevance = 0.9 },
+        .{ .source = .spirit, .episode = "Tri-Source Coherence philosophy essay", .goal_id = g_ghw, .relevance = 0.9 },
         .{ .source = .spirit, .episode = "go to ghw weekly", .goal_id = g_ghw, .relevance = 0.5 },
         .{ .source = .matter, .episode = "read paper on Mem0", .goal_id = g_learn3, .relevance = 0.5 },
         .{ .source = .form, .episode = "compare mag vs everos vs mem3", .goal_id = g_learn3, .relevance = 0.6 },
