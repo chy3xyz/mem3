@@ -803,7 +803,13 @@ the official Zig 0.17.0 tarball, sha256-checked):
   ReleaseFast test step (macOS: 550/551, only `Timer measures a non-zero,
   monotonic duration`; **Linux aarch64: 551/551, the fold did not reproduce**) and
   the Linux `zig build test` race below. The gate-can-go-red guard went red on
-  both. `python3 scripts/mcp_conformance.py` passes on both (and 56/56 on x86_64).
+  both. `python3 scripts/mcp_conformance.py` passes on macOS and, on Linux, passed
+56/56 (aarch64, first run), 56/56 (x86_64 cross-build under Rosetta) and 5/5 reruns;
+under a host load average of 130–195 (other jobs on the same Mac) both platforms
+also produced 55/56, the failing check on macOS being `a very large but legal request
+is answered, not refused` — a fixed 5 s wait in the script for a 200 KB query, which
+is a timing artefact of the loaded host rather than evidence about the server (the
+next run was 56/56). On Linux the failing check of that one 55/56 run was not captured.
 - `cross-compile` commands: all four targets built in Debug and ReleaseFast;
   `file` output matched the expected format for all eight artifacts under
   macOS `file` and Ubuntu's `file` 5.45; the test roots compiled for all four.
@@ -840,6 +846,11 @@ for Linux before):
    arm64 4/200. A Linux `zig build test` will therefore fail on most runs until
    `embed` waits a bounded time for the child after `EPIPE`. This is a `src/`
    behaviour change, outside what this CI work was allowed to touch.
+
+4. Timing-sensitive, not investigated: `GoalPoset: bindMemcell is O(1)
+   amortised, not O(k) per insert` (`large < small * 3`, a wall-clock ratio)
+   failed once on Linux aarch64 in a final run made while the host's load average
+   was above 100. Expect it to flake on a busy runner.
 
 The `scripts/verify.sh` "Linux runtime behaviour" caveat still holds for that
 script itself (it only cross-compiles); the container runs above are a one-off,

@@ -153,7 +153,7 @@ jobs:
             failed="$(grep -E "^error: '.+' failed" "$RUNNER_TEMP/releasefast-test.log" || true)"
             {
               echo "### ReleaseFast test run FAILED (exit $rc)"
-              echo "Known: \`platform.clock.test.Timer measures a non-zero, monotonic duration\` (docs/roadmap.md)."
+              echo "Known (macOS): \`platform.clock.test.Timer measures a non-zero, monotonic duration\` (docs/roadmap.md). Any OTHER line below is a new failure."
               echo '```'
               if [ -n "$failed" ]; then echo "$failed"; else echo "no per-test failure line: build/compile failure, see log"; fi
               echo '```'
