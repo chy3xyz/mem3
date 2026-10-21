@@ -275,6 +275,26 @@ jobs:
             fi
           done
 
+      # `zig build` never builds the test roots, so it cannot notice a test that
+      # does not compile for the target. That is not hypothetical: a test in
+      # src/storage/wal.zig called `std.c.fstat`, whose `Stat` is `void` on
+      # Linux, so the whole `src/main.zig` test binary failed to compile on
+      # Linux while every cross-compile above stayed green. Compile each test
+      # root for the target (`--test-no-exec`: build it, never run it).
+      - name: Compile (not run) the three test roots for ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          out="${RUNNER_TEMP:-/tmp}/xtest-$TARGET"
+          rm -rf "$out"; mkdir -p "$out"
+          for root in src/main.zig tests/main.zig tests/constitution/main.zig; do
+            name="$(printf '%s' "$root" | tr '/.' '__')"
+            echo "::group::zig test --test-no-exec $root -target $TARGET"
+            zig test -target "$TARGET" --test-no-exec -femit-bin="$out/$name" \
+              --dep mem3 -Mroot="$root" -lc -Mmem3=src/lib.zig -lc
+            echo "::endgroup::"
+            [ -s "$out/$name" ] || { echo "::error::test binary for $root is missing or empty ($TARGET)"; exit 1; }
+          done
+
   # ---------------------------------------------------------------------------
   # The platform-scope refusal (constitution v1.1.0, amendment 2026-10-14) must
   # keep firing. For each unsupported target the build must FAIL and its output

@@ -493,25 +493,13 @@ test "WAL: append + replay" {
     try wal.append(.{ .record_type = .memcell_insert, .payload = "world", .timestamp = 2000 });
     try wal.flush();
 
-    // Replay from disk. Use POSIX open via std.c — Zig 0.17 removed
-    // std.fs.cwd(), and std.posix.openat wants a directory fd.
-    var zpath: [std.fs.max_path_bytes + 1]u8 = undefined;
-    const z = try std.fmt.bufPrint(&zpath, "{s}\x00", .{wal_path});
-    const zslice = z[0 .. z.len - 1 :0];
-    const fd = std.c.open(zslice.ptr, std.c.O{}, @as(std.c.mode_t, 0));
-    try std.testing.expect(fd >= 0);
-    defer _ = std.c.close(fd);
-    var stat_buf: std.c.Stat = undefined;
-    try std.testing.expect(std.c.fstat(fd, &stat_buf) == 0);
-    const stat_size: usize = @intCast(@max(0, stat_buf.size));
-    const buf = try std.testing.allocator.alloc(u8, stat_size);
+    // Replay from disk. Read through the platform layer, not `std.c.fstat`:
+    // `std.c.Stat` is `void` on Linux in Zig 0.17, so the old direct call
+    // compiled on macOS and made the whole `src/main.zig` test binary fail to
+    // compile on Linux (found by running the suite in a Linux container;
+    // cross-compiling `zig build` never builds the test root).
+    const buf = try slurp(std.testing.allocator, wal_path);
     defer std.testing.allocator.free(buf);
-    var got: usize = 0;
-    while (got < stat_size) {
-        const n = std.c.read(fd, buf[got..].ptr, stat_size - got);
-        if (n <= 0) break;
-        got += @intCast(n);
-    }
 
     var records: usize = 0;
     const Cb = struct {
