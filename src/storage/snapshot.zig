@@ -60,6 +60,35 @@ pub const SNAPSHOT_MAGIC: u32 = 0x4D45_4D53; // "MEMS" in little-endian
 
 /// Current on-disk format version.
 ///
+/// ## v3 — cell rows carry `superseded_by`
+///
+/// Appended to the END of every cell row (active and fuzzy alike), after
+/// `fuzzed_at`:
+///
+///     flags u8  [+ superseded_by u64 if bit 0]
+///
+/// `flags` bit 0 = has `superseded_by` (the only bit the first v3 writer
+/// used, as a 0/1 bool, so those files read unchanged); bit 1 =
+/// `supersede_pinned` (an operator ran `mem3 unsupersede`; the cell is never
+/// superseded again). Unknown bits are ignored.
+///
+/// Everything before it is byte-for-byte what v2 wrote, so a v3 reader
+/// loads a v1/v2 file by not reading the suffix: such a cell comes back with
+/// `superseded_by = null` (and, if it was superseded at all, a
+/// `superseded_at` that names no superseder). `superseded_at` itself has
+/// been in the cell row since v1 and did not change. **Existing v1/v2 files
+/// still load.** A v3 file does NOT load on a v2 build (`SnapshotBadVersion`,
+/// which `Store.loadSnapshot` reports as "no valid snapshot"): upgrade, do
+/// not downgrade — after a snapshot the WAL is empty of cells, so a build
+/// that refuses the snapshot has nothing to rebuild them from.
+pub const SNAPSHOT_VERSION: u32 = 3;
+
+const SUPERSEDED_BY_BIT: u8 = 1;
+const SUPERSEDE_PINNED_BIT: u8 = 2;
+
+/// Format version 2: goal rows carry their timestamps (`SNAPSHOT_VERSION`
+/// above is the current one).
+///
 /// ## v2 — goal rows carry their timestamps
 ///
 /// Appended to the END of every goal row, after `priority`:
@@ -96,7 +125,7 @@ pub const SNAPSHOT_MAGIC: u32 = 0x4D45_4D53; // "MEMS" in little-endian
 /// silently did not apply to it, while a WAL-replayed store aged its
 /// goals correctly. Same store, two restore paths, two behaviours,
 /// decided by whether a snapshot happened to exist.
-pub const SNAPSHOT_VERSION: u32 = 2;
+pub const SNAPSHOT_VERSION_V2: u32 = 2;
 
 /// The original format: a goal row ended at `priority`.
 pub const SNAPSHOT_VERSION_LEGACY: u32 = 1;
@@ -475,6 +504,12 @@ fn writeCellSnapshot(w: *BufferedWriter, cell: CellSnapshot) !void {
     if (cell.metadata.superseded_at) |ts| try w.writeI64(ts);
     try w.writeBool(cell.metadata.fuzzed_at != null);
     if (cell.metadata.fuzzed_at) |ts| try w.writeI64(ts);
+    // v3 suffix. See SNAPSHOT_VERSION.
+    var flags: u8 = 0;
+    if (cell.metadata.superseded_by != null) flags |= SUPERSEDED_BY_BIT;
+    if (cell.metadata.supersede_pinned) flags |= SUPERSEDE_PINNED_BIT;
+    try w.writeU8(flags);
+    if (cell.metadata.superseded_by) |by| try w.writeU64(by);
 }
 
 /// Reader. Returns SnapshotData which the caller restores into their
@@ -512,6 +547,7 @@ pub fn read(alloc: Allocator, path: []const u8) !SnapshotData {
         return error.SnapshotBadVersion;
     }
     const has_goal_timestamps = version >= 2;
+    const has_superseded_by = version >= 3;
 
     const counter = try r.readU64();
 
@@ -594,7 +630,7 @@ pub fn read(alloc: Allocator, path: []const u8) !SnapshotData {
         alloc.free(cells);
     }
     for (cells) |*cell| {
-        try readCellSnapshot(alloc, &r, cell);
+        try readCellSnapshot(alloc, &r, cell, has_superseded_by);
         cells_filled += 1;
     }
 
@@ -612,7 +648,7 @@ pub fn read(alloc: Allocator, path: []const u8) !SnapshotData {
         alloc.free(fuzzy_cells);
     }
     for (fuzzy_cells) |*cell| {
-        try readCellSnapshot(alloc, &r, cell);
+        try readCellSnapshot(alloc, &r, cell, has_superseded_by);
         fuzzy_filled += 1;
     }
 
@@ -625,7 +661,7 @@ pub fn read(alloc: Allocator, path: []const u8) !SnapshotData {
     };
 }
 
-fn readCellSnapshot(alloc: Allocator, r: *BufferedReader, cell: *CellSnapshot) !void {
+fn readCellSnapshot(alloc: Allocator, r: *BufferedReader, cell: *CellSnapshot, has_superseded_by: bool) !void {
     const cs = cell;
     cs.id = try r.readU64();
     cs.source = try readEnumByte(MemorySource, r);
@@ -690,6 +726,13 @@ fn readCellSnapshot(alloc: Allocator, r: *BufferedReader, cell: *CellSnapshot) !
     cs.metadata.superseded_at = if (has_sup) try r.readI64() else null;
     const has_fuzz = try r.readBool();
     cs.metadata.fuzzed_at = if (has_fuzz) try r.readI64() else null;
+    cs.metadata.superseded_by = null;
+    cs.metadata.supersede_pinned = false;
+    if (has_superseded_by) {
+        const flags = try r.readU8();
+        cs.metadata.superseded_by = if (flags & SUPERSEDED_BY_BIT != 0) try r.readU64() else null;
+        cs.metadata.supersede_pinned = flags & SUPERSEDE_PINNED_BIT != 0;
+    }
     // Nothing below can fail, so ownership transfers cleanly.
     cs.metadata.location = location;
 }
@@ -1585,6 +1628,93 @@ test "Snapshot: a v1 file from the previous version still loads, with the timest
         try std.testing.expectEqual(@as(?i64, null), got.deadline);
         try std.testing.expectEqual(@as(?i64, null), got.unrealized_at);
     }
+}
+
+test "Snapshot: superseded_by round-trips, and a v2 file (no such field) still loads" {
+    const alloc = std.testing.allocator;
+    var cur_buf: [128]u8 = undefined;
+    var old_buf: [128]u8 = undefined;
+    const cur_path = goalTestPath(&cur_buf, "v3cells");
+    const old_path = goalTestPath(&old_buf, "v2cells");
+    unlinkIfPresent(cur_path);
+    unlinkIfPresent(old_path);
+    defer unlinkIfPresent(cur_path);
+    defer unlinkIfPresent(old_path);
+
+    var ids: std.atomic.Value(u64) = .init(1);
+    var mgr = TriSourceManager.init(alloc, &ids);
+    defer mgr.deinit();
+    var fuzzy = FuzzyStore.init(alloc);
+    defer fuzzy.deinit();
+    var goals = GoalPoset.init(alloc);
+    defer goals.deinit();
+
+    const base: MemCell = .{
+        .id = 0,
+        .source = .matter,
+        .episode = "the user lives in Paris",
+        .atomic_facts = &.{},
+        .foresight = &.{},
+        .goal_associations = &.{.{ .goal_id = 1, .relevance = 0.5, .priority = 1 }},
+        .metadata = .{},
+    };
+    // 1. One current cell: its v3 record ends in a single `false` byte, which
+    //    is exactly what a v2 file lacks.
+    _ = try mgr.add(base);
+    var w = SnapshotWriter.init(alloc, cur_path);
+    _ = try w.write(5, &goals, &mgr, &fuzzy);
+    const raw = try readRawFile(alloc, cur_path);
+    defer alloc.free(raw);
+    try std.testing.expectEqual(@as(u32, SNAPSHOT_VERSION), std.mem.readInt(u32, raw[4..8], .little));
+    // ... then the 8-byte fuzzy-cell count closes the file.
+    const suffix_at = raw.len - 8 - 1;
+    try std.testing.expectEqual(@as(u8, 0), raw[suffix_at]);
+
+    var v2 = try alloc.alloc(u8, raw.len - 1);
+    defer alloc.free(v2);
+    @memcpy(v2[0..suffix_at], raw[0..suffix_at]);
+    @memcpy(v2[suffix_at..], raw[suffix_at + 1 ..]);
+    std.mem.writeInt(u32, v2[4..8], SNAPSHOT_VERSION_V2, .little);
+    {
+        var zb: [platform_fs.max_path_bytes + 1]u8 = undefined;
+        const z = std.fmt.bufPrint(&zb, "{s}\x00", .{old_path}) catch return error.SnapshotPathTooLong;
+        const fd = try platform_fs.open(z[0 .. z.len - 1 :0], .{ .access = .write_only, .create = .truncate });
+        var bw: BufferedWriter = .{ .fd = fd };
+        for (v2) |b| try bw.writeU8(b);
+        try bw.flush();
+        platform_fs.close(fd);
+    }
+    {
+        var data = try read(alloc, old_path);
+        defer data.deinit();
+        try std.testing.expectEqual(@as(usize, 1), data.cells.len);
+        try std.testing.expectEqualStrings("the user lives in Paris", data.cells[0].episode);
+        try std.testing.expectEqual(@as(?u64, null), data.cells[0].metadata.superseded_by);
+        try std.testing.expectEqual(@as(?i64, null), data.cells[0].metadata.superseded_at);
+    }
+
+    // 2. A superseded cell keeps both fields through write + read.
+    var cell2 = base;
+    cell2.episode = "the user moved to Berlin";
+    cell2.metadata.superseded_at = 1234;
+    cell2.metadata.superseded_by = 99;
+    _ = try mgr.add(cell2);
+    var w2 = SnapshotWriter.init(alloc, cur_path);
+    _ = try w2.write(6, &goals, &mgr, &fuzzy);
+    var data = try read(alloc, cur_path);
+    defer data.deinit();
+    try std.testing.expectEqual(@as(usize, 2), data.cells.len);
+    var saw = false;
+    for (data.cells) |c| {
+        if (std.mem.eql(u8, c.episode, "the user moved to Berlin")) {
+            saw = true;
+            try std.testing.expectEqual(@as(?i64, 1234), c.metadata.superseded_at);
+            try std.testing.expectEqual(@as(?u64, 99), c.metadata.superseded_by);
+        } else {
+            try std.testing.expectEqual(@as(?u64, null), c.metadata.superseded_by);
+        }
+    }
+    try std.testing.expect(saw);
 }
 
 test "Snapshot: an unknown version is refused rather than guessed at" {

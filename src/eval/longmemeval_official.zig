@@ -41,6 +41,8 @@ const Allocator = std.mem.Allocator;
 
 const store_mod = @import("../store/store.zig");
 const core = @import("../core/mod.zig");
+const abl = @import("lme_ablation.zig");
+const time = @import("../utils/time.zig");
 
 /// Cut-offs reported. 1/3/5/10 are the task; 30 and 50 are what the official
 /// script also records.
@@ -257,6 +259,10 @@ pub const Question = struct {
     haystack_session_ids: []const []const u8,
     haystack_sessions: []const []const Turn,
     answer_session_ids: []const []const u8 = &.{},
+    /// Read only by the ablation variants that simulate age
+    /// (`Variant.simulate_age`); the default harness never looks at them.
+    haystack_dates: []const []const u8 = &.{},
+    question_date: []const u8 = "",
 };
 
 pub const Span = struct { start: usize, end: usize };
@@ -370,6 +376,9 @@ pub fn answerIdsDisagree(q: Question) bool {
 pub const Doc = struct {
     id: []const u8,
     text: []const u8,
+    /// Index of the haystack session this document came from. Documents are
+    /// emitted in session order, so equal values are contiguous.
+    session: u32 = 0,
 };
 
 pub fn freeDocs(alloc: Allocator, docs: []Doc) void {
@@ -421,7 +430,7 @@ pub fn buildDocs(alloc: Allocator, q: Question, gran: Granularity, roles: Roles)
                 else
                     try alloc.dupe(u8, sess_id);
                 errdefer alloc.free(id);
-                try docs.append(alloc, .{ .id = id, .text = try text.toOwnedSlice(alloc) });
+                try docs.append(alloc, .{ .id = id, .text = try text.toOwnedSlice(alloc), .session = @intCast(si) });
             },
             .turn => {
                 for (turns, 0..) |t, ti| {
@@ -436,7 +445,7 @@ pub fn buildDocs(alloc: Allocator, q: Question, gran: Granularity, roles: Roles)
                     errdefer alloc.free(id);
                     const text = try alloc.dupe(u8, t.content);
                     errdefer alloc.free(text);
-                    try docs.append(alloc, .{ .id = id, .text = text });
+                    try docs.append(alloc, .{ .id = id, .text = text, .session = @intCast(si) });
                 }
             },
         }
@@ -471,6 +480,21 @@ pub const Options = struct {
     embed_dim: u16 = 384,
     embedder_cmd: ?[]const u8 = null,
     embedder_args: []const []const u8 = &.{},
+    /// Ablation switches. The default value reproduces the pre-ablation
+    /// harness exactly; see `lme_ablation.zig`.
+    variant: abl.Variant = .{},
+};
+
+/// What a run actually did, so a variant that silently did nothing shows up
+/// as a zero here instead of as a plausible-looking result.
+pub const Diag = struct {
+    /// Ingested documents per source (matter, form, spirit).
+    tag_counts: [3]u32 = .{ 0, 0, 0 },
+    goals_created: u32 = 0,
+    edges_created: u32 = 0,
+    ages_set: u32 = 0,
+    ages_unparsed: u32 = 0,
+    router_pred: ?core.MemorySource = null,
 };
 
 pub const Ranked = struct {
@@ -485,6 +509,7 @@ pub const Ranked = struct {
     empty_text: usize = 0,
     /// Name of the first `addRaw` error seen, if any (static string).
     first_add_error: ?[]const u8 = null,
+    diag: Diag = .{},
 
     pub fn deinit(self: Ranked, alloc: Allocator) void {
         freeDocs(alloc, self.docs);
@@ -509,10 +534,70 @@ fn applyArm(store: *store_mod.Store, arm: Arm) void {
     store.lc.cfg.recall_lambda_graph = w[2];
 }
 
+/// Apply the config-level variant switches. These write only to the two live
+/// copies of the config the `Store` already exposes; nothing is stored back
+/// into a product default.
+fn applyVariantConfig(store: *store_mod.Store, v: abl.Variant) void {
+    if (v.goal_bonus_weight) |w| store.lc.cfg.goal_bonus_weight = w;
+    if (v.existence_bonus_weight) |w| store.lc.cfg.existence_bonus_weight = w;
+    if (v.recency_bonus_weight) |w| store.lc.cfg.recency_bonus_weight = w;
+    if (v.graph_off) {
+        // Same two-copies rule as `applyArm`.
+        store.hybrid.cfg.recall_lambda_graph = 0;
+        store.lc.cfg.recall_lambda_graph = 0;
+    }
+}
+
+/// `Variant.goals == .per_session`: one goal per haystack session, named
+/// `g<session>` and described by the session's most frequent content words.
+/// Uses only haystack text; no label, no question type, no `has_answer`.
+/// Fills `goal_ids[i]` for every document of a session that has at least one
+/// non-empty document.
+fn createSessionGoals(
+    alloc: Allocator,
+    store: *store_mod.Store,
+    docs: []const Doc,
+    goal_ids: []u64,
+    diag: *Diag,
+) !void {
+    const now_ms = time.nowMs();
+    var lo: usize = 0;
+    while (lo < docs.len) {
+        var hi = lo + 1;
+        while (hi < docs.len and docs[hi].session == docs[lo].session) hi += 1;
+
+        var any = false;
+        for (docs[lo..hi]) |d| {
+            if (d.text.len > 0) any = true;
+        }
+        if (any) {
+            var texts = try alloc.alloc([]const u8, hi - lo);
+            defer alloc.free(texts);
+            for (docs[lo..hi], 0..) |d, i| texts[i] = d.text;
+            const desc = try abl.topicWords(alloc, texts, 12);
+            defer alloc.free(desc);
+            var name_buf: [24]u8 = undefined;
+            const name = try std.fmt.bufPrint(&name_buf, "g{d}", .{docs[lo].session});
+            const gid = try store.createGoal(name, desc, null, 5, null, now_ms);
+            @memset(goal_ids[lo..hi], gid);
+            diag.goals_created += 1;
+        }
+        lo = hi;
+    }
+}
+
 /// Build a fresh in-memory store, ingest the question's haystack, run the
 /// question through `Store.query` (the product's recall path, goal-aware
 /// rerank included) and map the returned cells back to corpus documents.
+///
+/// `opts.variant` selects an ablation (pre-registered in
+/// `docs/benchmarks/ablation-tri-source.md`). With the default variant every
+/// call below is the call the harness always made: source matter, goal 1,
+/// relevance 0.5, product weights.
 pub fn rank(alloc: Allocator, q: Question, opts: Options) !Ranked {
+    const v = opts.variant;
+    if (v.session_edges and opts.granularity != .turn) return error.EdgesNeedTurnGranularity;
+
     const docs = try buildDocs(alloc, q, opts.granularity, opts.roles);
     errdefer freeDocs(alloc, docs);
 
@@ -525,26 +610,65 @@ pub fn rank(alloc: Allocator, q: Question, opts: Options) !Ranked {
     });
     defer store.deinit();
     applyArm(store, opts.arm);
+    applyVariantConfig(store, v);
+
+    var diag = Diag{};
+
+    // Per-document tag, goal and cell id. All three are trivial under the
+    // default variant (every doc matter, goal 1, no extra bookkeeping).
+    const tags = try alloc.alloc(core.MemorySource, docs.len);
+    defer alloc.free(tags);
+    {
+        const texts = try alloc.alloc([]const u8, docs.len);
+        defer alloc.free(texts);
+        for (docs, 0..) |d, i| texts[i] = d.text;
+        try abl.assignTags(alloc, v.tags, v.tag_seed, q.question_id, texts, tags);
+    }
+    const goal_ids = try alloc.alloc(u64, docs.len);
+    defer alloc.free(goal_ids);
+    @memset(goal_ids, 1);
+    const relevance: f32 = if (v.goals == .per_session) 1.0 else 0.5;
+    if (v.goals == .per_session) try createSessionGoals(alloc, store, docs, goal_ids, &diag);
+
+    const doc_cell = try alloc.alloc(u64, docs.len);
+    defer alloc.free(doc_cell);
+    @memset(doc_cell, 0);
 
     var cell_to_doc = std.AutoHashMap(u64, u32).init(alloc);
     defer cell_to_doc.deinit();
     var failures: usize = 0;
     var empty_text: usize = 0;
     var first_err: ?[]const u8 = null;
+    const intent_foresight = [_]core.Foresight{.{
+        .description = "intent",
+        .valid_from = 0,
+        .valid_until = time.nowMs() + 365 * 86_400_000,
+        .confidence = 0.8,
+    }};
     for (docs, 0..) |d, i| {
         if (d.text.len == 0) {
             failures += 1;
             empty_text += 1;
             continue;
         }
-        // Source matter: a dialogue turn is a raw trace of what happened.
-        const cell_id = store.addRaw(core.MemorySource.matter, d.text, "", 1, 0.5) catch |err| {
+        // Default: source matter (a dialogue turn is a raw trace of what
+        // happened), goal 1, relevance 0.5 -- the call this harness always made.
+        const added = if (v.foresight_on_spirit and tags[i] == .spirit)
+            store.addRawWithForesight(tags[i], d.text, "", goal_ids[i], relevance, &intent_foresight)
+        else
+            store.addRaw(tags[i], d.text, "", goal_ids[i], relevance);
+        const cell_id = added catch |err| {
             failures += 1;
             if (first_err == null) first_err = @errorName(err);
             continue;
         };
+        doc_cell[i] = cell_id;
+        diag.tag_counts[@backingInt(tags[i])] += 1;
         try cell_to_doc.put(cell_id, @intCast(i));
     }
+
+    if (v.session_edges) try addSessionEdges(alloc, store, docs, doc_cell, &diag);
+    if (v.simulate_age) simulateAges(store, q, docs, doc_cell, &diag);
 
     var ranking = std.ArrayList(u32).empty;
     errdefer ranking.deinit(alloc);
@@ -552,7 +676,27 @@ pub fn rank(alloc: Allocator, q: Question, opts: Options) !Ranked {
     if (depth > 0 and cell_to_doc.count() > 0) {
         const scored = try store.query(alloc, q.question, .{ .topk = depth });
         defer alloc.free(scored);
-        for (scored) |s| {
+
+        // Harness-side source router (variant E): the store has no source
+        // argument, so the permutation is applied to the ranking it returned.
+        var order: ?[]u32 = null;
+        defer if (order) |o| alloc.free(o);
+        if (v.router != .none) {
+            const scores = try alloc.alloc(f32, scored.len);
+            defer alloc.free(scores);
+            const sources = try alloc.alloc(core.MemorySource, scored.len);
+            defer alloc.free(sources);
+            for (scored, 0..) |s, k| {
+                scores[k] = s.final_score;
+                sources[k] = s.cell.source;
+            }
+            const pred = abl.classifyHeuristic(q.question);
+            diag.router_pred = pred;
+            order = try abl.routeOrder(alloc, scores, sources, pred, v.router, v.router_boost);
+        }
+        var k: usize = 0;
+        while (k < scored.len) : (k += 1) {
+            const s = if (order) |o| scored[o[k]] else scored[k];
             const di = cell_to_doc.get(s.cell.id) orelse continue;
             try ranking.append(alloc, di);
         }
@@ -563,7 +707,71 @@ pub fn rank(alloc: Allocator, q: Question, opts: Options) !Ranked {
         .ingest_failures = failures,
         .empty_text = empty_text,
         .first_add_error = first_err,
+        .diag = diag,
     };
+}
+
+/// Variant H_edges: one `associative` hyperedge per session over that
+/// session's ingested documents. Natural structure only; no labels.
+fn addSessionEdges(
+    alloc: Allocator,
+    store: *store_mod.Store,
+    docs: []const Doc,
+    doc_cell: []const u64,
+    diag: *Diag,
+) !void {
+    var ids = std.ArrayList(u64).empty;
+    defer ids.deinit(alloc);
+    var lo: usize = 0;
+    while (lo < docs.len) {
+        var hi = lo + 1;
+        while (hi < docs.len and docs[hi].session == docs[lo].session) hi += 1;
+        ids.clearRetainingCapacity();
+        for (doc_cell[lo..hi]) |c| {
+            if (c != 0) try ids.append(alloc, c);
+        }
+        if (ids.items.len >= 2) {
+            _ = try store.addHyperedge(.{
+                .id = 0,
+                .edge_type = .associative,
+                .nodes = ids.items,
+                .weight = 1.0,
+                .source_weights = .{ 1.0, 0.0, 0.0 },
+                .confidence = 1.0,
+                .created_at = 0,
+            });
+            diag.edges_created += 1;
+        }
+        lo = hi;
+    }
+}
+
+/// Variant J: give every cell the age its session really had relative to the
+/// question date, so `exp(-decay_rate * age_days)` in the recency factor is
+/// live. `created_at = t_ref - age`, with `t_ref` read once after ingestion;
+/// the query then runs milliseconds later, which is below f32 resolution of
+/// the factor. A doc whose session date or the question date does not parse
+/// keeps its real (age ~ 0) timestamp and is counted.
+fn simulateAges(
+    store: *store_mod.Store,
+    q: Question,
+    docs: []const Doc,
+    doc_cell: []const u64,
+    diag: *Diag,
+) void {
+    const qd = abl.parseDateMs(q.question_date);
+    const t_ref = time.nowMs();
+    for (docs, doc_cell) |d, cell_id| {
+        if (cell_id == 0) continue;
+        const sd = if (d.session < q.haystack_dates.len) abl.parseDateMs(q.haystack_dates[d.session]) else null;
+        if (qd == null or sd == null) {
+            diag.ages_unparsed += 1;
+            continue;
+        }
+        const age_ms: i64 = @max(0, qd.? - sd.?);
+        store.getCell(cell_id).?.metadata.created_at = t_ref - age_ms;
+        diag.ages_set += 1;
+    }
 }
 
 pub const QuestionScore = struct {
@@ -1029,4 +1237,216 @@ test "arms: dense-only and bm25-only both run through Store.query" {
         try std.testing.expect(r.ranking.len >= 1);
         try std.testing.expectEqualStrings("answer_q1", r.docs[r.ranking[0]].id);
     }
+}
+
+// ============================================================================
+// Ablation variants (see lme_ablation.zig and docs/benchmarks/ablation-tri-source.md)
+// ============================================================================
+
+fn rankingsEqual(a: Ranked, b: Ranked) bool {
+    return std.mem.eql(u32, a.ranking, b.ranking);
+}
+
+fn fixtureQuestion(arena: Allocator, idx: usize) !Question {
+    const spans = try indexQuestions(arena, FIXTURE);
+    return parseQuestion(arena, FIXTURE[spans[idx].start..spans[idx].end]);
+}
+
+test "variant: the default Variant is the default behaviour (isDefault)" {
+    try std.testing.expect((abl.Variant{}).isDefault());
+    try std.testing.expect(!(abl.Variant{ .tags = .heuristic }).isDefault());
+    try std.testing.expect(!(abl.Variant{ .graph_off = true }).isDefault());
+    try std.testing.expect(!(abl.Variant{ .goal_bonus_weight = 0 }).isDefault());
+}
+
+test "variant: tag-only variants cannot move a fixture ranking (the tag is not a retrieval signal)" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const q = try fixtureQuestion(arena_state.allocator(), 2); // q3, multi-session
+
+    const base = try rank(alloc, q, .{ .granularity = .session });
+    defer base.deinit(alloc);
+    for ([_]abl.Variant{
+        .{ .tags = .form },
+        .{ .tags = .spirit },
+        .{ .tags = .heuristic },
+        .{ .tags = .random, .tag_seed = 3 },
+    }) |v| {
+        const r = try rank(alloc, q, .{ .granularity = .session, .variant = v });
+        defer r.deinit(alloc);
+        try std.testing.expect(rankingsEqual(base, r));
+    }
+}
+
+test "variant: diagnostics report what was actually done" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const q = try fixtureQuestion(arena_state.allocator(), 2); // q3: 3 sessions, 3 user docs
+
+    const r = try rank(alloc, q, .{
+        .granularity = .session,
+        .variant = .{ .tags = .heuristic, .goals = .per_session },
+    });
+    defer r.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 3), r.diag.goals_created);
+    try std.testing.expectEqual(@as(u32, 0), r.diag.edges_created);
+    // "I bought a refractor telescope..." / "Which sourdough..." / "Planning a trip..."
+    // -> none of the pre-registered phrases ("planning to" needs "to") -> all matter.
+    try std.testing.expectEqual(@as(u32, 3), r.diag.tag_counts[0] + r.diag.tag_counts[1] + r.diag.tag_counts[2]);
+}
+
+test "variant: session edges need turn granularity and are one per multi-turn session" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const q = try fixtureQuestion(arena_state.allocator(), 0); // q1: three sessions of 1 user turn each
+
+    try std.testing.expectError(error.EdgesNeedTurnGranularity, rank(alloc, q, .{
+        .granularity = .session,
+        .variant = .{ .session_edges = true },
+    }));
+    // roles=all gives two turns per session -> one edge per session.
+    const r = try rank(alloc, q, .{
+        .granularity = .turn,
+        .roles = .all,
+        .variant = .{ .session_edges = true },
+    });
+    defer r.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 3), r.diag.edges_created);
+}
+
+test "variant: goal-bonus off, existence off and recency off are bit-identical to the default" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const q = try fixtureQuestion(arena_state.allocator(), 2);
+
+    const base = try rank(alloc, q, .{ .granularity = .session });
+    defer base.deinit(alloc);
+    // Uniform goal / importance / recency => switching the factor off cannot
+    // change an ordering. This is the harness-side proof of the inventory.
+    for ([_]abl.Variant{
+        .{ .goal_bonus_weight = 0 },
+        .{ .existence_bonus_weight = 0 },
+        .{ .recency_bonus_weight = 0 },
+    }) |v| {
+        const r = try rank(alloc, q, .{ .granularity = .session, .variant = v });
+        defer r.deinit(alloc);
+        try std.testing.expect(rankingsEqual(base, r));
+    }
+}
+
+test "variant: simulated age makes recency real, and only then" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    // Two sessions with IDENTICAL user text; only the dates differ.
+    const json =
+        \\{"question_id":"qa","question_type":"knowledge-update",
+        \\ "question":"which marmalade recipe did I settle on",
+        \\ "question_date":"2023/05/30 (Tue) 10:00",
+        \\ "haystack_dates":["2021/01/01 (Fri) 10:00","2023/05/29 (Mon) 10:00"],
+        \\ "haystack_session_ids":["answer_old","answer_new"],
+        \\ "answer_session_ids":["answer_new"],
+        \\ "haystack_sessions":[
+        \\  [{"role":"user","content":"I settled on the bitter orange marmalade recipe","has_answer":true}],
+        \\  [{"role":"user","content":"I settled on the bitter orange marmalade recipe","has_answer":true}]
+        \\ ]}
+    ;
+    const q = try parseQuestion(arena, json);
+
+    const aged = try rank(alloc, q, .{ .granularity = .session, .variant = .{ .simulate_age = true } });
+    defer aged.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 2), aged.diag.ages_set);
+    try std.testing.expectEqual(@as(u32, 0), aged.diag.ages_unparsed);
+    try std.testing.expectEqual(@as(usize, 2), aged.ranking.len);
+    // the 2023-05-29 session is ~1 day old, the 2021 one ~880 days old
+    try std.testing.expectEqualStrings("answer_new", aged.docs[aged.ranking[0]].id);
+}
+
+test "variant: unparseable dates are counted, not guessed" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const json =
+        \\{"question_id":"qb","question_type":"knowledge-update","question":"marmalade",
+        \\ "question_date":"garbage","haystack_dates":["also garbage"],
+        \\ "haystack_session_ids":["answer_x"],"answer_session_ids":["answer_x"],
+        \\ "haystack_sessions":[[{"role":"user","content":"marmalade","has_answer":true}]]}
+    ;
+    const q = try parseQuestion(arena, json);
+    const r = try rank(alloc, q, .{ .granularity = .session, .variant = .{ .simulate_age = true } });
+    defer r.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 0), r.diag.ages_set);
+    try std.testing.expectEqual(@as(u32, 1), r.diag.ages_unparsed);
+}
+
+test "variant: router filter puts the predicted source first, boost keeps every doc" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const json =
+        \\{"question_id":"qc","question_type":"single-session-preference",
+        \\ "question":"I want to know my favorite pastry",
+        \\ "question_date":"2023/05/30 (Tue) 10:00",
+        \\ "haystack_dates":["2023/05/01 (Mon) 10:00","2023/05/02 (Tue) 10:00","2023/05/03 (Wed) 10:00"],
+        \\ "haystack_session_ids":["s1","answer_s2","s3"],"answer_session_ids":["answer_s2"],
+        \\ "haystack_sessions":[
+        \\  [{"role":"user","content":"my favorite pastry shop sells croissants"}],
+        \\  [{"role":"user","content":"I love a good pastry, croissants are my favorite","has_answer":true}],
+        \\  [{"role":"user","content":"pastry dough needs cold butter"}]
+        \\ ]}
+    ;
+    const q = try parseQuestion(arena, json);
+    try std.testing.expectEqual(core.MemorySource.spirit, abl.classifyHeuristic(q.question));
+
+    const base = try rank(alloc, q, .{ .granularity = .session, .variant = .{ .tags = .heuristic } });
+    defer base.deinit(alloc);
+    const filt = try rank(alloc, q, .{ .granularity = .session, .variant = .{ .tags = .heuristic, .router = .filter } });
+    defer filt.deinit(alloc);
+    const boost = try rank(alloc, q, .{ .granularity = .session, .variant = .{ .tags = .heuristic, .router = .boost } });
+    defer boost.deinit(alloc);
+
+    try std.testing.expectEqual(base.ranking.len, filt.ranking.len);
+    try std.testing.expectEqual(base.ranking.len, boost.ranking.len);
+    try std.testing.expectEqual(core.MemorySource.spirit, filt.diag.router_pred.?);
+    // the two spirit-tagged sessions come before the form/matter one
+    try std.testing.expect(filt.ranking.len == 3);
+    var seen_non_spirit = false;
+    for (filt.ranking) |di| {
+        const is_spirit = abl.classifyHeuristic(filt.docs[di].text) == .spirit;
+        if (!is_spirit) seen_non_spirit = true else try std.testing.expect(!seen_non_spirit);
+    }
+}
+
+test "variant: per-session goals are created from haystack text and the evidence session still ranks first" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    // Plumbing check only: one goal per session is created, none leaks a
+    // label, and the ranking is well formed. That the goal bonus can change an
+    // outcome at all is shown by the SYNTHETIC test in lme_ablation.zig; that
+    // it does on LongMemEval is what the pre-registered run measures.
+    const json =
+        \\{"question_id":"qd","question_type":"multi-session",
+        \\ "question":"telescope maintenance schedule",
+        \\ "question_date":"2023/05/30 (Tue) 10:00",
+        \\ "haystack_dates":["2023/05/01 (Mon) 10:00","2023/05/02 (Tue) 10:00"],
+        \\ "haystack_session_ids":["s_a","answer_b"],"answer_session_ids":["answer_b"],
+        \\ "haystack_sessions":[
+        \\  [{"role":"user","content":"gardening schedule notes gardening gardening trowel"}],
+        \\  [{"role":"user","content":"telescope schedule notes telescope telescope eyepiece","has_answer":true}]
+        \\ ]}
+    ;
+    const q = try parseQuestion(arena, json);
+    const on = try rank(alloc, q, .{ .granularity = .session, .variant = .{ .goals = .per_session } });
+    defer on.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 2), on.diag.goals_created);
+    try std.testing.expectEqualStrings("answer_b", on.docs[on.ranking[0]].id);
 }

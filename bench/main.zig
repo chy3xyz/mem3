@@ -76,6 +76,7 @@ const cold_start_bench = @import("cold_start.zig");
 const footprint_bench = @import("footprint.zig");
 const longmemeval_bench = @import("longmemeval.zig");
 const longmemeval_official_bench = @import("longmemeval_official.zig");
+const lme_compare_bench = @import("lme_compare.zig");
 
 /// Library logging stays quiet so it cannot interleave with bench output.
 pub const std_options: std.Options = .{
@@ -1014,6 +1015,20 @@ const CONSTITUTIONAL_BENCHES = [_]ConstitutionalBench{
         .file = "bench/longmemeval_official.zig",
         .target = "none (retrieval-only; official dataset via --data)",
         .run = longmemeval_official_bench.run,
+    },
+    .{
+        .name = "lme-compare",
+        .alt_name = "lme_compare",
+        .file = "bench/lme_compare.zig",
+        .target = "none (paired bootstrap over --dump-scores files; see ablation-tri-source.md)",
+        .run = lme_compare_bench.run,
+    },
+    .{
+        .name = "lme-synthetic",
+        .alt_name = "lme_synthetic",
+        .file = "bench/lme_compare.zig",
+        .target = "none (SYNTHETIC goal/source mechanism check)",
+        .run = lme_compare_bench.runSynthetic,
     },
 };
 

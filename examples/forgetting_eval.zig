@@ -58,6 +58,19 @@
 //! that forgets *nothing* scores the mirror image. Both components are
 //! reported per group and combined, never blended into one number.
 //!
+//! ## Other modes
+//!
+//! The age sweep above exercises only the *decay* term. The other two terms
+//! of `net_existence = importance - redundancy - conflict_score` have their
+//! own scenarios in `forgetting_eval_netex.zig`:
+//!
+//!     ./zig-out/bin/mem3-forgetting-eval --mode=netex   # before/after, ground truth
+//!     ./zig-out/bin/mem3-forgetting-eval --mode=scale   # sweep time at 1k/5k/20k
+//!
+//! Every cell in the age sweep carries a distinct fact. They used to repeat
+//! (36 cells drawn from 12 episodes), which is harmless to a decay-only sweep
+//! and would now be forgotten as redundant, conflating age with duplication.
+//!
 //! ## Usage
 //!
 //!     zig build example-forgetting-eval
@@ -68,6 +81,7 @@
 
 const std = @import("std");
 const mem3 = @import("mem3");
+const netex = @import("forgetting_eval_netex.zig");
 
 const Allocator = std.mem.Allocator;
 const MemCell = mem3.MemCell;
@@ -177,7 +191,12 @@ const Params = struct {
     in_memory: bool = true,
     stdout_jsonl: bool = false,
     force: bool = false,
+    mode: Mode = .age,
+    /// `--mode=scale`: largest corpus to time.
+    scale_max: usize = 20000,
 };
+
+const Mode = enum { age, netex, scale };
 
 const MAX_CONFIGS = 512;
 
@@ -368,7 +387,14 @@ fn runConfig(
         for (SOURCES) |src| {
             for (RELEVANCE) |rel| {
                 const i = rand.intRangeAtMost(usize, 0, EPISODES.len - 1);
-                const id = store.addRaw(src, EPISODES[i], FACT_STRINGS[i], 1, rel) catch |e| {
+                // A per-cell suffix on both text and fact: the age sweep must
+                // isolate *age*, so no two cells may be duplicates of each
+                // other (see "Other modes").
+                var ep_buf: [192]u8 = undefined;
+                var fact_buf: [96]u8 = undefined;
+                const ep_text = std.fmt.bufPrint(&ep_buf, "{s} item {d}", .{ EPISODES[i], n }) catch unreachable;
+                const fact_text = std.fmt.bufPrint(&fact_buf, "{s}-{d}", .{ FACT_STRINGS[i], n }) catch unreachable;
+                const id = store.addRaw(src, ep_text, fact_text, 1, rel) catch |e| {
                     err("forgetting_eval: addRaw failed: {s}\n", .{@errorName(e)});
                     return e;
                 };
@@ -543,6 +569,10 @@ fn parseArgs(init: std.process.Init.Minimal) !Params {
             p.stdout_jsonl = true;
         } else if (std.mem.eql(u8, a, "--force")) {
             p.force = true;
+        } else if (std.mem.startsWith(u8, a, "--mode=")) {
+            p.mode = std.meta.stringToEnum(Mode, a["--mode=".len..]) orelse return error.BadMode;
+        } else if (std.mem.startsWith(u8, a, "--scale-max=")) {
+            p.scale_max = try std.fmt.parseInt(usize, a["--scale-max=".len..], 10);
         } else if (std.mem.startsWith(u8, a, "--configs=")) {
             p.configs = try std.fmt.parseInt(usize, a["--configs=".len..], 10);
         } else if (std.mem.startsWith(u8, a, "--max-age-days=")) {
@@ -562,6 +592,8 @@ fn parseArgs(init: std.process.Init.Minimal) !Params {
             out(
                 \\mem3-forgetting-eval — measure whether forgetting actually works
                 \\
+                \\  --mode=M           age (default) | netex | scale; see the file header
+                \\  --scale-max=N      scale mode: largest corpus to time (default 20000)
                 \\  --configs=N        sweep points (default 13)
                 \\  --max-age-days=D   base age swept 0..D (default 240)
                 \\  --threshold=T      forgetting threshold (default 0.1)
@@ -599,6 +631,13 @@ pub fn main(init: std.process.Init.Minimal) !void {
         err("forgetting_eval: bad arguments ({s})\n", .{@errorName(e)});
         std.process.exit(2);
     };
+
+    // The other two modes print their own tables and write no JSONL.
+    switch (p.mode) {
+        .age => {},
+        .netex => return netex.runNetex(alloc, p.seed, .{}),
+        .scale => return netex.runScale(alloc, p.scale_max),
+    }
 
     if (!p.force and fileExists(p.out_path)) {
         err("forgetting_eval: {s} already exists — pass --force or --out=PATH\n", .{p.out_path});

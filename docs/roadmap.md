@@ -9,6 +9,33 @@ Current version: **`0.1.0-alpha`**. Supported targets: **macOS and Linux**.
 
 ## Recently closed
 
+- **Forgetting implements `net_existence` and supersession** (branch
+  `p2/forget`; ADR [0005](adr/0005-existence-gain-forgetting.md)). The sweep was
+  `importance × decay < θ` only; `redundancy`, `conflict_score` and
+  `superseded_at` did not exist while the MCP text and the `forgetter.zig`
+  header described them. Now: redundancy by an exact prefix-filter duplicate
+  pass, conflict by a subject+predicate index, `superseded_at` / `superseded_by`
+  journaled (`memcell_update`) and in snapshot v3, per-reason counts in
+  `forget`, superseded cells hidden from default recall. Measured on the
+  synthetic `--mode=netex` corpus: exact-copy pairs 0/60 → 60/60 collapsed,
+  unique high-importance cells forgotten 0/400, contradiction-pair top-1 =
+  current value 53% → 100%. **Not a free win**: the first cut (every predicate
+  single-valued) marked 120 of 180 multi-valued cells superseded, so the default
+  now supersedes only a short list of single-valued predicates
+  (`--supersede=off|functional|all`, `--functional-predicates`): 0/180
+  multi-valued superseded or forgotten (asserted), at the price of 0/60
+  contradictions on an unlisted predicate being superseded. Every supersession
+  is reported by the add (`superseded:[{id,subject,predicate}]`) and undone with
+  `mem3 unsupersede <id>` / `memory_unsupersede`. Near-duplicates are lowered
+  but not forgotten. Sweep time at 20k cells: 140 ms (realistic corpus,
+  near-linear), 1.1 s (dense templated worst case, capped at 256 candidates per
+  cell; 18.9 s uncapped). Also fixed: replaying a `.forget` WAL record freed the
+  cell instead of moving it to the fuzzy store, so a restart after a CLI
+  `mem3 forget` (which does not sync) lost forgotten cells outright.
+  Still open: predicate schemas beyond a flat list, `mem3 remember` (promote-back,
+  T084), profiling the superlinear tail on the dense corpus, a non-synthetic
+  evaluation corpus, no downgrade path from snapshot v3.
+
 - **Consolidation is incremental** (`Consolidator` + `src/memory/cluster_index.zig`).
   The pass used to compare every cell pair: 1.01e9 pairs at 45,000 cells. The
   union-find and a per-cell token signature (512 bits) now persist across passes
@@ -660,9 +687,15 @@ raw text. See `scripts/embedder_adapter_example.py`.
   clobber, `@call(.never_inline)`, function-pointer indirection, and
   `mach_absolute_time` — and all four still fold. The remaining approach is a
   per-architecture non-foldable cycle counter through inline asm (`rdtsc` /
-  `cntvct_el0`), which is **not written** because it cannot be validated on
-  Linux from this machine. Until then, treat min/tail-percentile latencies as
-  unreliable and report p50.
+  `cntvct_el0`), which is **not written**. Update 2026-10-21: a Linux
+  container is available after all (OrbStack). The defect is not macOS-only:
+  on Linux aarch64 the Timer test alone fails 186/300 runs in ReleaseFast and
+  0/300 in Debug (so a full-suite ReleaseFast run there passes or fails at
+  random — it passed twice and failed once), and on macOS arm64 it fails every
+  time. Linux x86_64 was only measured under Rosetta (0/300), which is not a
+  native result. CI runs the ReleaseFast test step as `continue-on-error` for
+  this reason. Until then, treat min/tail-percentile latencies as unreliable and
+  report p50.
 - **Snapshot restore now rebuilds the vector index** (fixed 2026-10-15).
   `Store.loadSnapshot` restored `addCell` + `cell_index.put` but never
   `hnsw.insert`, and `sync` is snapshot-and-truncate: `takeSnapshot` unlinks
