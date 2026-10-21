@@ -15,7 +15,7 @@
 | Theory | 三源合恰论 (物/象/性) + GHW 范式 (Goal/Harness/World) |
 | Spec-kit | Initialized; spec at `specs/001-trisource-everos-mvp/` |
 | Platforms | **macOS and Linux only** — Windows and WASM refused at compile time (see [Platforms](#platforms)) |
-| Status | **v0.1.0-alpha** (CLI + MCP + persistence + 623 tests + 12 constitution invariants, all measured). All 7 constitutional principles active. |
+| Status | **v0.1.0-alpha** (CLI + MCP + persistence + 665 tests + 12 constitution invariants, all measured). All 7 constitutional principles active. |
 
 ## Read Order for New Agents
 
@@ -137,7 +137,7 @@ tests/
 | Lexical arm | ✅ | `src/retrieval/bm25.zig`, Okapi BM25 over unigrams + bigrams, max-normalised inside the existing `λ_dense=0.5 / λ_sparse=0.2 / λ_graph=0.3` sum. Rebuilt from cells on snapshot restore, never serialised. Identifiers that live only in an `atomic_facts` triple went from 1/12 recall to 12/12 |
 | Persistence | ✅ | WAL-first + snapshot. WAL truncated on sync. `--wal-sync=always\|group\|interval:N` (default `always`, byte-identical); `interval` is weaker and documented as such. |
 | Daemon hygiene | ✅ | `serve`/`mcp` exit 0 on SIGINT/SIGTERM (`src/platform/signal.zig`: handler only stores an atomic; loops poll with a timeout). `--log-format`/`--log-every` feed `src/utils/logger.zig`; default is silent and byte-identical. JSONL goes to stderr only. |
-| Tests | ✅ | 623: 439 (`src/main.zig`-rooted) + 184 (`tests/main.zig`-rooted), plus 12 constitution invariants as a separate gate, 0 leaks |
+| Tests | ✅ | 665: 481 (`src/main.zig`-rooted) + 184 (`tests/main.zig`-rooted), plus 12 constitution invariants as a separate gate, 0 leaks |
 | Binary | ✅ | 963,704 bytes `ReleaseFast` / 4,569,032 bytes Debug, only links libSystem. The lexical arm added 49 KB ReleaseFast (+5.4%) over the 914,456 B measured before it |
 | Toolchain | ✅ | Pinned via `.zigversion` (Zig 0.17.0) |
 | Platforms | ✅ | macOS + Linux (x86_64 and aarch64). Windows/WASM refused at compile time — see [Platforms](#platforms) |
@@ -185,6 +185,16 @@ tests/
   moving end-to-end accuracy, so the embedder is not the binding limit either.
   Retrieval on the official dataset (no LLM judge) is in
   `docs/benchmarks/longmemeval-official.md`.
+- **No measured retrieval gain from the tri-source tag, goal bonus,
+  importance/existence-gain terms or source-dependent decay on LongMemEval-S**
+  (pre-registered paired ablation, 419 questions, 79 runs:
+  `docs/benchmarks/ablation-tri-source.md`). The tag is not a ranking input on
+  `Store.query` (shuffling it: Δ NDCG@10 = 0); heuristic-tag routing lost to
+  shuffled-tag routing; the goal bonus cost −0.014/−0.023. The benchmark has no
+  goals or source labels, so this is not evidence against the theory — do not
+  quote it as such, and do not quote the theory as measured. Also: turn-level
+  rankings are not bit-reproducible deep in the tail (the recency factor reads
+  the wall clock); compare the first 50 ranks, not whole dumps.
 
 ## Development Workflow
 
@@ -310,7 +320,7 @@ The current spec-kit artifacts:
 ## Testing
 
 ```bash
-# All tests: 623 (439 src/main.zig-rooted + 184 tests/main.zig-rooted)
+# All tests: 665 (481 src/main.zig-rooted + 184 tests/main.zig-rooted)
 zig build test
 
 # Just the constitution invariants (12, separate root)
@@ -330,7 +340,7 @@ without re-executing**. When you need a count you can trust, drive the roots
 directly:
 
 ```bash
-zig test --dep mem3 -Mroot=src/main.zig  -Mmem3=src/lib.zig   # All 439 tests passed.
+zig test --dep mem3 -Mroot=src/main.zig  -Mmem3=src/lib.zig   # All 481 tests passed.
 zig test --dep mem3 -Mroot=tests/main.zig -Mmem3=src/lib.zig   # All 184 tests passed.
 zig test --dep mem3 -Mroot=tests/constitution/main.zig -Mmem3=src/lib.zig  # All 12 tests passed.
 ```

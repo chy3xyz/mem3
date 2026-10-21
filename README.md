@@ -622,6 +622,13 @@ zig build bench
   `longmemeval_s_cleaned.json`. These are *not* QA accuracies and not comparable
   to published QA numbers; dataset hash, commands, results and limitations are
   in [`docs/benchmarks/longmemeval-official.md`](docs/benchmarks/longmemeval-official.md).
+- **Does the tri-source / goal / importance / hypergraph machinery improve
+  retrieval? (pre-registered ablation, same dataset):**
+  [`docs/benchmarks/ablation-tri-source.md`](docs/benchmarks/ablation-tri-source.md)
+  — paired per-question deltas with bootstrap 95 % CIs for 39–40 variants at
+  session and turn granularity (`scripts/lme_ablation_run.sh`,
+  `scripts/lme_ablation_report.py`, `mem3-bench lme-compare`). Headline: no
+  measured retrieval gain; see [Status and limitations](#status-and-limitations).
 
 The `ef` budget bug that used to make beam search sample instead of navigate is
 fixed: the budget is now gated on candidate-set size, which is what `ef` means,
@@ -961,6 +968,22 @@ recorded here, not something `verify.sh` reproduces.
 
 Known and measured, not discovered after the fact:
 
+- **No measured retrieval gain from the tri-source tag, the goal bonus, the
+  importance / existence-gain terms or source-dependent decay on LongMemEval-S
+  (official data, retrieval only, 419 questions).** The tag is not an input to
+  ranking on the shipped query path, so shuffling it changes nothing (Δ NDCG@10
+  = 0.0000, CI [0, 0]). Routing a query by a heuristic tag *lost* to routing by
+  shuffled tags (−0.22 / −0.13 NDCG@10, session / turn); switching the goal
+  bonus on, with goals derived from the haystack text, cost −0.014 / −0.023;
+  importance and source-dependent decay are within noise (|Δ| ≤ 0.006 at the
+  pre-registered primary level, with one nominal +0.0046 that does not survive
+  the multiplicity correction); one hyperedge per session adds +0.0020 (CI spans
+  0) on the primary turn metric and +0.0076 on a secondary session-derived one.
+  A null on LongMemEval is not evidence against the ideas — the benchmark has
+  no goals or source labels to reward them; a synthetic task built to reward
+  them does (goal bonus 1/8 → 8/8, source router 2/10 → 10/10 top-1). Full
+  tables, threats to validity and a sketch of a benchmark that would test the
+  claims: [`docs/benchmarks/ablation-tri-source.md`](docs/benchmarks/ablation-tri-source.md).
 - **Lexical by default, and semantic is opt-in.** Retrieval works — `mem3 query`
   returns ranked, reproducible results and typos/morphology still match — but the
   built-in embedder is bag-of-features over surface forms. It has no world
