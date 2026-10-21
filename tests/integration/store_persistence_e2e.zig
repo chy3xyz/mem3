@@ -544,3 +544,142 @@ test "E2E: foresight-only cell keeps its spirit dimension across WAL replay and 
         wipeDataDir(data_dir);
     }
 }
+
+// =============================================================================
+// WAL durability modes (group commit / interval): the store must replay the
+// same state whichever mode wrote the log.
+// =============================================================================
+
+const EPISODES = [_][]const u8{
+    "wal mode probe alpha",
+    "wal mode probe beta",
+    "wal mode probe gamma",
+    "wal mode probe delta",
+    "wal mode probe epsilon",
+    "wal mode probe zeta",
+};
+
+/// Write EPISODES into `data_dir` with `mode`, optionally snapshotting
+/// halfway, then close.
+fn writeWith(alloc: std.mem.Allocator, data_dir: []const u8, mode: mem3.core.Config.WalSync, snapshot_midway: bool) !void {
+    wipeDataDir(data_dir);
+    var store = try mem3.Store.init(alloc, .{ .data_dir = data_dir, .wal_sync = mode });
+    defer store.deinit();
+    for (EPISODES, 0..) |ep, i| {
+        _ = try store.addRaw(@enumFromInt(@as(u8, @intCast(i % 3))), ep, "u|likes|wal", 1, 0.6);
+        if (snapshot_midway and i == 2) try store.sync();
+    }
+    // The mode must survive the snapshot's WAL rotation.
+    if (store.wal) |w| try testing.expectEqual(std.meta.activeTag(mode), std.meta.activeTag(w.sync));
+}
+
+/// Reopen with the DEFAULT mode (a restart that forgot the flag must still
+/// read the log) and return the sorted episode list.
+fn readBack(alloc: std.mem.Allocator, data_dir: []const u8) ![][]u8 {
+    var store = try mem3.Store.init(alloc, .{ .data_dir = data_dir });
+    defer store.deinit();
+    const cells = try store.allCells(alloc);
+    defer alloc.free(cells);
+    var out = try alloc.alloc([]u8, cells.len);
+    var made: usize = 0;
+    errdefer {
+        for (out[0..made]) |s| alloc.free(s);
+        alloc.free(out);
+    }
+    for (cells) |cell| {
+        out[made] = try alloc.dupe(u8, cell.episode);
+        made += 1;
+    }
+    std.mem.sort([]u8, out, {}, struct {
+        fn lt(_: void, a: []u8, b: []u8) bool {
+            return std.mem.lessThan(u8, a, b);
+        }
+    }.lt);
+    return out;
+}
+
+fn freeList(alloc: std.mem.Allocator, l: [][]u8) void {
+    for (l) |s| alloc.free(s);
+    alloc.free(l);
+}
+
+test "E2E: every WAL durability mode replays the same cells" {
+    const alloc = testing.allocator;
+    const dir_a = try makeDataDir(alloc, "mode_always");
+    defer alloc.free(dir_a);
+    const dir_b = try makeDataDir(alloc, "mode_group");
+    defer alloc.free(dir_b);
+    const dir_c = try makeDataDir(alloc, "mode_interval");
+    defer alloc.free(dir_c);
+    defer wipeDataDir(dir_a);
+    defer wipeDataDir(dir_b);
+    defer wipeDataDir(dir_c);
+
+    try writeWith(alloc, dir_a, .always, false);
+    try writeWith(alloc, dir_b, .group, false);
+    try writeWith(alloc, dir_c, .{ .interval_ms = 60_000 }, false);
+
+    const a = try readBack(alloc, dir_a);
+    defer freeList(alloc, a);
+    const b = try readBack(alloc, dir_b);
+    defer freeList(alloc, b);
+    const cc = try readBack(alloc, dir_c);
+    defer freeList(alloc, cc);
+
+    try testing.expectEqual(@as(usize, EPISODES.len), a.len);
+    try testing.expectEqual(a.len, b.len);
+    try testing.expectEqual(a.len, cc.len);
+    for (a, b, cc) |x, y, z| {
+        try testing.expectEqualStrings(x, y);
+        try testing.expectEqualStrings(x, z);
+    }
+}
+
+test "E2E: group mode survives a snapshot's WAL rotation mid-stream" {
+    const alloc = testing.allocator;
+    const dir = try makeDataDir(alloc, "mode_group_snap");
+    defer alloc.free(dir);
+    defer wipeDataDir(dir);
+
+    try writeWith(alloc, dir, .group, true);
+    const got = try readBack(alloc, dir);
+    defer freeList(alloc, got);
+    try testing.expectEqual(@as(usize, EPISODES.len), got.len);
+}
+
+/// Cut `n` bytes off the end of the WAL.
+fn tearWal(data_dir: []const u8, n: i64) !void {
+    var z: [std.fs.max_path_bytes + 1]u8 = undefined;
+    const p = try std.fmt.bufPrint(&z, "{s}/mem3.wal\x00", .{data_dir});
+    const fd = std.c.open(p[0 .. p.len - 1 :0].ptr, .{ .ACCMODE = .RDWR }, @as(std.c.mode_t, 0));
+    if (fd < 0) return error.OpenFailed;
+    defer _ = std.c.close(fd);
+    const end = std.c.lseek(fd, 0, std.c.SEEK.END);
+    if (std.c.ftruncate(fd, end - n) != 0) return error.TruncateFailed;
+}
+
+/// Cells recovered after tearing the tail, or null if the store refused to
+/// open. Whatever the answer is, it must not depend on the mode.
+fn tornOutcome(alloc: std.mem.Allocator, data_dir: []const u8, mode: mem3.core.Config.WalSync) !?usize {
+    try writeWith(alloc, data_dir, mode, false);
+    try tearWal(data_dir, 7);
+    var store = mem3.Store.init(alloc, .{ .data_dir = data_dir }) catch return null;
+    defer store.deinit();
+    return store.cellCount();
+}
+
+test "E2E: a torn WAL tail is handled identically in group and always mode" {
+    const alloc = testing.allocator;
+    const dir_a = try makeDataDir(alloc, "torn_always");
+    defer alloc.free(dir_a);
+    const dir_b = try makeDataDir(alloc, "torn_group");
+    defer alloc.free(dir_b);
+    defer wipeDataDir(dir_a);
+    defer wipeDataDir(dir_b);
+
+    const a = try tornOutcome(alloc, dir_a, .always);
+    const b = try tornOutcome(alloc, dir_b, .group);
+    try testing.expectEqual(a, b);
+    // And it is a real tear, not a no-op: the last cell is not recoverable.
+    if (a) |n| try testing.expect(n < EPISODES.len);
+}

@@ -33,6 +33,11 @@ const retrieval = @import("../retrieval/mod.zig");
 /// collected here (see the note on that test section).
 const cli = @import("../cli.zig");
 
+const wal_mod = @import("../storage/wal.zig");
+const signal = @import("../platform/signal.zig");
+const logger_mod = @import("../utils/logger.zig");
+const Logger = logger_mod.Logger;
+
 const log = std.log.scoped(.mem3_server);
 
 /// Diagnostic logging that is compiled out of tests.
@@ -532,6 +537,35 @@ pub const Server = struct {
     /// cell moves to the fuzzy store and the counters stay put.
     forget_dry_run: bool = false,
 
+    /// Where daemon events go. `.off` (the default) writes nothing, so a
+    /// `Server` built without options is exactly as silent as it always was.
+    logger: Logger = .{},
+    /// Seconds between periodic summary lines; 0 = none. Only ever non-zero
+    /// when the operator typed `--log-every`.
+    log_every_sec: u32 = 0,
+    /// The WAL durability mode this server's store was opened with.
+    wal_sync: core.Config.WalSync = .always,
+    /// True in `.group` mode: each connection gets its own thread, so that
+    /// several writers can be waiting on one shared fsync at once. In every
+    /// other mode the accept loop stays the single-threaded loop it always
+    /// was, so the default path is unchanged.
+    concurrent: bool = false,
+    /// Connections currently being handled on their own thread.
+    inflight: std.atomic.Value(usize) = .init(0),
+    /// Set by `requestShutdown` (and by SIGINT/SIGTERM when `watch_signals`).
+    shutdown_requested: std.atomic.Value(bool) = .init(false),
+    /// Also stop on SIGINT/SIGTERM. Off by default: the signal flag is
+    /// process-global, and an embedded `Server` (a test, an SDK host) must
+    /// not be stopped by a signal aimed at its host. `mem3 serve` turns it on.
+    watch_signals: bool = false,
+
+    pub const Options = struct {
+        data_dir: ?[]const u8,
+        wal_sync: core.Config.WalSync = .always,
+        logger: Logger = .{},
+        log_every_sec: u32 = 0,
+    };
+
     /// `data_dir` is `null` for an in-memory server: no WAL, no snapshot,
     /// nothing written to disk. Tests that are not about persistence must
     /// use it — a fixed `/tmp` path makes a test non-idempotent, because
@@ -539,9 +573,14 @@ pub const Server = struct {
     /// corpus quietly doubles. (That is not hypothetical: the `maxHops`
     /// test passed on a clean `/tmp` and failed on the second run.)
     pub fn init(alloc: Allocator, bind: []const u8, port: u16, data_dir: ?[]const u8) !*Server {
+        return initWithOptions(alloc, bind, port, .{ .data_dir = data_dir });
+    }
+
+    pub fn initWithOptions(alloc: Allocator, bind: []const u8, port: u16, opts: Options) !*Server {
         const self = try alloc.create(Server);
         errdefer alloc.destroy(self);
-        const store = try Store.init(alloc, .{ .data_dir = data_dir });
+        const store = try Store.init(alloc, .{ .data_dir = opts.data_dir, .wal_sync = opts.wal_sync });
+        errdefer store.deinit();
         self.* = .{
             .alloc = alloc,
             .bind = try alloc.dupe(u8, bind),
@@ -551,6 +590,10 @@ pub const Server = struct {
             .store = store,
             .boot_time_ns = 0,
             .metrics = .{},
+            .logger = opts.logger,
+            .log_every_sec = opts.log_every_sec,
+            .wal_sync = opts.wal_sync,
+            .concurrent = opts.wal_sync == .group and opts.data_dir != null,
         };
         return self;
     }
@@ -575,7 +618,15 @@ pub const Server = struct {
     /// scheduled forgetting too. That is stated in `--help` rather than
     /// papered over with a second thread.
     pub fn startMaintenance(self: *Server, interval_sec: u32) !void {
-        if (interval_sec == 0) return;
+        // The thread also carries the two duties that have nothing to do
+        // with goals: the periodic summary line and interval-mode fsyncs. If
+        // neither is on, `--maint-interval=0` still means "no thread".
+        const interval_mode = switch (self.wal_sync) {
+            .interval_ms => self.store.wal != null,
+            else => false,
+        };
+        const other_duties = (self.log_every_sec != 0 and self.logger.enabled()) or interval_mode;
+        if (interval_sec == 0 and !other_duties) return;
         if (self.maint_thread != null) return; // already running
         self.maint_interval_sec = interval_sec;
         self.maint_running.store(true, .release);
@@ -597,6 +648,88 @@ pub const Server = struct {
         self.forget_dry_run = dry_run;
     }
 
+    /// One periodic summary line (`--log-every`). Takes `store_mutex` only
+    /// to read the store's counters; the rest are atomics.
+    pub fn emitSummary(self: *Server) void {
+        if (!self.logger.enabled()) return;
+        self.store_mutex.lock();
+        const cells = self.store.cellCount();
+        const edges = self.store.hyperedgeCount();
+        const ws: ?wal_mod.WAL.Stats = if (self.store.wal) |w| w.stats() else null;
+        self.store_mutex.unlock();
+
+        const uptime_s: u64 = @intCast(@divTrunc(nowNs() - self.boot_time_ns, 1_000_000_000));
+        const m = &self.metrics;
+        if (ws) |w| {
+            self.logger.event(.info, "summary", "uptime_s={d} requests={d} inserts={d} queries={d} cells={d} hyperedges={d} maintenance_passes={d} forgotten={d} wal_sync={s} wal_appended={d} wal_durable={d} wal_fsyncs={d}", .{
+                uptime_s,
+                m.requests_total.load(.monotonic),
+                m.inserts_total.load(.monotonic),
+                m.queries_total.load(.monotonic),
+                cells,
+                edges,
+                m.maintenance_passes.load(.monotonic),
+                m.forgotten_cells_total.load(.monotonic),
+                @tagName(self.wal_sync),
+                w.appended,
+                w.durable,
+                w.syncs,
+            });
+        } else {
+            self.logger.event(.info, "summary", "uptime_s={d} requests={d} inserts={d} queries={d} cells={d} hyperedges={d} maintenance_passes={d} forgotten={d} wal=none", .{
+                uptime_s,
+                m.requests_total.load(.monotonic),
+                m.inserts_total.load(.monotonic),
+                m.queries_total.load(.monotonic),
+                cells,
+                edges,
+                m.maintenance_passes.load(.monotonic),
+                m.forgotten_cells_total.load(.monotonic),
+            });
+        }
+    }
+
+    /// `interval:N` mode's idle-stream flush, from the maintenance thread.
+    /// Holds `store_mutex` because `takeSnapshot` swaps the WAL object under
+    /// it; the fsync it may trigger is bounded by one interval.
+    fn walIntervalTick(self: *Server) void {
+        self.store_mutex.lock();
+        defer self.store_mutex.unlock();
+        if (self.store.wal) |w| w.syncIfDue() catch |err| {
+            diag("interval fsync failed: {}", .{err});
+        };
+    }
+
+    /// Ask `serve` to stop accepting, drain, and return. Safe from any thread.
+    pub fn requestShutdown(self: *Server) void {
+        self.shutdown_requested.store(true, .release);
+    }
+
+    fn stopping(self: *const Server) bool {
+        if (self.shutdown_requested.load(.acquire)) return true;
+        return self.watch_signals and signal.terminationRequested();
+    }
+
+    /// Wait for connection threads to finish. Bounded: a handler wedged on a
+    /// dead client must not turn a clean shutdown into a SIGKILL.
+    fn drainInflight(self: *Server, timeout_ms: u32) bool {
+        var waited: u32 = 0;
+        while (self.inflight.load(.acquire) != 0) {
+            if (waited >= timeout_ms) return false;
+            sleepMs(2);
+            waited += 2;
+        }
+        return true;
+    }
+
+    /// Make the WAL durable. `serve` calls this after draining, with the
+    /// maintenance thread already joined.
+    pub fn flushWal(self: *Server) !void {
+        self.store_mutex.lock();
+        defer self.store_mutex.unlock();
+        if (self.store.wal) |w| try w.flush();
+    }
+
     fn stopMaintenance(self: *Server) void {
         self.maint_running.store(false, .release);
         if (self.maint_thread) |t| {
@@ -612,26 +745,46 @@ pub const Server = struct {
         const slice_ms: u32 = 100;
         // u64 arithmetic: `interval_sec * 1000` overflows u32 above ~4.29e6
         // seconds, which is a typo away from a nonsense slice count.
-        const maint_slices: u64 = @max(@as(u64, srv.maint_interval_sec) * 1000 / slice_ms, 1);
+        // 0 = maintenance is off (the thread is only here for the summary or
+        // interval fsyncs); forgetting rides the same switch, as documented.
+        const maint_slices: u64 = if (srv.maint_interval_sec == 0)
+            0
+        else
+            @max(@as(u64, srv.maint_interval_sec) * 1000 / slice_ms, 1);
+        const summary_slices: u64 = if (srv.log_every_sec == 0 or !srv.logger.enabled())
+            0
+        else
+            @max(@as(u64, srv.log_every_sec) * 1000 / slice_ms, 1);
+        const interval_mode = switch (srv.wal_sync) {
+            .interval_ms => true,
+            else => false,
+        };
         // Two independent deadlines over one thread. `forget_slices == 0`
         // is "forgetting is off", and in that case the counter must stop
         // advancing entirely — incrementing it forever would eventually
         // wrap a u64 into a panic in the middle of the night.
-        const forget_slices: u64 = if (srv.forget_interval_sec == 0)
+        const forget_slices: u64 = if (srv.forget_interval_sec == 0 or maint_slices == 0)
             0
         else
             @max(@as(u64, srv.forget_interval_sec) * 1000 / slice_ms, 1);
 
         var since_maintenance: u64 = 0;
         var since_forget: u64 = 0;
+        var since_summary: u64 = 0;
 
         while (srv.maint_running.load(.acquire)) {
             sleepMs(slice_ms);
-            since_maintenance += 1;
+            if (maint_slices != 0) since_maintenance += 1;
             if (forget_slices != 0) since_forget += 1;
+            if (summary_slices != 0) since_summary += 1;
             if (!srv.maint_running.load(.acquire)) break;
 
-            if (since_maintenance >= maint_slices) {
+            if (interval_mode) srv.walIntervalTick();
+            if (summary_slices != 0 and since_summary >= summary_slices) {
+                since_summary = 0;
+                srv.emitSummary();
+            }
+            if (maint_slices != 0 and since_maintenance >= maint_slices) {
                 since_maintenance = 0;
                 srv.runMaintenancePass();
             }
@@ -639,6 +792,7 @@ pub const Server = struct {
                 since_forget = 0;
                 if (srv.runForgetSweep(srv.forget_dry_run)) |_| {} else |err| {
                     diag("forgetting sweep failed: {}", .{err});
+                    srv.logger.event(.warn, "forgetting", "sweep failed: {s}", .{@errorName(err)});
                 }
             }
         }
@@ -654,6 +808,7 @@ pub const Server = struct {
         const res = self.store.maintain(nowMs()) catch |err| {
             self.store_mutex.unlock();
             diag("maintenance pass failed: {}", .{err});
+            self.logger.event(.warn, "maintenance", "pass failed: {s}", .{@errorName(err)});
             return;
         };
         self.store_mutex.unlock();
@@ -667,6 +822,7 @@ pub const Server = struct {
             // Transitions are rare by construction (7-day rule), so
             // logging them unconditionally is safe and useful.
             if (!builtin.is_test) log.info("maintenance: {d} goal(s) unrealized, {d} failed", .{ res.goals_unrealized, res.goals_failed });
+            self.logger.event(.info, "maintenance", "{d} goal(s) unrealized, {d} failed", .{ res.goals_unrealized, res.goals_failed });
         }
     }
 
@@ -725,6 +881,7 @@ pub const Server = struct {
         // operator at all.
         if (!dry_run and res.fuzzied > 0) {
             diag("forgetting: {d} cell(s) fuzzied of {d} swept", .{ res.fuzzied, res.fuzzied + res.kept });
+            self.logger.event(.info, "forgetting", "{d} cell(s) fuzzied of {d} swept", .{ res.fuzzied, res.fuzzied + res.kept });
         }
         return res;
     }
@@ -778,16 +935,70 @@ pub const Server = struct {
         log.info("listening on {s}:{d}", .{ self.bind, self.port });
     }
 
+    /// Accept loop. Returns once `requestShutdown` is called (or SIGINT /
+    /// SIGTERM arrives, with `watch_signals`): it stops accepting, waits for
+    /// in-flight connections, joins the maintenance thread and flushes the
+    /// WAL, so the caller only has to `deinit`.
     pub fn serve(self: *Server) !void {
         if (!self.bound) return error.NotListening;
-        while (true) {
+        // Poll with a short timeout instead of a bare blocking `accept`:
+        // a signal that lands between the `stopping()` check and the
+        // blocking call would otherwise be missed until the next client.
+        const POLL_MS = 200;
+        while (!self.stopping()) {
+            var pfd = [1]std.c.pollfd{.{ .fd = self.fd, .events = std.c.POLL.IN, .revents = 0 }};
+            if (std.c.poll(&pfd, 1, POLL_MS) <= 0) continue;
             var client_addr: std.posix.sockaddr.in = undefined;
             var addr_len: std.posix.socklen_t = @sizeOf(@TypeOf(client_addr));
             const client_fd = std.c.accept(self.fd, @ptrCast(&client_addr), &addr_len);
             if (client_fd < 0) continue;
-            self.handleConn(client_fd) catch |err| log.warn("conn: {}", .{err});
-            _ = std.c.close(client_fd);
+            if (self.concurrent) {
+                self.spawnConn(client_fd);
+            } else {
+                self.handleConn(client_fd) catch |err| log.warn("conn: {}", .{err});
+                _ = std.c.close(client_fd);
+            }
         }
+
+        // Stop accepting: new connections are refused from here on.
+        if (self.fd >= 0) {
+            _ = std.c.close(self.fd);
+            self.fd = -1;
+            self.bound = false;
+        }
+        const drained = self.drainInflight(10_000);
+        if (!drained) diag("shutdown: {d} connection(s) still in flight after 10s, flushing anyway", .{self.inflight.load(.acquire)});
+        self.stopMaintenance();
+        self.flushWal() catch |err| {
+            diag("shutdown: WAL flush failed: {}", .{err});
+            self.logger.event(.err, "shutdown", "WAL flush failed: {s}", .{@errorName(err)});
+            return err;
+        };
+    }
+
+    /// Most connection threads alive at once; beyond it the accept loop
+    /// waits, which is back-pressure rather than unbounded thread growth.
+    const MAX_INFLIGHT: usize = 256;
+
+    fn spawnConn(self: *Server, client_fd: c.fd_t) void {
+        while (self.inflight.load(.acquire) >= MAX_INFLIGHT) sleepMs(1);
+        _ = self.inflight.fetchAdd(1, .acq_rel);
+        const t = std.Thread.spawn(.{}, connThread, .{ self, client_fd }) catch |err| {
+            // Out of threads: serve it here, on the accept thread, which is
+            // slower but never drops the request.
+            _ = self.inflight.fetchSub(1, .acq_rel);
+            diag("conn thread spawn failed: {}; handling inline", .{err});
+            self.handleConn(client_fd) catch |e| log.warn("conn: {}", .{e});
+            _ = std.c.close(client_fd);
+            return;
+        };
+        t.detach();
+    }
+
+    fn connThread(self: *Server, client_fd: c.fd_t) void {
+        defer _ = self.inflight.fetchSub(1, .acq_rel);
+        self.handleConn(client_fd) catch |err| log.warn("conn: {}", .{err});
+        _ = std.c.close(client_fd);
     }
 
     fn handleConn(self: *Server, fd: c.fd_t) !void {
@@ -819,12 +1030,30 @@ pub const Server = struct {
         // `handleConn` is the right altitude, not `route`: `route` is
         // called directly by the tests, and locking there would deadlock
         // against `runMaintenanceNow`.
+        //
+        // Group commit: in `.group` mode every WAL append this request makes
+        // is *written* under the lock but not *waited for*. The lock is
+        // dropped, and only then does this thread block until one fsync
+        // covers its records — so while it waits, other connections can run
+        // and append, and they all share that fsync. The client still gets
+        // no reply before its record is durable; it is the lock, not the
+        // acknowledgement, that no longer spans the fsync.
+        if (self.concurrent) wal_mod.deferDurability();
         self.store_mutex.lock();
-        const response = self.route(method, path, req) catch |err| {
+        var response = self.route(method, path, req) catch |err| {
             self.store_mutex.unlock();
+            if (self.concurrent) wal_mod.awaitDeferred() catch {};
             return err;
         };
         self.store_mutex.unlock();
+        if (self.concurrent) {
+            wal_mod.awaitDeferred() catch |err| {
+                // The change is in memory but its journal record is not
+                // known to be on disk: say so instead of acknowledging it.
+                self.alloc.free(response.body);
+                response = self.jsonResponse(500, "Internal Server Error", "{\"error\":\"WAL fsync failed; write not acknowledged\"}") catch return err;
+            };
+        }
         defer self.alloc.free(response.body);
 
         var header_buf: [512]u8 = undefined;
@@ -914,6 +1143,7 @@ pub const Server = struct {
                 return try self.jsonResponse(500, "Internal Server Error",
                     try std.fmt.allocPrint(self.alloc, "{{\"error\":\"snapshot failed: {s}\"}}", .{@errorName(err)}));
             };
+            self.logger.event(.info, "sync", "snapshot taken and WAL rotated", .{});
             return try self.jsonResponse(200, "OK",
                 \\{"status":"synced","wal":true,"snapshot":true}
             );
@@ -2757,4 +2987,291 @@ test "HTTP: POST /api/memcells carries foresight through to the committed cell" 
     defer r2.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 400), r2.status);
     try std.testing.expectEqual(@as(usize, 1), srv.store.cellCount());
+}
+
+// =============================================================================
+// Graceful shutdown, group-commit concurrency and daemon logging.
+// =============================================================================
+
+fn testFreePort() !u16 {
+    const fd = c.socket(c.AF.INET, @bitCast(@as(u32, c.SOCK.STREAM)), 0);
+    if (fd < 0) return error.SocketFailed;
+    defer _ = c.close(fd);
+    var addr: std.posix.sockaddr.in = undefined;
+    addr.family = c.AF.INET;
+    addr.port = 0;
+    addr.addr = 0;
+    if (c.bind(fd, @ptrCast(&addr), @sizeOf(@TypeOf(addr))) != 0) return error.BindFailed;
+    var got: std.posix.sockaddr.in = undefined;
+    var len: std.posix.socklen_t = @sizeOf(@TypeOf(got));
+    if (c.getsockname(fd, @ptrCast(&got), &len) != 0) return error.GetsocknameFailed;
+    return std.mem.bigToNative(u16, got.port);
+}
+
+/// One request over a real socket; returns the HTTP status or 0 on a
+/// transport failure. The body is discarded: these tests assert on status
+/// and on the store.
+fn testHttpStatus(port: u16, request: []const u8) u16 {
+    var addr: std.posix.sockaddr.in = undefined;
+    addr.family = c.AF.INET;
+    addr.port = std.mem.nativeToBig(u16, port);
+    addr.addr = std.mem.nativeToBig(u32, 0x7F000001);
+    const fd = c.socket(c.AF.INET, @bitCast(@as(u32, c.SOCK.STREAM)), 0);
+    if (fd < 0) return 0;
+    defer _ = c.close(fd);
+    if (c.connect(fd, @ptrCast(&addr), @sizeOf(@TypeOf(addr))) != 0) return 0;
+    var sent: usize = 0;
+    while (sent < request.len) {
+        const n = c.write(fd, request[sent..].ptr, request.len - sent);
+        if (n <= 0) return 0;
+        sent += @intCast(n);
+    }
+    var buf: [4096]u8 = undefined;
+    var total: usize = 0;
+    while (total < buf.len) {
+        const n = c.read(fd, buf[total..].ptr, buf.len - total);
+        if (n <= 0) break;
+        total += @intCast(n);
+    }
+    // "HTTP/1.1 201 Created"
+    if (total < 12) return 0;
+    return std.fmt.parseInt(u16, buf[9..12], 10) catch 0;
+}
+
+fn testPost(port: u16, episode: []const u8) u16 {
+    var body_buf: [256]u8 = undefined;
+    const body = std.fmt.bufPrint(&body_buf, "{{\"source\":\"matter\",\"episode\":\"{s}\",\"facts\":\"\",\"goalId\":1,\"relevance\":0.5}}", .{episode}) catch return 0;
+    var req_buf: [512]u8 = undefined;
+    const req = std.fmt.bufPrint(&req_buf, "POST /api/memcells HTTP/1.1\r\nHost: x\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ body.len, body }) catch return 0;
+    return testHttpStatus(port, req);
+}
+
+const ServeRunner = struct {
+    srv: *Server,
+    done: std.atomic.Value(bool) = .init(false),
+    err: ?anyerror = null,
+    fn run(self: *ServeRunner) void {
+        self.srv.serve() catch |e| {
+            self.err = e;
+        };
+        self.done.store(true, .release);
+    }
+};
+
+fn testDataDir(buf: []u8, label: []const u8) []const u8 {
+    return std.fmt.bufPrint(buf, "/tmp/mem3_srv_{d}_{s}", .{ c.getpid(), label }) catch unreachable;
+}
+
+fn testWipe(dir: []const u8) void {
+    var z: [std.fs.max_path_bytes + 1]u8 = undefined;
+    inline for (.{ "mem3.wal", "snapshot.bin" }) |f| {
+        if (std.fmt.bufPrint(&z, "{s}/" ++ f ++ "\x00", .{dir})) |p| {
+            _ = c.unlink(p[0 .. p.len - 1 :0].ptr);
+        } else |_| {}
+    }
+    if (std.fmt.bufPrint(&z, "{s}\x00", .{dir})) |p| {
+        _ = c.rmdir(p[0 .. p.len - 1 :0].ptr);
+    } else |_| {}
+}
+
+test "Server: serve() answers requests, then returns once shutdown is requested" {
+    const alloc = std.testing.allocator;
+    const port = try testFreePort();
+    var srv = try Server.init(alloc, "127.0.0.1", port, null);
+    defer srv.deinit();
+    try srv.listen();
+
+    var runner = ServeRunner{ .srv = srv };
+    const t = try std.Thread.spawn(.{}, ServeRunner.run, .{&runner});
+
+    try std.testing.expectEqual(@as(u16, 200), testHttpStatus(port, "GET /healthz HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"));
+    try std.testing.expect(!runner.done.load(.acquire));
+
+    srv.requestShutdown();
+    t.join();
+    try std.testing.expect(runner.done.load(.acquire));
+    try std.testing.expectEqual(@as(?anyerror, null), runner.err);
+}
+
+test "Server: group mode acknowledges concurrent POSTs only after they are durable, and loses none" {
+    const alloc = std.testing.allocator;
+    var db: [96]u8 = undefined;
+    const dir = testDataDir(&db, "grp_http");
+    testWipe(dir);
+    defer testWipe(dir);
+
+    const THREADS = 4;
+    const PER = 12;
+    {
+        const port = try testFreePort();
+        var srv = try Server.initWithOptions(alloc, "127.0.0.1", port, .{ .data_dir = dir, .wal_sync = .group });
+        defer srv.deinit();
+        try srv.listen();
+        var runner = ServeRunner{ .srv = srv };
+        const st = try std.Thread.spawn(.{}, ServeRunner.run, .{&runner});
+
+        const Client = struct {
+            fn run(p: u16, t: usize, ok: *std.atomic.Value(u32)) void {
+                for (0..PER) |i| {
+                    var ep: [48]u8 = undefined;
+                    const text = std.fmt.bufPrint(&ep, "group http cell {d}-{d}", .{ t, i }) catch return;
+                    if (testPost(p, text) == 201) _ = ok.fetchAdd(1, .monotonic);
+                }
+            }
+        };
+        var ok: std.atomic.Value(u32) = .init(0);
+        var ths: [THREADS]std.Thread = undefined;
+        for (&ths, 0..) |*th, t| th.* = try std.Thread.spawn(.{}, Client.run, .{ port, t, &ok });
+        for (ths) |th| th.join();
+        try std.testing.expectEqual(@as(u32, THREADS * PER), ok.load(.monotonic));
+
+        // Every acknowledged write is covered by an fsync.
+        const ws = srv.store.wal.?.stats();
+        try std.testing.expect(ws.appended >= THREADS * PER);
+        try std.testing.expectEqual(ws.appended, ws.durable);
+        try std.testing.expect(ws.syncs <= ws.appended);
+        try std.testing.expectEqual(@as(usize, 0), ws.pending);
+
+        srv.requestShutdown();
+        st.join();
+        try std.testing.expectEqual(@as(?anyerror, null), runner.err);
+    }
+    // A restart WITHOUT the flag still reads every record.
+    var store = try mem3_store.Store.init(alloc, .{ .data_dir = dir });
+    defer store.deinit();
+    try std.testing.expectEqual(@as(usize, THREADS * PER), store.cellCount());
+}
+
+/// POST that connects first and sends its request only after `delay_ms`,
+/// so the server holds an accepted, in-flight connection in the meantime.
+fn testSlowPost(port: u16, episode: []const u8, delay_ms: u32) u16 {
+    var addr: std.posix.sockaddr.in = undefined;
+    addr.family = c.AF.INET;
+    addr.port = std.mem.nativeToBig(u16, port);
+    addr.addr = std.mem.nativeToBig(u32, 0x7F000001);
+    const fd = c.socket(c.AF.INET, @bitCast(@as(u32, c.SOCK.STREAM)), 0);
+    if (fd < 0) return 0;
+    defer _ = c.close(fd);
+    if (c.connect(fd, @ptrCast(&addr), @sizeOf(@TypeOf(addr))) != 0) return 0;
+    sleepMs(delay_ms);
+    var body_buf: [256]u8 = undefined;
+    const body = std.fmt.bufPrint(&body_buf, "{{\"source\":\"matter\",\"episode\":\"{s}\",\"facts\":\"\",\"goalId\":1,\"relevance\":0.5}}", .{episode}) catch return 0;
+    var req_buf: [512]u8 = undefined;
+    const req = std.fmt.bufPrint(&req_buf, "POST /api/memcells HTTP/1.1\r\nHost: x\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ body.len, body }) catch return 0;
+    if (c.write(fd, req.ptr, req.len) <= 0) return 0;
+    var buf: [256]u8 = undefined;
+    var total: usize = 0;
+    while (total < buf.len) {
+        const n = c.read(fd, buf[total..].ptr, buf.len - total);
+        if (n <= 0) break;
+        total += @intCast(n);
+    }
+    if (total < 12) return 0;
+    return std.fmt.parseInt(u16, buf[9..12], 10) catch 0;
+}
+
+test "Server: shutdown drains an in-flight request instead of dropping it" {
+    const alloc = std.testing.allocator;
+    var db: [96]u8 = undefined;
+    const dir = testDataDir(&db, "drain");
+    testWipe(dir);
+    defer testWipe(dir);
+
+    const port = try testFreePort();
+    var srv = try Server.initWithOptions(alloc, "127.0.0.1", port, .{ .data_dir = dir, .wal_sync = .group });
+    defer srv.deinit();
+    try srv.listen();
+    var runner = ServeRunner{ .srv = srv };
+    const st = try std.Thread.spawn(.{}, ServeRunner.run, .{&runner});
+
+    // The client connects, then dawdles for 600 ms before sending: from the
+    // server's side an accepted connection is in flight for that long.
+    var status: std.atomic.Value(u32) = .init(0);
+    const Client = struct {
+        fn run(p: u16, out: *std.atomic.Value(u32)) void {
+            out.store(testSlowPost(p, "drained insert", 600), .release);
+        }
+    };
+    const ct = try std.Thread.spawn(.{}, Client.run, .{ port, &status });
+    while (srv.inflight.load(.acquire) == 0) sleepMs(1);
+
+    srv.requestShutdown();
+    sleepMs(250);
+    // Still waiting on that connection: a shutdown that does not drain
+    // would have returned by now (nothing else is holding it up).
+    try std.testing.expect(!runner.done.load(.acquire));
+    try std.testing.expectEqual(@as(u32, 0), status.load(.acquire));
+
+    ct.join();
+    st.join();
+    try std.testing.expectEqual(@as(u32, 201), status.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 1), srv.store.cellCount());
+    try std.testing.expectEqual(@as(?anyerror, null), runner.err);
+}
+
+test "Server: the periodic summary is one parseable JSON line carrying live numbers" {
+    const alloc = std.testing.allocator;
+    var sc = try logger_mod.Scratch.open("srv_summary");
+    defer sc.close();
+    var srv = try Server.initWithOptions(alloc, "127.0.0.1", 0, .{
+        .data_dir = null,
+        .logger = .{ .mode = .jsonl, .fd = sc.fd },
+    });
+    defer srv.deinit();
+
+    _ = try srv.store.addRaw(.matter, "summary probe", "", 0, 0.0);
+    _ = srv.metrics.inserts_total.fetchAdd(1, .monotonic);
+    srv.emitSummary();
+
+    const got = try sc.contents(alloc);
+    defer alloc.free(got);
+    try std.testing.expect(got.len > 0 and got[got.len - 1] == '\n');
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, got[0 .. got.len - 1], .{});
+    defer parsed.deinit();
+    const obj = parsed.value.object;
+    try std.testing.expectEqualStrings("summary", obj.get("scope").?.string);
+    const msg = obj.get("msg").?.string;
+    try std.testing.expect(std.mem.indexOf(u8, msg, "cells=1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, msg, "inserts=1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, msg, "uptime_s=") != null);
+}
+
+test "Server: a maintenance transition is logged as a JSONL event, and a quiet pass is not" {
+    const alloc = std.testing.allocator;
+    var sc = try logger_mod.Scratch.open("srv_maint");
+    defer sc.close();
+    var srv = try Server.initWithOptions(alloc, "127.0.0.1", 0, .{
+        .data_dir = null,
+        .logger = .{ .mode = .jsonl, .fd = sc.fd },
+    });
+    defer srv.deinit();
+
+    // Quiet pass: nothing to say, nothing written.
+    srv.runMaintenancePass();
+    {
+        const got = try sc.contents(alloc);
+        defer alloc.free(got);
+        try std.testing.expectEqual(@as(usize, 0), got.len);
+    }
+
+    // An aged, childless goal: the 7-day rule fires.
+    const eight_days_ms: i64 = 8 * 24 * 3600 * 1000;
+    _ = try srv.store.goals.create("stale", "no memories", null, 5, null, nowMs() - eight_days_ms, &srv.store.ids);
+    srv.runMaintenancePass();
+    const got = try sc.contents(alloc);
+    defer alloc.free(got);
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, std.mem.trimEnd(u8, got, "\n"), .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("maintenance", parsed.value.object.get("scope").?.string);
+    try std.testing.expect(std.mem.indexOf(u8, parsed.value.object.get("msg").?.string, "1 goal(s) unrealized") != null);
+}
+
+test "Server: the default logger is silent" {
+    const alloc = std.testing.allocator;
+    var srv = try Server.init(alloc, "127.0.0.1", 0, null);
+    defer srv.deinit();
+    try std.testing.expect(!srv.logger.enabled());
+    // Would write to stderr and kill the test runner if it were not off.
+    srv.emitSummary();
+    srv.runMaintenancePass();
 }

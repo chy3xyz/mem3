@@ -109,6 +109,7 @@ comptime {
     _ = @import("platform/fs.zig");
     _ = @import("platform/stdio.zig");
     _ = @import("platform/env.zig");
+    _ = @import("platform/signal.zig");
     _ = @import("platform/mod.zig");
     // `utils/serializer.zig` was likewise outside the gate entirely, which
     // is how a size-accounting defect that silently dropped every
@@ -176,6 +177,11 @@ comptime {
     _ = @import("mcp/tools.zig");
     _ = @import("mcp/server.zig");
     _ = @import("cli_commands/mcp.zig");
+    // Official LongMemEval retrieval harness: metric math, dataset parsing,
+    // corpus construction and a Store-backed fixture run.
+    _ = @import("eval/longmemeval_official.zig");
+    // The daemon entry point: banner, logger selection and signal wiring.
+    _ = @import("cli_commands/serve.zig");
 }
 
 const log = std.log.scoped(.mem3_main);
