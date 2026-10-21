@@ -4,19 +4,19 @@
 
 ## Context
 
-The paper's `ghw_memory_system.agent.final.md` §3.2.1 establishes a formal mapping from 三源 (M/F/S) to GHW three layers (Goal/Harness/World):
+The paper's `ghw_memory_system.agent.final.md` §3.2.1 establishes a formal mapping from the three sources (M/F/S) to the GHW three layers (Goal/Harness/World). The paper is written in Chinese; the quotation below is translated:
 
-> 性源的方向性转化为Goal层的目标生成
-> 象源的表征力转化为Harness层的调控能力
-> 物源的境域性转化为World层的世界建构
+> The directionality of the spirit source becomes goal generation in the Goal layer.
+> The representational power of the form source becomes regulatory capacity in the Harness layer.
+> The situatedness of the matter source becomes world construction in the World layer.
 
 This gives:
 
-| 三源 | GHW Layer | Function | Time scale |
+| Source | GHW Layer | Function | Time scale |
 |---|---|---|---|
-| 性 (S) | Goal | 目标记忆、价值定向、元目标评估 | 周至年级 (slowest) |
-| 象 (F) | Harness | 调控记忆、程序学习、元认知策略 | 毫秒至天级 (fastest) |
-| 物 (M) | World | 世界模型、情境记忆、物理因果 | 分钟至月级 (mid) |
+| Spirit (S) | Goal | Goal memory, value orientation, meta-goal evaluation | Weeks to years (slowest) |
+| Form (F) | Harness | Regulatory memory, procedural learning, meta-cognitive strategy | Milliseconds to days (fastest) |
+| Matter (M) | World | World model, situated memory, physical causality | Minutes to months (mid) |
 
 ## Decision
 
@@ -24,7 +24,7 @@ We enforce the GHW three-layer architecture as three top-level source directorie
 
 ```
 src/ghw/       → Goal + Harness + World (the "control plane" of GHW)
-src/memory/    → 三源合恰 (the "data plane" of three sources)
+src/memory/    → Tri-source coherence (the "data plane" of the three sources)
 src/hypermem/  → HyMem (the "storage plane" of hypergraph)
 src/retrieval/ → Three-way recall (the "query plane")
 src/storage/   → LSM + WAL (the "persistence plane")
@@ -33,7 +33,7 @@ src/storage/   → LSM + WAL (the "persistence plane")
 Each file in `src/ghw/` MUST declare its layer in the file-level doc-comment:
 
 ```zig
-//! GHW Layer: **Goal** (性源)
+//! GHW Layer: **Goal** (spirit source)
 //! ...
 ```
 
@@ -49,12 +49,12 @@ Cross-layer calls MUST go through the GHW I/O interface in `src/ghw/ghw_io.zig`.
 ## Alternatives Considered
 
 1. **Single flat `src/` with no layer separation**. Rejected: violates Constitution II.
-2. **Map 1:1 with the paper's `GHW Three-Layer Architecture` figure**. This is what we do, but with a refinement: the `src/memory/` directory (三源) is parallel to the GHW three layers, not a fourth layer. The data plane is orthogonal to the control plane.
+2. **Map 1:1 with the paper's `GHW Three-Layer Architecture` figure**. This is what we do, but with a refinement: the `src/memory/` directory (tri-source) is parallel to the GHW three layers, not a fourth layer. The data plane is orthogonal to the control plane.
 
 ## References
 
 - `ghw_memory_system.agent.final.md` §3.2 (GHW three-layer mapping, time scales)
-- `ghw_memory_system.agent.final.md` Table 2 (三源-三层 mapping)
-- `.specify/memory/constitution.md` Principle II (GHW 三层耦合)
+- `ghw_memory_system.agent.final.md` Table 2 (three-source to three-layer mapping)
+- `.specify/memory/constitution.md` Principle II (GHW Three-Layer Coupling)
 - `specs/001-trisource-everos-mvp/plan.md` §Project Structure
 - `specs/001-trisource-everos-mvp/data-model.md` §Constitutional Mapping Table

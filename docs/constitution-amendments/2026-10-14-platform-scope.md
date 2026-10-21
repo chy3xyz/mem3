@@ -2,7 +2,7 @@
 
 **Date:** 2026-10-14
 **From:** v1.0.0 → v1.1.0
-**Affects:** Principle IV (零依赖 + Zig 0.17 原生), Scope Boundaries, Version history
+**Affects:** Principle IV (Zero-Dependency Zig 0.17 Native), Scope Boundaries, Version history
 
 ---
 
