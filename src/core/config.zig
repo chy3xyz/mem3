@@ -4,6 +4,17 @@ const std = @import("std");
 
 /// All thresholds / parameters. CLI flags override these.
 pub const Config = struct {
+    /// How the HNSW index stores the vectors it scores against.
+    pub const VectorStorage = enum {
+        /// 4 bytes per dimension, exact. The default.
+        f32,
+        /// 1 byte per dimension: each vector is scaled so its largest component
+        /// is 127 and rounded. Cosine is scale-invariant, so no scale is kept;
+        /// scoring is an exact integer dot product of two quantised vectors.
+        /// Lossy: see `docs/roadmap.md` for the measured recall cost.
+        int8,
+    };
+
     // Storage
     data_dir: []const u8 = "data",
     memtable_size: usize = 64 * 1024 * 1024,
@@ -15,6 +26,21 @@ pub const Config = struct {
     hnsw_m_max0: u16 = 32,
     hnsw_ef_construction: u16 = 200,
     hnsw_ef_search: u16 = 100,
+    /// Adaptive search budget. 0 = off (the budget is exactly
+    /// `hnsw_ef_search`). Otherwise the budget is
+    /// `max(hnsw_ef_search, live_count / divisor)`, so it grows with the
+    /// corpus. Recall at a fixed ef falls with corpus size (the graph stays
+    /// fully reachable; the walk simply runs out of budget), and this is the
+    /// knob that buys it back at a measured latency cost.
+    ///
+    /// Default 64: inert below 6,400 live cells (count / 64 < 100), so every
+    /// small-corpus result is unchanged. Measured at dim 384, 100 queries:
+    /// recall@10 0.893 -> 0.944 (10k), 0.676 -> 0.926 (30k), 0.430 -> 0.928
+    /// (100k), at 100k a mean 0.81 -> 9.88 ms/query. See docs/roadmap.md.
+    hnsw_ef_search_divisor: u16 = 64,
+    /// Vector storage inside the index. Fixed for the life of an index:
+    /// changing it after the first insert is not supported.
+    hnsw_vector_storage: VectorStorage = .f32,
     /// Seed for the index's level-assignment RNG. Explicit so graph
     /// construction is reproducible: the benchmark reports a stability
     /// figure and the tests assert measured numbers, both of which are

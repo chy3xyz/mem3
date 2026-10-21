@@ -105,6 +105,10 @@ fn diag(comptime fmt: []const u8, args: anytype) void {
     seed_default_goals: bool = true,
     /// Embedder vector dimension. Default: 384.
     embed_dim: u16 = 384,
+    /// How the HNSW index stores vectors. `.f32` (default) is exact; `.int8`
+    /// is a quarter of the memory and lossy. Vectors are not persisted, so
+    /// this can differ between runs over the same data directory.
+    vector_storage: Config.VectorStorage = .f32,
     /// Which embedder implementation the store embeds with. Default:
     /// `.lexical_hash` — the real lexical embedder. `.stub_xxhash`
     /// stays available because it is the historical default and
@@ -298,7 +302,7 @@ pub const Store = struct {
         // HNSW + embedder
         const hnsw_ptr = try alloc.create(HNSW);
         errdefer alloc.destroy(hnsw_ptr);
-        hnsw_ptr.* = HNSW.init(alloc, .{}, opts.embed_dim);
+        hnsw_ptr.* = HNSW.init(alloc, .{ .hnsw_vector_storage = opts.vector_storage }, opts.embed_dim);
         errdefer hnsw_ptr.deinit();
         self.hnsw = hnsw_ptr;
 

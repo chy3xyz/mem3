@@ -131,7 +131,7 @@ tests/
 | Lexical arm | ✅ | `src/retrieval/bm25.zig`, Okapi BM25 over unigrams + bigrams, max-normalised inside the existing `λ_dense=0.5 / λ_sparse=0.2 / λ_graph=0.3` sum. Rebuilt from cells on snapshot restore, never serialised. Identifiers that live only in an `atomic_facts` triple went from 1/12 recall to 12/12 |
 | Persistence | ✅ | WAL-first + snapshot. WAL truncated on sync. `--wal-sync=always\|group\|interval:N` (default `always`, byte-identical); `interval` is weaker and documented as such. |
 | Daemon hygiene | ✅ | `serve`/`mcp` exit 0 on SIGINT/SIGTERM (`src/platform/signal.zig`: handler only stores an atomic; loops poll with a timeout). `--log-format`/`--log-every` feed `src/utils/logger.zig`; default is silent and byte-identical. JSONL goes to stderr only. |
-| Tests | ✅ | 541: 421 (`src/main.zig`-rooted) + 120 (`tests/main.zig`-rooted), plus 12 constitution invariants as a separate gate, 0 leaks |
+| Tests | ✅ | 551: 431 (`src/main.zig`-rooted) + 120 (`tests/main.zig`-rooted), plus 12 constitution invariants as a separate gate, 0 leaks |
 | Binary | ✅ | 963,704 bytes `ReleaseFast` / 4,569,032 bytes Debug, only links libSystem. The lexical arm added 49 KB ReleaseFast (+5.4%) over the 914,456 B measured before it |
 | Toolchain | ✅ | Pinned via `.zigversion` (Zig 0.17.0) |
 | Platforms | ✅ | macOS + Linux (x86_64 and aarch64). Windows/WASM refused at compile time — see [Platforms](#platforms) |
@@ -154,6 +154,10 @@ tests/
   the range, not the best run. The cause is `hnsw.insert` (~899 µs/op), not the
   WAL fsync (~1.2 ms/record), and it was measured by phase profile: ~55% of the
   write pipeline is `hnsw.insert`, ~42% the embedder, under 3% the `Store`.
+  Those are pre-rework figures: after the 2026-10-21 HNSW rework `hnsw.insert`
+  is 886 → 244 µs/op and `store.addRaw_durable` 538 → 275 µs/op (A/B, 5
+  interleaved rounds, `docs/roadmap.md` "1a"). The end-to-end cells/sec above
+  has not been re-run.
 - LongMemEval offline reimplementation: 0.646 on the core set, 0.000 padded,
   against a ≥80% target. `exhaustive_nn_hit_rate` is 0.604 and invariant across
   configurations, so `lexical_hash` — not the HNSW retrieval layer — is the
@@ -201,15 +205,19 @@ real gap, not a rounding error.
 |---|---|---|---|
 | MemCell write throughput | ≥ 1K/sec MVP / 1.75K/sec release (amended 2026-10-15, worst window) | worst window 1,863–2,438/sec; mean 3,116–3,898/sec | **pass** |
 | Top-10 query P95 | < 50ms MVP / < 10ms release (100K corpus) | 0.624 ms p95 (600-cell corpus) | not comparable — wrong corpus size |
-| HNSW build 100K vectors | < 30s | 430.6 s (dim=384, efc=200, whole-index build) | **MISS — 14x over** |
+| HNSW build 100K vectors | < 30s | 115.3 s median, 105.9–120.6 (dim=384, efc=200, whole-index build; interleaved against `main` at 543.4 s, 437.3–580.0, same loaded host; was 430.6 s before the HNSW rework) | **MISS — 3.8x over** |
 | 3-hop traversal | < 5ms (1K seeds) | 0.000 ms/seed | pass |
 | Cold-start | < 200ms | 0.077 ms | pass |
-| RSS at 100K cells | < 500MB | 687.6 MB (whole-process peak RSS, built-in embedder, no WAL, no consolidation; marginal ~27 KB/cell) | **MISS** |
+| RSS at 100K cells | < 500MB | 687.6 MB (idle host, before the HNSW rework; whole-process peak RSS, built-in embedder, no WAL, no consolidation). **Not re-verified since**: on a loaded host `time -l` read 426–2,768 MB for `main` and 331–579 MB for the branch at 100k, which is noise, not a result. Deterministic live-allocation floor: ~294 MB f32 / ~178 MB int8 (excludes allocator overhead) | **MISS (last idle-host measurement); unverified after rework** |
 | Binary size | < 10MB stripped | 963,704 bytes ReleaseFast | pass |
 | External deps (ldd) | 0 | `otool -L` lists only `libSystem` | pass |
 | LongMemEval accuracy | ≥ 80% | 0.7292 core / 0.7083 padded (offline reimplementation, BM25 sparse arm active) | **MISS** |
 
-The write-throughput miss is **HNSW insert**, not fsync: `hnsw.insert` is
+After the HNSW rework (2026-10-21, `docs/roadmap.md` "1a. HNSW rework"),
+interleaved against `main` over 5 rounds, `hnsw.insert` measures 886 µs/op on
+`main` and **244 µs/op** on the branch, `store.addRaw_durable` 538 → 275 µs/op,
+with `wal.append_durable` (the control) unchanged at ~950 µs. The
+write-throughput miss was **HNSW insert**, not fsync: `hnsw.insert` was
 ~899 µs/op, comparable to the ~1.2 ms WAL fsync and above the whole
 `store.addRaw_durable` pipeline. Group commit did not move it: `--wal-sync=group`
 (opt-in) was A/B-measured over 5 interleaved rounds and is within noise of

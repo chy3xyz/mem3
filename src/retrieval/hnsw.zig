@@ -107,6 +107,74 @@ fn normOf(v: []const f32) f32 {
     return @sqrt(s);
 }
 
+/// Integer dot product of two int8 vectors whose components are in
+/// [-127, 127].
+///
+/// Exact, so identical on every target: a product is at most 127^2 = 16,129,
+/// the sum of two is at most 32,258 and still fits an i16, which lets the
+/// pairwise add happen at 16 bits before widening to the i32 accumulators.
+/// (-128 would break that bound; `quantizeInto` never produces it.)
+fn dotI8(a: []const i8, b: []const i8) i32 {
+    const n = @min(a.len, b.len);
+    const V = @Vector(16, i8);
+    const P = @Vector(16, i16);
+    const H = @Vector(8, i16);
+    const W = @Vector(8, i32);
+    var acc0: W = @splat(0);
+    var acc1: W = @splat(0);
+    const even = [8]i32{ 0, 2, 4, 6, 8, 10, 12, 14 };
+    const odd = [8]i32{ 1, 3, 5, 7, 9, 11, 13, 15 };
+
+    var i: usize = 0;
+    while (i + 32 <= n) : (i += 32) {
+        const a0: *align(1) const V = @ptrCast(a.ptr + i);
+        const b0: *align(1) const V = @ptrCast(b.ptr + i);
+        const a1: *align(1) const V = @ptrCast(a.ptr + i + 16);
+        const b1: *align(1) const V = @ptrCast(b.ptr + i + 16);
+        const p0: P = @as(P, a0.*) * @as(P, b0.*);
+        const p1: P = @as(P, a1.*) * @as(P, b1.*);
+        const s0: H = @shuffle(i16, p0, undefined, even) + @shuffle(i16, p0, undefined, odd);
+        const s1: H = @shuffle(i16, p1, undefined, even) + @shuffle(i16, p1, undefined, odd);
+        acc0 += @as(W, s0);
+        acc1 += @as(W, s1);
+    }
+    while (i + 16 <= n) : (i += 16) {
+        const a0: *align(1) const V = @ptrCast(a.ptr + i);
+        const b0: *align(1) const V = @ptrCast(b.ptr + i);
+        const p0: P = @as(P, a0.*) * @as(P, b0.*);
+        const s0: H = @shuffle(i16, p0, undefined, even) + @shuffle(i16, p0, undefined, odd);
+        acc0 += @as(W, s0);
+    }
+    var tail: i32 = 0;
+    while (i < n) : (i += 1) tail += @as(i32, a[i]) * @as(i32, b[i]);
+    return @reduce(.Add, acc0 + acc1) + tail;
+}
+
+/// Quantise `v` into `out` (same length): scale so the largest finite
+/// magnitude maps to 127, round half away from zero. Non-finite components
+/// become 0 — `@intFromFloat` of a NaN is illegal behaviour — and an
+/// all-zero input stays all zero. Returns the integer norm
+/// sqrt(sum out[i]^2), the only norm cosine needs because the scale cancels.
+fn quantizeInto(out: []i8, v: []const f32) f32 {
+    var m: f32 = 0.0;
+    for (v) |x| {
+        if (std.math.isFinite(x)) m = @max(m, @abs(x));
+    }
+    if (m == 0.0) {
+        @memset(out, 0);
+        return 0.0;
+    }
+    const s = 127.0 / m;
+    var sumsq: i64 = 0;
+    for (out, v) |*o, x| {
+        const y: f32 = if (std.math.isFinite(x)) x * s else 0.0;
+        const r: i32 = @intFromFloat(std.math.clamp(@round(y), -127.0, 127.0));
+        o.* = @intCast(r);
+        sumsq += @as(i64, r) * r;
+    }
+    return @floatCast(@sqrt(@as(f64, @floatFromInt(sumsq))));
+}
+
 /// A query vector paired with its precomputed norm.
 ///
 /// The norm used to be recomputed from scratch inside every cosine call,
@@ -116,6 +184,10 @@ fn normOf(v: []const f32) f32 {
 pub const Query = struct {
     vec: []const f32,
     norm: f32,
+    /// Set only when the index stores int8 vectors: the quantised query and
+    /// its integer norm. `vec`/`norm` stay the exact float form.
+    q8: []const i8 = &.{},
+    q8_norm: f32 = 0.0,
 
     pub fn of(v: []const f32) Query {
         return .{ .vec = v, .norm = normOf(v) };
@@ -124,6 +196,9 @@ pub const Query = struct {
 
 pub const Node = struct {
     id: u64,
+    /// A view into the index's vector arena (`HNSW.vec_chunks`), not an
+    /// allocation of its own: the node does not free it, and the slice is
+    /// valid for the life of the index because chunks are never moved.
     vector: []f32,
     /// `normOf(vector)`, computed once at insert. Derived state: nothing
     /// serialises a `Node`, and no caller outside this file constructs
@@ -149,7 +224,6 @@ pub const Node = struct {
     deleted: bool = false,
 
     pub fn deinit(self: *Node, alloc: Allocator) void {
-        alloc.free(self.vector);
         for (self.neighbors) |*n| n.deinit(alloc);
         alloc.free(self.neighbors);
     }
@@ -229,9 +303,47 @@ pub const HNSW = struct {
     /// id space rather than a run with gaps. After that every lookup falls
     /// back to the map, so the worst case is one bounds check. `nodeFor`
     /// is the only function that reads it.
-    dense: std.ArrayList(?*Node) = .empty,
+    dense: std.ArrayList(u32) = .empty,
     dense_base: u64 = 0,
     dense_ok: bool = true,
+
+    /// `by_idx[i]` is the node whose `dense_idx` is `i`; `norms[i]` is its
+    /// cached norm. Both are indexed by insertion order and, like
+    /// `visit_stamp`, only ever grow. The beam loop works entirely in these
+    /// indices: a neighbour id becomes an index through `dense`, and from
+    /// there its stamp, norm and vector are array reads at computed
+    /// addresses — no `*Node` is dereferenced to score a neighbour, which
+    /// is what lets the vector be prefetched before it is needed.
+    by_idx: std.ArrayList(*Node) = .empty,
+    norms: std.ArrayList(f32) = .empty,
+
+    /// Vector arena: node `i`'s `dim` floats live in chunk `i >> chunk_shift`
+    /// at offset `(i & chunk_mask) * dim`.
+    ///
+    /// Each vector used to be its own `alloc(f32, dim)`: 1,536 bytes that the
+    /// general-purpose allocator rounds up to a 2,048-byte size class (a
+    /// quarter of every vector wasted), scattered wherever the allocator
+    /// found room, with a `*Node` between the graph and the data. Chunks
+    /// are cache-line aligned, about 1 MiB each, and never reallocated, so a
+    /// `Node.vector` slice into one stays valid and growing the index never
+    /// copies existing vectors (a single growing buffer would double peak
+    /// RSS at every doubling).
+    vec_chunks: std.ArrayList([]align(64) u8) = .empty,
+    chunk_shift: u5 = 0,
+    /// Bytes per stored vector: `4 * dim` for f32, `dim` for int8.
+    vec_stride: usize = 0,
+    /// `cfg.hnsw_vector_storage == .int8`, fixed at `init`.
+    int8: bool = false,
+    /// The quantised form of the vector being inserted or searched.
+    scratch_q8: std.ArrayList(i8) = .empty,
+
+    /// Neighbours to score for the node currently being expanded: collected
+    /// first so their vectors can be prefetched while the earlier ones are
+    /// being scored.
+    scratch_pending: std.ArrayList(Pending) = .empty,
+    /// Working buffers of `shrinkConnections`.
+    scratch_cands: std.ArrayList(Cand) = .empty,
+    scratch_kept: std.ArrayList(u64) = .empty,
 
     /// Reusable beam containers. `searchLayer` runs four times per insert
     /// and each call used to allocate and free its frontier, its result
@@ -241,10 +353,18 @@ pub const HNSW = struct {
     scratch_out: std.ArrayList(u64) = .empty,
 
     pub fn init(alloc: Allocator, cfg: Config, dim: u16) HNSW {
+        // About 1 MiB per chunk, at least one vector, a power of two so the
+        // index-to-chunk split is a shift and a mask.
+        const is_int8 = cfg.hnsw_vector_storage == .int8;
+        const bytes_per_vec: usize = @as(usize, @max(dim, 1)) * (if (is_int8) @as(usize, 1) else @sizeOf(f32));
+        const per_chunk: usize = @max(chunk_target_bytes / bytes_per_vec, 1);
         return .{
             .alloc = alloc,
             .cfg = cfg,
             .dim = dim,
+            .chunk_shift = @intCast(std.math.log2_int(usize, per_chunk)),
+            .vec_stride = bytes_per_vec,
+            .int8 = is_int8,
             .nodes = std.AutoHashMap(u64, *Node).init(alloc),
             .entry_point = null,
             .max_level = 0,
@@ -259,6 +379,14 @@ pub const HNSW = struct {
             self.alloc.destroy(entry.value_ptr.*);
         }
         self.nodes.deinit();
+        for (self.vec_chunks.items) |chunk| self.alloc.free(chunk);
+        self.vec_chunks.deinit(self.alloc);
+        self.by_idx.deinit(self.alloc);
+        self.norms.deinit(self.alloc);
+        self.scratch_pending.deinit(self.alloc);
+        self.scratch_cands.deinit(self.alloc);
+        self.scratch_q8.deinit(self.alloc);
+        self.scratch_kept.deinit(self.alloc);
         self.visit_stamp.deinit(self.alloc);
         self.dense.deinit(self.alloc);
         self.scratch_frontier.deinit(self.alloc);
@@ -266,29 +394,109 @@ pub const HNSW = struct {
         self.scratch_out.deinit(self.alloc);
     }
 
-    /// Resolve an id to its node: array index when the contiguous-id
-    /// table covers it, `nodes` otherwise.
+    /// Resolve an id to its dense index: an array read when the
+    /// contiguous-id table covers it, `nodes` otherwise.
     ///
-    /// The two must never disagree — a `nodeFor` that returned a
-    /// different node than `nodes.get` would walk the graph to nodes that
-    /// are not in the index, and every effect of that would be a silently
-    /// wrong neighbour rather than a crash.
-    fn nodeFor(self: *HNSW, id: u64) ?*Node {
+    /// The two must never disagree — an index that named a different node
+    /// than `nodes.get` would walk the graph to nodes that are not in the
+    /// index, and every effect of that would be a silently wrong neighbour
+    /// rather than a crash.
+    fn idxFor(self: *const HNSW, id: u64) ?u32 {
         if (self.dense_ok and id >= self.dense_base) {
             const off = id - self.dense_base;
-            if (off < self.dense.items.len) return self.dense.items[@intCast(off)];
+            if (off < self.dense.items.len) {
+                const v = self.dense.items[@intCast(off)];
+                return if (v == no_slot) null else v;
+            }
         }
-        return self.nodes.get(id);
+        const n = self.nodes.get(id) orelse return null;
+        return n.dense_idx;
     }
 
+    /// Resolve an id to its node.
+    fn nodeFor(self: *HNSW, id: u64) ?*Node {
+        const idx = self.idxFor(id) orelse return null;
+        return self.by_idx.items[idx];
+    }
+
+    /// The raw bytes of node `idx`'s vector, inside the arena.
+    fn vectorBytes(self: *const HNSW, idx: u32) []u8 {
+        const chunk = self.vec_chunks.items[idx >> self.chunk_shift];
+        const mask: usize = (@as(usize, 1) << self.chunk_shift) - 1;
+        const off = (@as(usize, idx) & mask) * self.vec_stride;
+        return chunk[off..][0..self.vec_stride];
+    }
+
+    /// The `dim` floats of node `idx`. f32 storage only.
+    fn vectorAt(self: *const HNSW, idx: u32) []f32 {
+        return @alignCast(std.mem.bytesAsSlice(f32, self.vectorBytes(idx)));
+    }
+
+    /// The `dim` quantised components of node `idx`. int8 storage only.
+    fn vector8At(self: *const HNSW, idx: u32) []i8 {
+        return std.mem.bytesAsSlice(i8, self.vectorBytes(idx));
+    }
+
+    /// Prepare `v` for scoring against this index: its norm, and in int8
+    /// mode its quantised form (held in `scratch_q8`, valid until the next
+    /// `prepare`).
+    fn prepare(self: *HNSW, v: []const f32) !Query {
+        var q = Query.of(v);
+        if (self.int8) {
+            try self.scratch_q8.resize(self.alloc, v.len);
+            q.q8_norm = quantizeInto(self.scratch_q8.items, v);
+            q.q8 = self.scratch_q8.items;
+        }
+        return q;
+    }
+
+    /// Cosine of a prepared query against node `idx`, read from the arrays
+    /// rather than through the node.
+    fn scoreIdx(self: *const HNSW, q: Query, idx: u32) f32 {
+        if (self.int8) {
+            const denom = q.q8_norm * self.norms.items[idx];
+            if (denom == 0.0) return 0.0;
+            return @as(f32, @floatFromInt(dotI8(q.q8, self.vector8At(idx)))) / denom;
+        }
+        const denom = q.norm * self.norms.items[idx];
+        if (denom == 0.0) return 0.0;
+        return dotProduct(q.vec, self.vectorAt(idx)) / denom;
+    }
+
+    /// Cosine between two indexed nodes, both norms cached. Used by the
+    /// diversity rule in `shrinkConnections`.
+    fn simIdx(self: *const HNSW, a: u32, b: u32) f32 {
+        const denom = self.norms.items[a] * self.norms.items[b];
+        if (denom == 0.0) return 0.0;
+        if (self.int8) return @as(f32, @floatFromInt(dotI8(self.vector8At(a), self.vector8At(b)))) / denom;
+        return dotProduct(self.vectorAt(a), self.vectorAt(b)) / denom;
+    }
+
+    /// Ask the cache for a vector before it is scored. One hint per line:
+    /// the hardware prefetcher would pick up a sequential stream after a
+    /// couple of misses, but those misses are the cost being avoided.
+    fn prefetchVector(self: *const HNSW, idx: u32) void {
+        const bytes = self.vectorBytes(idx);
+        var off: usize = 0;
+        while (off < bytes.len) : (off += 64) {
+            @prefetch(bytes.ptr + off, .{ .rw = .read, .locality = 3, .cache = .data });
+        }
+    }
+
+    const no_slot: u32 = std.math.maxInt(u32);
+    const chunk_target_bytes: usize = 1 << 20;
+
+    /// A neighbour that passed the visited check and is waiting to be scored.
+    const Pending = struct { id: u64, idx: u32 };
+
     /// Widest hole worth stepping over before deciding the id space is
-    /// sparse. 1024 slots is 8 KB, once, before the table gives up.
+    /// sparse. 1024 slots is 4 KB, once, before the table gives up.
     const max_dense_hole: usize = 1024;
     /// Slots the table may occupy before its density is judged too poor
     /// to be worth keeping alongside the index.
     const dense_floor: usize = 4096;
 
-    /// Record `id` in the fast-path table, or give up on it for good.
+    /// Record `id` -> `idx` in the fast-path table, or give up on it for good.
     ///
     /// `insert` rejects a duplicate id before it gets here, so this only
     /// ever sees a slot that is empty or already the same node — the two
@@ -298,11 +506,11 @@ pub const HNSW = struct {
     /// at the same fresh node while the node they replaced was orphaned
     /// and `count` drifted. Consistency between two wrong answers is not
     /// a property worth preserving.
-    fn trackDense(self: *HNSW, id: u64, n: *Node) !void {
+    fn trackDense(self: *HNSW, id: u64, idx: u32) !void {
         if (!self.dense_ok) return;
         if (self.dense.items.len == 0) {
             self.dense_base = id;
-            try self.dense.append(self.alloc, n);
+            try self.dense.append(self.alloc, idx);
             return;
         }
         if (id < self.dense_base) {
@@ -311,7 +519,7 @@ pub const HNSW = struct {
         }
         const off = id - self.dense_base;
         if (off < self.dense.items.len) {
-            self.dense.items[@intCast(off)] = n;
+            self.dense.items[@intCast(off)] = idx;
             return;
         }
         const hole = off - self.dense.items.len;
@@ -321,8 +529,8 @@ pub const HNSW = struct {
             self.dense_ok = false;
             return;
         }
-        try self.dense.appendNTimes(self.alloc, null, hole + 1);
-        self.dense.items[@intCast(off)] = n;
+        try self.dense.appendNTimes(self.alloc, no_slot, hole + 1);
+        self.dense.items[@intCast(off)] = idx;
     }
 
     /// Open a fresh "seen" generation for one beam search.
@@ -375,32 +583,71 @@ pub const HNSW = struct {
         // Before any allocation: a rejected insert has nothing to free.
         if (id <= self.max_id and self.nodes.contains(id)) return errors.DuplicateId;
 
-        const q = Query.of(vector);
+        const q = try self.prepare(vector);
         const level = self.randomLevel();
-        const n = try self.alloc.create(Node);
-        errdefer self.alloc.destroy(n);
-        const vec_copy = try self.alloc.alloc(f32, vector.len);
-        @memcpy(vec_copy, vector);
-        n.* = .{
-            .id = id,
-            .vector = vec_copy,
-            .norm = normOf(vec_copy),
-            .dense_idx = @intCast(self.visit_stamp.items.len),
-            .level = level,
-            .neighbors = try self.alloc.alloc(std.ArrayList(u64), level + 1),
+        // The errdefers below are scoped to this block on purpose. Once the
+        // node is committed, `nodes` owns it: an error from the linking
+        // work further down must not free a node the index can still reach.
+        // (They used to live in the function scope, so a failed `searchLayer`
+        // destroyed a node that was already in the map, and `deinit` then
+        // walked a dangling pointer.)
+        _ = blk: {
+            const n = try self.alloc.create(Node);
+            errdefer self.alloc.destroy(n);
+
+            const idx: u32 = @intCast(self.visit_stamp.items.len);
+            // A fresh chunk is kept even if a later step fails: the next insert
+            // takes the same `idx` and finds it already there.
+            if ((idx >> self.chunk_shift) == self.vec_chunks.items.len) {
+                const per_chunk: usize = @as(usize, 1) << self.chunk_shift;
+                try self.vec_chunks.ensureUnusedCapacity(self.alloc, 1);
+                const chunk = try self.alloc.alignedAlloc(u8, .@"64", per_chunk * self.vec_stride);
+                self.vec_chunks.appendAssumeCapacity(chunk);
+            }
+            const neighbors = try self.alloc.alloc(std.ArrayList(u64), level + 1);
+            errdefer self.alloc.free(neighbors);
+            for (neighbors) |*list| list.* = .empty;
+
+            // Every fallible step that mutates shared state happens before the
+            // first mutation: capacity for the per-node arrays and the map is
+            // reserved up front and the commit below cannot fail, so an
+            // allocation failure leaves the index exactly as it was and
+            // `visit_stamp`, `by_idx` and `norms` stay in lockstep.
+            try self.visit_stamp.ensureUnusedCapacity(self.alloc, 1);
+            try self.by_idx.ensureUnusedCapacity(self.alloc, 1);
+            try self.norms.ensureUnusedCapacity(self.alloc, 1);
+            try self.nodes.ensureUnusedCapacity(1);
+            try self.trackDense(id, idx);
+
+            // int8 storage keeps no float copy: `Node.vector` is empty and the
+            // quantised bytes live only in the arena.
+            var vec_copy: []f32 = &.{};
+            var norm: f32 = undefined;
+            if (self.int8) {
+                norm = quantizeInto(self.vector8At(idx), vector);
+            } else {
+                vec_copy = self.vectorAt(idx);
+                @memcpy(vec_copy, vector);
+                norm = normOf(vec_copy);
+            }
+            n.* = .{
+                .id = id,
+                .vector = vec_copy,
+                .norm = norm,
+                .dense_idx = idx,
+                .level = level,
+                .neighbors = neighbors,
+            };
+            // A stamp slot per node, in lockstep with `dense_idx`. No node is
+            // ever removed from this index, so the arrays only grow.
+            self.visit_stamp.appendAssumeCapacity(0);
+            self.by_idx.appendAssumeCapacity(n);
+            self.norms.appendAssumeCapacity(n.norm);
+            self.nodes.putAssumeCapacity(id, n);
+            self.count += 1;
+            if (id > self.max_id) self.max_id = id;
+            break :blk n;
         };
-        for (0..level + 1) |i| {
-            n.neighbors[i] = .empty;
-        }
-        // A stamp slot per node, in lockstep with `dense_idx`. No node is
-        // ever removed from this index, so the array only grows. Done
-        // before `nodes.put` so an allocation failure leaves the index
-        // exactly as it was.
-        try self.visit_stamp.append(self.alloc, 0);
-        try self.trackDense(id, n);
-        try self.nodes.put(id, n);
-        self.count += 1;
-        if (id > self.max_id) self.max_id = id;
 
         if (self.entry_point == null) {
             self.entry_point = id;
@@ -495,7 +742,7 @@ pub const HNSW = struct {
         const node = self.nodes.get(id) orelse return false;
         if (node.deleted) return false;
         node.deleted = true;
-        @memset(node.vector, 0.0);
+        @memset(self.vectorBytes(node.dense_idx), 0);
         // Its outgoing edges are not followed for results any more, and
         // leaving them would let a tombstone pin memory through the
         // neighbour lists that still name it.
@@ -508,12 +755,16 @@ pub const HNSW = struct {
     pub fn search(self: *HNSW, alloc: Allocator, query: []const f32, k: usize) errors![]SearchResult {
         if (query.len != self.dim) return errors.InvalidQuery;
         if (self.entry_point == null) return &.{};
-        const q = Query.of(query);
+        const q = try self.prepare(query);
         // Over-fetch, because tombstoned candidates are dropped below and
         // a swept store would otherwise come back short. Three times is
         // arbitrary but bounded; returning fewer than `k` live hits is not
         // a correctness failure, just a smaller result set.
-        const want = @max(k, @as(usize, self.cfg.hnsw_ef_search));
+        var ef: usize = self.cfg.hnsw_ef_search;
+        if (self.cfg.hnsw_ef_search_divisor != 0) {
+            ef = @max(ef, self.count / self.cfg.hnsw_ef_search_divisor);
+        }
+        const want = @max(k, ef);
         const fetch = @min(self.count, want + want / 2);
         const cands = try self.searchInternal(q, fetch, 0);
 
@@ -523,7 +774,7 @@ pub const HNSW = struct {
             if (out.items.len == k) break;
             const node = self.nodeFor(id) orelse continue;
             if (node.deleted) continue;
-            try out.append(alloc, .{ .id = id, .score = score(q, node) });
+            try out.append(alloc, .{ .id = id, .score = self.scoreIdx(q, node.dense_idx) });
         }
         return out.toOwnedSlice(alloc);
     }
@@ -558,10 +809,23 @@ pub const HNSW = struct {
     /// search *samples* a slice of the corpus instead of navigating to the
     /// neighbourhood.
     ///
-    /// Both containers stay bounded (`frontier` by `budget`, because a node
-    /// only joins the frontier as it joins W), so the linear scans below
-    /// are far cheaper than the cosine evaluations they gate. A heap would
-    /// only move the constant factor.
+    /// Both containers are binary heaps. They used to be flat arrays scanned
+    /// linearly — once per pop to find the best frontier entry, once per
+    /// displacement to find the worst incumbent — on the theory that the
+    /// scans were "far cheaper than the cosine evaluations they gate". They
+    /// were not: measured by profile on a 12,000-vector build (dim 384,
+    /// efc 200), the frontier scan (avg 437 entries, 217 pops per insert)
+    /// was 16.9% of insert time and the worst-incumbent scan (avg 198
+    /// entries, 655 per insert) was 25.5%, against 40.6% for the cosine
+    /// kernel itself. `frontier` is not bounded by `budget` — an entry
+    /// joins it each time it displaces an incumbent — which is why its scan
+    /// was longer than `ef`.
+    ///
+    /// Equal scores are ordered by id (smaller id is "better"), so a
+    /// duplicate vector no longer depends on array position. With distinct
+    /// scores the visit order, and therefore the graph, is identical to the
+    /// scan version (`graphFingerprint` tests pin it); with exact ties the
+    /// choice among equals is now by id instead of by slot.
     fn searchLayer(self: *HNSW, q: Query, start: u64, ef: usize, level: u8) errors![]u64 {
         const budget = @max(ef, 1);
 
@@ -575,68 +839,61 @@ pub const HNSW = struct {
         try frontier.ensureTotalCapacity(self.alloc, budget);
         try results.ensureTotalCapacity(self.alloc, budget);
 
-        const start_node = self.nodeFor(start).?;
-        const start_score = score(q, start_node);
-        stamps[start_node.dense_idx] = gen;
+        const start_idx = self.idxFor(start).?;
+        const start_score = self.scoreIdx(q, start_idx);
+        stamps[start_idx] = gen;
         try frontier.append(self.alloc, .{ .id = start, .score = start_score });
         try results.append(self.alloc, .{ .id = start, .score = start_score });
 
         while (frontier.items.len > 0) {
-            // Pop the closest unexpanded candidate.
-            var best_i: usize = 0;
-            for (frontier.items, 0..) |c, i| {
-                if (c.score > frontier.items[best_i].score) best_i = i;
-            }
-            const c = frontier.swapRemove(best_i);
+            // Pop the closest unexpanded candidate: the root of a max-heap.
+            const c = heapPop(frontier.items, candBetter);
+            frontier.items.len -= 1;
 
-            if (results.items.len >= budget and c.score < results.items[worstIdx(results.items)].score) break;
+            // `results` is a min-heap, so its root is the worst incumbent.
+            if (results.items.len >= budget and c.score < results.items[0].score) break;
 
             const node = self.nodeFor(c.id) orelse continue;
             if (level >= node.neighbors.len) continue;
 
-            // Locate the incumbent to displace once per expansion rather
-            // than once per neighbour: rescanning `results` inside the
-            // neighbour loop made the inner loop O(ef * degree) — 200 * 32
-            // comparisons for every node expanded at construction time,
-            // which dominated the whole search.
-            //
-            // `worst_valid` matters: while the beam is still filling, the
-            // cached index is meaningless and MUST be recomputed on the
-            // first neighbour seen *after* it fills. Caching it from the
-            // pre-fill state silently compared every candidate against
-            // `results[0]` and overwrote the best entry instead of the
-            // worst — measured as recall@10 dropping 0.5660 -> 0.5420 at
-            // ef = 10 before this was caught.
-            var worst: usize = 0;
-            var worst_valid = false;
+            // Pass 1: resolve and mark every unseen neighbour, and ask the
+            // cache for its vector. Pass 2 scores them in the same order a
+            // single pass would have, so the walk is unchanged — only the
+            // memory latency of the later vectors now overlaps the
+            // arithmetic on the earlier ones.
+            const nbrs = node.neighbors[level].items;
+            var pending = &self.scratch_pending;
+            pending.clearRetainingCapacity();
+            try pending.ensureTotalCapacity(self.alloc, nbrs.len);
+            for (nbrs) |nid| {
+                const nidx = self.idxFor(nid) orelse continue;
+                if (stamps[nidx] == gen) continue;
+                stamps[nidx] = gen;
+                self.prefetchVector(nidx);
+                pending.appendAssumeCapacity(.{ .id = nid, .idx = nidx });
+            }
 
-            for (node.neighbors[level].items) |nid| {
-                const n = self.nodeFor(nid) orelse continue;
-                if (stamps[n.dense_idx] == gen) continue;
-                stamps[n.dense_idx] = gen;
-                const s = score(q, n);
+            for (pending.items) |pn| {
+                const nid = pn.id;
+                const s = self.scoreIdx(q, pn.idx);
 
                 if (results.items.len < budget) {
                     try results.append(self.alloc, .{ .id = nid, .score = s });
+                    heapUp(results.items, results.items.len - 1, candWorse);
                     try frontier.append(self.alloc, .{ .id = nid, .score = s });
-                } else {
-                    if (!worst_valid) {
-                        worst = worstIdx(results.items);
-                        worst_valid = true;
-                    }
-                    if (s > results.items[worst].score) {
-                        results.items[worst] = .{ .id = nid, .score = s };
-                        try frontier.append(self.alloc, .{ .id = nid, .score = s });
-                        worst = worstIdx(results.items);
-                    }
+                    heapUp(frontier.items, frontier.items.len - 1, candBetter);
+                } else if (s > results.items[0].score) {
+                    results.items[0] = .{ .id = nid, .score = s };
+                    heapDown(results.items, 0, candWorse);
+                    try frontier.append(self.alloc, .{ .id = nid, .score = s });
+                    heapUp(frontier.items, frontier.items.len - 1, candBetter);
                 }
             }
         }
 
         std.mem.sort(Cand, results.items, {}, struct {
             fn lt(_: void, a: Cand, b: Cand) bool {
-                if (a.score != b.score) return a.score > b.score;
-                return a.id < b.id;
+                return candBetter(a, b);
             }
         }.lt);
 
@@ -717,14 +974,56 @@ pub const HNSW = struct {
     /// nested functions or local type declarations.
     const Cand = struct { id: u64, score: f32 };
 
-    /// Index of the lowest-scoring entry — the one a full result set
-    /// displaces when a better neighbour shows up.
-    fn worstIdx(items: []const Cand) usize {
-        var w: usize = 0;
-        for (items, 0..) |r, i| {
-            if (r.score < items[w].score) w = i;
+    /// Total order on candidates: higher score first, then smaller id.
+    fn candBetter(a: Cand, b: Cand) bool {
+        if (a.score != b.score) return a.score > b.score;
+        return a.id < b.id;
+    }
+
+    /// The reverse order, for the results min-heap whose root is the worst.
+    fn candWorse(a: Cand, b: Cand) bool {
+        return candBetter(b, a);
+    }
+
+    /// Restore the heap property upward from `i`. `first(a, b)` is true when
+    /// `a` belongs nearer the root than `b`.
+    fn heapUp(items: []Cand, start: usize, comptime first: fn (Cand, Cand) bool) void {
+        var i = start;
+        const item = items[i];
+        while (i > 0) {
+            const parent = (i - 1) / 2;
+            if (!first(item, items[parent])) break;
+            items[i] = items[parent];
+            i = parent;
         }
-        return w;
+        items[i] = item;
+    }
+
+    /// Restore the heap property downward from `i`.
+    fn heapDown(items: []Cand, start: usize, comptime first: fn (Cand, Cand) bool) void {
+        const n = items.len;
+        var i = start;
+        const item = items[i];
+        while (true) {
+            var child = 2 * i + 1;
+            if (child >= n) break;
+            if (child + 1 < n and first(items[child + 1], items[child])) child += 1;
+            if (!first(items[child], item)) break;
+            items[i] = items[child];
+            i = child;
+        }
+        items[i] = item;
+    }
+
+    /// Remove and return the root of the heap in `items`. The caller then
+    /// shrinks its list by one: the last slot is left stale.
+    fn heapPop(items: []Cand, comptime first: fn (Cand, Cand) bool) Cand {
+        const top = items[0];
+        const last = items.len - 1;
+        if (last == 0) return top;
+        items[0] = items[last];
+        heapDown(items[0..last], 0, first);
+        return top;
     }
 
     /// Maximum adjacency-list length at `level`.
@@ -798,16 +1097,30 @@ pub const HNSW = struct {
     /// Ids missing from `self.nodes` are dropped rather than carried: the
     /// adjacency lists must never point at a node the index no longer holds.
     fn shrinkConnections(self: *HNSW, node: *Node, q: Query, level: u8, limit: usize) !void {
-        const level_idx: usize = level;
-        const src = node.neighbors[level_idx].items;
+        const list = &node.neighbors[level];
+        const src = list.items;
 
-        var cands = std.ArrayList(Cand).empty;
-        defer cands.deinit(self.alloc);
-        try cands.ensureTotalCapacity(self.alloc, src.len);
+        // Pass 1: resolve every candidate and ask the cache for its vector,
+        // so the 33 loads overlap instead of queueing behind the arithmetic.
+        // Pass 2 scores them in list order, as before.
+        var pending = &self.scratch_pending;
+        pending.clearRetainingCapacity();
+        try pending.ensureTotalCapacity(self.alloc, src.len);
         for (src) |cid| {
             if (cid == node.id) continue; // never keep a self loop
-            const cn = self.nodeFor(cid) orelse continue; // never keep a dangling id
-            try cands.append(self.alloc, .{ .id = cid, .score = score(q, cn) });
+            const cidx = self.idxFor(cid) orelse continue; // never keep a dangling id
+            self.prefetchVector(cidx);
+            pending.appendAssumeCapacity(.{ .id = cid, .idx = cidx });
+        }
+
+        // Both buffers are the index's own scratch, reused across calls: this
+        // runs ~32 times per insert, and it used to allocate and free three
+        // lists each time.
+        var cands = &self.scratch_cands;
+        cands.clearRetainingCapacity();
+        try cands.ensureTotalCapacity(self.alloc, pending.items.len);
+        for (pending.items) |pn| {
+            cands.appendAssumeCapacity(.{ .id = pn.id, .score = self.scoreIdx(q, pn.idx) });
         }
         // Nearest to the query first; ties broken by id so the resulting
         // graph is byte-for-byte reproducible for a given insertion order.
@@ -818,20 +1131,20 @@ pub const HNSW = struct {
             }
         }.lt);
 
-        var kept = std.ArrayList(u64).empty;
-        errdefer kept.deinit(self.alloc);
+        var kept = &self.scratch_kept;
+        kept.clearRetainingCapacity();
         try kept.ensureTotalCapacity(self.alloc, @min(limit, cands.items.len));
 
         for (cands.items) |c| {
             if (kept.items.len >= limit) break;
             if (containsId(kept.items, c.id)) continue;
 
-            const cn = self.nodeFor(c.id).?;
+            const cn = self.idxFor(c.id).?;
             var evict: ?usize = null;
             if (kept.items.len > 0) {
                 for (kept.items, 0..) |kid, ki| {
-                    const kn = self.nodeFor(kid) orelse continue;
-                    if (nodeSim(cn, kn) >= c.score) {
+                    const kn = self.idxFor(kid) orelse continue;
+                    if (self.simIdx(cn, kn) >= c.score) {
                         evict = ki;
                         break;
                     }
@@ -840,7 +1153,7 @@ pub const HNSW = struct {
             if (evict) |ki| {
                 kept.items[ki] = c.id;
             } else {
-                try kept.append(self.alloc, c.id);
+                kept.appendAssumeCapacity(c.id);
             }
         }
 
@@ -860,12 +1173,15 @@ pub const HNSW = struct {
             for (cands.items) |c| {
                 if (kept.items.len >= limit) break;
                 if (containsId(kept.items, c.id)) continue;
-                try kept.append(self.alloc, c.id);
+                kept.appendAssumeCapacity(c.id);
             }
         }
 
-        node.neighbors[level_idx].deinit(self.alloc);
-        node.neighbors[level_idx] = kept;
+        // Written back into the list's own storage. `kept` is never longer
+        // than `limit` and the list has just overflowed `limit`, so the
+        // capacity is already there and nothing below can fail.
+        list.clearRetainingCapacity();
+        list.appendSliceAssumeCapacity(kept.items);
     }
 
     /// Append `nb` to `node`'s list at `level` unless it is already there,
@@ -884,8 +1200,15 @@ pub const HNSW = struct {
         const list = &node.neighbors[level];
         if (containsId(list.items, nb)) return; // already linked
 
-        try list.append(self.alloc, nb);
         const limit = self.maxDegree(level);
+        // Grow by doubling but never past `limit + 1`: that is the longest
+        // a list gets before `shrinkConnections` cuts it back, so a full
+        // list holds 33 ids (264 B) instead of the 56 (448 B) the default
+        // 1.5x-plus-8 growth leaves behind.
+        if (list.items.len == list.capacity) {
+            try list.ensureTotalCapacityPrecise(self.alloc, @min(@max(list.capacity * 2, 4), limit + 1));
+        }
+        list.appendAssumeCapacity(nb);
         if (list.items.len > limit) {
             try self.shrinkConnections(node, q, level, limit);
         }
@@ -954,6 +1277,39 @@ pub const HNSW = struct {
         return top;
     }
 
+    /// Order-independent-of-layout digest of the graph's *structure*: entry
+    /// point, top level, and for every id (ascending) its level and each
+    /// layer's neighbour list in stored order. Vectors are not hashed.
+    ///
+    /// Exists so a performance change that claims "same graph" has to prove
+    /// it: two builds from the same corpus and seed either agree on this
+    /// number or they built different indexes. It reads only ids and list
+    /// order, so it does not move when the storage behind them does.
+    pub fn graphFingerprint(self: *HNSW, alloc: Allocator) !u64 {
+        const ids = try alloc.alloc(u64, self.nodes.count());
+        defer alloc.free(ids);
+        var it = self.nodes.keyIterator();
+        var i: usize = 0;
+        while (it.next()) |k| : (i += 1) ids[i] = k.*;
+        std.mem.sort(u64, ids, {}, std.sort.asc(u64));
+
+        var h = std.hash.Wyhash.init(0x6D65_6D33);
+        const ep: u64 = self.entry_point orelse 0;
+        h.update(std.mem.asBytes(&ep));
+        h.update(std.mem.asBytes(&self.max_level));
+        for (ids) |id| {
+            const n = self.nodes.get(id).?;
+            h.update(std.mem.asBytes(&id));
+            h.update(std.mem.asBytes(&n.level));
+            for (n.neighbors) |list| {
+                const len: u32 = @intCast(list.items.len);
+                h.update(std.mem.asBytes(&len));
+                h.update(std.mem.sliceAsBytes(list.items));
+            }
+        }
+        return h.final();
+    }
+
     pub fn cosineSim(self: *HNSW, a: []const f32, b: []const f32) f32 {
         _ = self;
         const denom = normOf(a) * normOf(b);
@@ -961,24 +1317,6 @@ pub const HNSW = struct {
         return dotProduct(a, b) / denom;
     }
 };
-
-/// Cosine of a prepared query against an indexed node.
-///
-/// Both norms are cached, so this is one vectorised pass over 384 bytes
-/// instead of three passes over 1,152.
-fn score(q: Query, n: *const Node) f32 {
-    const denom = q.norm * n.norm;
-    if (denom == 0.0) return 0.0;
-    return dotProduct(q.vec, n.vector) / denom;
-}
-
-/// Cosine between two indexed nodes, both norms cached. Used by
-/// `shrinkConnections` rule (b).
-fn nodeSim(a: *const Node, b: *const Node) f32 {
-    const denom = a.norm * b.norm;
-    if (denom == 0.0) return 0.0;
-    return dotProduct(a.vector, b.vector) / denom;
-}
 
 // =============================================================================
 // Tests
@@ -1954,4 +2292,279 @@ test "HNSW: max_id high-water mark tracks the largest accepted id" {
     try std.testing.expectEqual(@as(u64, 9), hnsw.max_id);
     try std.testing.expectEqual(@as(usize, 3), hnsw.count);
     try assertCountMatchesDistinctIds(&hnsw);
+}
+
+// =============================================================================
+// Graph-structure fingerprint
+// =============================================================================
+//
+// A change to the distance kernel, the candidate containers or the vector
+// storage is supposed to be invisible to the graph. "Invisible" is checked
+// here, not argued: the constants below were taken from the tree *before*
+// the first HNSW performance change (commit 03e588f) and a refactor that
+// claims bit-identity must reproduce them. A change that deliberately
+// alters the graph (a different pruning rule, a different default) must
+// update them in the same commit and say why.
+//
+// Both corpora are tie-free (splitmix64-derived, distinct scores), so the
+// result does not depend on how equal-scored candidates are ordered.
+
+// The constants were taken on aarch64. `@reduce(.Add)` in `dotProduct` is
+// free to sum its lanes in a target-specific order, so an x86-64 build can
+// round a score one ULP differently, and a one-ULP difference is enough to
+// flip a near-tie in the pruning heuristic and legitimately build a
+// different graph. Off aarch64 the tests skip (and say so) rather than pin a
+// number that is only true on one ISA.
+const fingerprint_pinned = @import("builtin").cpu.arch == .aarch64;
+
+fn fingerprintOf(alloc: std.mem.Allocator, n: usize, dim: u16, cfg: Config) !u64 {
+    var hnsw = HNSW.init(alloc, cfg, dim);
+    defer hnsw.deinit();
+    const corpus = try oracleCorpusN(alloc, n, dim);
+    defer alloc.free(corpus);
+    try oracleFillN(&hnsw, corpus, n, dim);
+    return hnsw.graphFingerprint(alloc);
+}
+
+test "HNSW: graph fingerprint, shipped config, 400 x 32" {
+    if (comptime !fingerprint_pinned) return error.SkipZigTest;
+    const fp = try fingerprintOf(std.testing.allocator, 400, 32, .{});
+    try std.testing.expectEqual(@as(u64, 5441432509814034711), fp);
+}
+
+test "HNSW: graph fingerprint, dim 100 (vector body plus scalar tail), 1000 x 100" {
+    if (comptime !fingerprint_pinned) return error.SkipZigTest;
+    var cfg = Config{};
+    cfg.hnsw_ef_construction = 100;
+    const fp = try fingerprintOf(std.testing.allocator, 1000, 100, cfg);
+    try std.testing.expectEqual(@as(u64, 3420897809111039506), fp);
+}
+
+test "HNSW: graph fingerprint, small m and efc, 1500 x 24" {
+    var cfg = Config{};
+    cfg.hnsw_m = 8;
+    cfg.hnsw_m_max0 = 16;
+    cfg.hnsw_ef_construction = 64;
+    if (comptime !fingerprint_pinned) return error.SkipZigTest;
+    const fp = try fingerprintOf(std.testing.allocator, 1500, 24, cfg);
+    try std.testing.expectEqual(@as(u64, 2861090809599722439), fp);
+}
+
+test "HNSW: candidate heaps pop in total order, ties broken by id" {
+    const alloc = std.testing.allocator;
+    var heap = std.ArrayList(HNSW.Cand).empty;
+    defer heap.deinit(alloc);
+
+    // Scores drawn from 5 values so most entries tie; ids are distinct.
+    var seed: u64 = 0xC0FFEE;
+    var i: u64 = 0;
+    while (i < 500) : (i += 1) {
+        seed = seed *% 6364136223846793005 +% 1442695040888963407;
+        const sc: f32 = @floatFromInt((seed >> 33) % 5);
+        try heap.append(alloc, .{ .id = i, .score = sc });
+        HNSW.heapUp(heap.items, heap.items.len - 1, HNSW.candBetter);
+    }
+
+    var prev: ?HNSW.Cand = null;
+    while (heap.items.len > 0) {
+        const c = HNSW.heapPop(heap.items, HNSW.candBetter);
+        heap.items.len -= 1;
+        if (prev) |p| try std.testing.expect(HNSW.candBetter(p, c));
+        prev = c;
+    }
+
+    // The min-heap view: root is the worst, so draining yields ascending.
+    var j: u64 = 0;
+    while (j < 100) : (j += 1) {
+        try heap.append(alloc, .{ .id = j, .score = @floatFromInt(j % 7) });
+        HNSW.heapUp(heap.items, heap.items.len - 1, HNSW.candWorse);
+    }
+    var prev_w: ?HNSW.Cand = null;
+    while (heap.items.len > 0) {
+        const c = HNSW.heapPop(heap.items, HNSW.candWorse);
+        heap.items.len -= 1;
+        if (prev_w) |p| try std.testing.expect(HNSW.candWorse(p, c));
+        prev_w = c;
+    }
+}
+
+// =============================================================================
+// Vector arena
+// =============================================================================
+
+test "HNSW: vectors survive chunk boundaries and the graph does not depend on chunk size" {
+    const alloc = std.testing.allocator;
+    const dim: u16 = 12;
+    const n: usize = 300;
+    const corpus = try oracleCorpusN(alloc, n, dim);
+    defer alloc.free(corpus);
+
+    var wide = HNSW.init(alloc, .{}, dim);
+    defer wide.deinit();
+    // 4 vectors per chunk: 300 inserts cross 75 chunk boundaries.
+    var tiny = HNSW.init(alloc, .{}, dim);
+    defer tiny.deinit();
+    tiny.chunk_shift = 2;
+
+    try oracleFillN(&wide, corpus, n, dim);
+    try oracleFillN(&tiny, corpus, n, dim);
+    try std.testing.expectEqual(@as(usize, 75), tiny.vec_chunks.items.len);
+
+    for (0..n) |i| {
+        const id: u64 = @intCast(i + 1);
+        const want = corpus[i * dim ..][0..dim];
+        const node = tiny.nodes.get(id).?;
+        try std.testing.expectEqualSlices(f32, want, node.vector);
+        try std.testing.expectEqualSlices(f32, want, tiny.vectorAt(node.dense_idx));
+        try std.testing.expectEqual(node.norm, tiny.norms.items[node.dense_idx]);
+        try std.testing.expect(tiny.by_idx.items[node.dense_idx] == node);
+    }
+    try std.testing.expectEqual(
+        try wide.graphFingerprint(alloc),
+        try tiny.graphFingerprint(alloc),
+    );
+}
+
+test "HNSW: a failed insert leaves the per-node arrays in lockstep and leaks nothing" {
+    const dim: u16 = 8;
+    const corpus = try oracleCorpusN(std.testing.allocator, 40, dim);
+    defer std.testing.allocator.free(corpus);
+
+    // Fail the k-th allocation for every k an insert can reach; whatever
+    // happens, the index must stay consistent and free everything.
+    var k: usize = 0;
+    while (k < 60) : (k += 1) {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = k });
+        const alloc = failing.allocator();
+        var hnsw = HNSW.init(alloc, .{}, dim);
+        defer hnsw.deinit();
+        hnsw.chunk_shift = 1;
+        for (0..40) |i| {
+            hnsw.insert(@intCast(i + 1), corpus[i * dim ..][0..dim]) catch continue;
+        }
+        try std.testing.expectEqual(hnsw.visit_stamp.items.len, hnsw.by_idx.items.len);
+        try std.testing.expectEqual(hnsw.visit_stamp.items.len, hnsw.norms.items.len);
+        try std.testing.expectEqual(hnsw.count, hnsw.nodes.count());
+        try std.testing.expectEqual(hnsw.count, hnsw.by_idx.items.len);
+    }
+}
+
+// =============================================================================
+// int8 vector storage
+// =============================================================================
+
+fn refDotI8(a: []const i8, b: []const i8) i32 {
+    var s: i32 = 0;
+    for (a, b) |x, y| s += @as(i32, x) * @as(i32, y);
+    return s;
+}
+
+test "HNSW: dotI8 equals the scalar reference at every width, extremes included" {
+    var prng = std.Random.DefaultPrng.init(0xD07);
+    const r = prng.random();
+    var a: [700]i8 = undefined;
+    var b: [700]i8 = undefined;
+    for ([_]usize{ 0, 1, 3, 15, 16, 17, 31, 32, 33, 100, 384, 700 }) |n| {
+        for (0..20) |_| {
+            for (a[0..n], b[0..n]) |*x, *y| {
+                x.* = r.intRangeAtMost(i8, -127, 127);
+                y.* = r.intRangeAtMost(i8, -127, 127);
+            }
+            try std.testing.expectEqual(refDotI8(a[0..n], b[0..n]), dotI8(a[0..n], b[0..n]));
+        }
+        // The overflow bound the i16 pairwise add relies on.
+        @memset(a[0..n], 127);
+        @memset(b[0..n], 127);
+        try std.testing.expectEqual(refDotI8(a[0..n], b[0..n]), dotI8(a[0..n], b[0..n]));
+        @memset(b[0..n], -127);
+        try std.testing.expectEqual(refDotI8(a[0..n], b[0..n]), dotI8(a[0..n], b[0..n]));
+    }
+}
+
+test "HNSW: quantizeInto scales to 127, never emits -128, tolerates zero and non-finite" {
+    var out: [6]i8 = undefined;
+    const norm = quantizeInto(&out, &.{ 0.5, -1.0, 0.25, 0.0, 1.0, -0.5 });
+    try std.testing.expectEqualSlices(i8, &.{ 64, -127, 32, 0, 127, -64 }, &out);
+    try std.testing.expectApproxEqAbs(@sqrt(@as(f32, 64 * 64 + 127 * 127 + 32 * 32 + 127 * 127 + 64 * 64)), norm, 1e-3);
+
+    try std.testing.expectEqual(@as(f32, 0.0), quantizeInto(&out, &.{ 0, 0, 0, 0, 0, 0 }));
+    try std.testing.expectEqualSlices(i8, &.{ 0, 0, 0, 0, 0, 0 }, &out);
+
+    _ = quantizeInto(&out, &.{ std.math.nan(f32), std.math.inf(f32), 2.0, -2.0, 0, 1.0 });
+    try std.testing.expectEqualSlices(i8, &.{ 0, 0, 127, -127, 0, 64 }, &out);
+    for (out) |x| try std.testing.expect(x != -128);
+}
+
+test "HNSW: int8 storage finds the same neighbours, keeps no float copy, and survives delete" {
+    const alloc = std.testing.allocator;
+    const dim: u16 = 48;
+    const n: usize = 400;
+    const corpus = try oracleCorpusN(alloc, n, dim);
+    defer alloc.free(corpus);
+
+    var cfg = Config{};
+    cfg.hnsw_vector_storage = .int8;
+    var idx = HNSW.init(alloc, cfg, dim);
+    defer idx.deinit();
+    idx.chunk_shift = 3; // cross chunk boundaries
+    try oracleFillN(&idx, corpus, n, dim);
+
+    // 1 byte per dimension, no per-node float copy.
+    try std.testing.expectEqual(@as(usize, dim), idx.vec_stride);
+    try std.testing.expectEqual(@as(usize, 0), idx.nodes.get(1).?.vector.len);
+    // Reachability is a property of the graph; compare with the exact index
+    // on the same corpus rather than assuming 100%.
+    var exact = HNSW.init(alloc, .{}, dim);
+    defer exact.deinit();
+    try oracleFillN(&exact, corpus, n, dim);
+    const reach8 = try idx.level0Reachable(alloc);
+    const reach32 = try exact.level0Reachable(alloc);
+    try std.testing.expect(reach8 + 2 >= reach32);
+
+    // Every corpus member is its own nearest neighbour, with cosine ~ 1.
+    var hits: usize = 0;
+    for (0..n) |i| {
+        const res = try idx.search(alloc, corpus[i * dim ..][0..dim], 1);
+        defer alloc.free(res);
+        if (res.len == 1 and res[0].id == i + 1) {
+            hits += 1;
+            try std.testing.expect(res[0].score > 0.999);
+        }
+    }
+    try std.testing.expect(hits >= n * 99 / 100);
+
+    // Recall against the exact scan stays close to the f32 index.
+    const spec = OracleSpec{ .n = n, .dim = dim, .queries = 50, .k = 10 };
+    const r8 = try recallAgainst(&idx, alloc, corpus, spec);
+    try std.testing.expect(r8 >= 0.95);
+
+    // Tombstoning zeroes the quantised bytes and the result drops out.
+    try std.testing.expect(idx.markDeleted(5));
+    for (idx.vectorBytes(idx.nodes.get(5).?.dense_idx)) |b| try std.testing.expectEqual(@as(u8, 0), b);
+    const res = try idx.search(alloc, corpus[4 * dim ..][0..dim], 10);
+    defer alloc.free(res);
+    for (res) |x| try std.testing.expect(x.id != 5);
+}
+
+test "HNSW: adaptive ef_search buys recall at a small budget, and is inert when off or too coarse" {
+    const alloc = std.testing.allocator;
+    const spec = OracleSpec{ .n = 3000, .dim = 64, .queries = 30, .k = 10 };
+
+    var cfg = Config{};
+    cfg.hnsw_ef_search = 20;
+    cfg.hnsw_ef_search_divisor = 0; // the default is adaptive; this is the control
+    const fixed = try oracleRecallAt(alloc, spec, cfg, 20);
+
+    // Divisor larger than the corpus: count / divisor == 0, so the budget
+    // stays at hnsw_ef_search and the result must be bit-identical.
+    cfg.hnsw_ef_search_divisor = 60_000;
+    const coarse = try oracleRecallAt(alloc, spec, cfg, 20);
+    try std.testing.expectEqual(fixed, coarse);
+
+    // 3000 / 10 = 300 effective budget against a fixed 20.
+    cfg.hnsw_ef_search_divisor = 10;
+    const adaptive = try oracleRecallAt(alloc, spec, cfg, 20);
+    // Measured 0.96 fixed, 1.00 adaptive.
+    try std.testing.expect(adaptive > fixed);
+    try std.testing.expect(adaptive >= 0.99);
 }

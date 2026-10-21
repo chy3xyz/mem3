@@ -104,6 +104,21 @@ Two honest readings of the table:
    loaded host; every single one exceeded 500 MB, so the miss does not depend on
    which run you believe.
 
+**Update after the HNSW rework (2026-10-21, loaded host).** The table above
+is the older idle-host measurement and has not been re-taken. On a loaded host
+RSS was unusable: at 100k cells `/usr/bin/time -l` read 426 / 991 / 2,768 MB for
+`main` and 331 / 337 / 579 MB for the branch, so **nothing is claimed about the
+< 500 MB target**. What can be stated is the deterministic live-allocation count
+(`mem3-bench footprint` now reports it from a counting allocator; it excludes
+allocator overhead, so it is a lower bound on RSS): at 100k cells **~3,013 B/cell
+(301 MB) on `main`, ~2,940 B/cell (294 MB) on the branch, ~1,784 B/cell (178 MB)
+with the optional int8 vector storage**. Of the ~2,926 B/cell on the branch at
+10k cells, 1,573 are the vector arena, ~520 the BM25 posting lists, ~340 the
+cells and their strings, 257 the layer-0 neighbour lists. The ~27 KB/cell
+marginal figure above is therefore mostly allocator page caching and macOS RSS
+behaviour, not live data. Full tables and method:
+[`docs/roadmap.md`](docs/roadmap.md), "1a. HNSW rework".
+
 This is early software. It has no external users, no published benchmarks, and
 several known gaps listed under [Status and limitations](#status-and-limitations).
 The reason it is published at all is that the constraints it was built under are
@@ -503,11 +518,11 @@ alongside the params and timestamp.
 | `time.formatIso8601` | 33.0 ns/op | 69.0 ns |
 | `serializer.roundtrip` | 27.7 µs | 64.2 µs |
 | `encoder.encode` | 35.0 ns/op | 35.0 ns |
-| `hnsw.insert` | 899 µs/op | 1,166 µs |
-| `hnsw.search` | 748 µs/op | 1,161 µs |
+| `hnsw.insert` | 899 µs/op (244 µs/op after the HNSW rework) | 1,166 µs (277 µs) |
+| `hnsw.search` | 748 µs/op (212 µs/op after the rework) | 1,161 µs (229 µs) |
 | `wal.append_durable` | 1,232 µs/record | 2,861 µs |
-| `store.addRaw_memory` | 239 µs/op | 323 µs |
-| `store.addRaw_durable` | 322 µs/op | 437 µs |
+| `store.addRaw_memory` | 239 µs/op (198 µs/op after the rework) | 323 µs (210 µs) |
+| `store.addRaw_durable` | 322 µs/op (275 µs/op after the rework) | 437 µs (294 µs) |
 
 **Read the median, distrust the p95.** On this machine p95 for the same binary
 and the same input varies by more than an order of magnitude between runs; only
@@ -550,9 +565,17 @@ Two caveats the benchmark states itself: `wal.append_durable` fsyncs on every
 record, which is what sets the write floor; and `hnsw.search` grows with the
 corpus, so do not quote it as graph-index performance.
 
-`hnsw.insert` at ~899 µs/op is the dominant cost in the write path —
+`hnsw.insert` at ~899 µs/op was the dominant cost in the write path —
 larger than the WAL fsync, and larger than the whole `store.addRaw_durable`
-pipeline it sits inside. See [Known misses](#known-misses).
+pipeline it sits inside. After the HNSW rework (2026-10-21) the rows marked
+"after the rework" were A/B-measured against a build of `main` over 5
+interleaved rounds (`hnsw.insert` 886 → 244 µs/op, `store.addRaw_durable`
+538 → 275 µs/op, `wal.append_durable` unchanged as the control); the figures in
+the left column are the older single-run table above, the parenthesised ones are
+the median of five medians and the median of five p95s, taken on a quieter host.
+The two columns are not from the same load, so compare the `main`-vs-branch pair in
+[`docs/roadmap.md`](docs/roadmap.md) ("1a. HNSW rework"), not left against right.
+See [Known misses](#known-misses).
 
 ## Long-run baseline
 
@@ -792,6 +815,13 @@ Known and measured, not discovered after the fact:
   **0.6760** (n=30k), **0.4300** (n=100k) at the default `ef=100`, reaching
   0.9890 only at ef=3200. Saturation needs roughly `ef ≈ 0.08·n`, so the
   default is a small-corpus setting: say nothing about a 100k index at `ef=100`.
+  `hnsw_ef_search_divisor` (default 64, so the budget is
+  `max(ef, live_count / 64)` and inert below 6,400 cells) now buys this back:
+  recall@10 **0.893 → 0.944** (10k), **0.676 → 0.926** (30k), **0.430 → 0.928**
+  (100k), at a mean of 0.81 → 9.88 ms/query at 100k (100 queries; no per-query
+  p95 was measured). Optional int8 vector storage exists
+  (`Config.hnsw_vector_storage`) and is off by default because it costs 0.7–1.0
+  pt of recall at 10k and 30k.
 - **The WAL fsyncs on every record by default**, costing ~1.2 ms per durable
   append in an earlier measurement. `--wal-sync=group|interval:N` exist but
   were not faster on the measured host (fsync was ~30 µs there); see

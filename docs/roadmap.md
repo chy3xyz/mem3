@@ -262,6 +262,189 @@ commit would not move this number. What would:
 - Tune `ef_construction` against the insert/search trade-off rather than leaving
   it at the search-oriented default.
 
+**Update (2026-10-21, `p1/hnsw`): the insert cost was reduced 3.6×, and the
+build-time target is still missed.** See "1a. HNSW rework" below for the
+interleaved A/B; the ~899 µs/op above is the pre-rework figure.
+
+### 1a. HNSW rework — what was measured (2026-10-21, branch `p1/hnsw`)
+
+Every number below is an interleaved A/B against a build of `main` at
+`cc6f427` (ReleaseFast, Apple M1 Pro), never against a figure in this
+document. The host was loaded (load average 20–50 during the 100k runs, 5–10
+during the micro-benchmarks), so medians and ranges are reported and user CPU is
+preferred over wall time where both exist. Raw outputs were kept in `/tmp`
+during the work and are not committed; the method is `scripts/hnsw_ab.py`.
+
+**What changed, one commit each.** (Per-step ratios were measured at 10k
+against the preceding commit, interleaved; their product, 0.29, is consistent
+with the 0.26 cumulative user-CPU ratio at 100k below.)
+
+1. *Profile.* `sample` on a 10k build: ~42% of samples in linear scans of the
+   candidate set (`searchLayer` kept `candidates`/`results` as unsorted
+   lists), ~41% in cosine. No allocator or hash-map hot spot.
+2. *Binary heaps in `searchLayer`.* Graph bit-identical to `main` (fingerprint
+   test, below). User CPU for a 10k build: 0.47× of `main`.
+3. *Vector arena + norm cache + prefetch.* Vectors live in 64-byte-aligned
+   chunks addressed by a dense index instead of one heap slice per node; the
+   norm is cached; the next neighbour's vector is prefetched while the current
+   one is scored. A further 0.68× user CPU. The dot product is memory-bound at
+   scale: 548 ns per call at 100k random vectors against 35 ns when hot, which
+   is why this step paid off more at 100k than at 10k.
+4. *`shrinkConnections` without per-call allocations*, in-place write-back,
+   prefetch pass. A further 0.90× user CPU, and in-process peak RSS for a 10k
+   build 66.4 → 42.9 MB.
+
+**Graph identity.** `HNSW.graphFingerprint` hashes ids, levels and the order of
+every neighbour list. Three pinned corpora (400×32 default, 1500×24 with
+`m=8`/`efc=64`, 1000×100 with `efc=100`) produce the same fingerprint on `main`
+and on the branch for steps 2–4, so those steps change speed, not the graph. At
+30k×384 recall@10 reproduces the documented 0.6760. The fingerprints are pinned
+on `aarch64` only: the f32 reduction order may differ on x86, where the test
+skips rather than guess. **Not run on x86_64/Linux.**
+
+**Cumulative result vs `main`, 3 interleaved rounds** (`hnsw_ab.py`,
+`mem3-bench hnsw-build --vectors=100000`, dim 384, efc 200):
+
+| Metric (100k build) | `main` median (range) | branch median (range) | B/A |
+|---|---|---|---|
+| build seconds | 543.4 (437.3–580.0) | **115.3 (105.9–120.6)** | 0.212 (per round 0.222 / 0.242 / 0.199) |
+| user CPU s | 432.3 (393.1–439.6) | 113.3 (105.4–117.4) | 0.262 |
+| peak RSS, `time -l` MB | 455.9 (444.9–462.3) | 260.1 (253.2–325.9) | 0.571 |
+
+`met_target` is **false**: 115 s against < 30 s, 3.8× over. The earlier 430.6 s
+in this file sits just under the low end of what `main` measured now
+(437–580 s): the same order, a different load. A fresh 100k f32 build under a lighter
+load (not an A/B) took 110–126 s; int8 storage took 87 s (below).
+
+`mem3-bench` micro-benchmarks, 5 interleaved rounds, load average 5–10
+(median of the five medians, range in brackets):
+
+| Benchmark | `main` | branch |
+|---|---|---|
+| `hnsw.insert` (µs/op) | 886 (859–898) | **244 (241–258)** |
+| `hnsw.search` (µs/op, 2,000-cell corpus) | 1,070 (1,065–1,107) | 212 (209–214) |
+| `store.addRaw_memory` (µs/op) | 444 (435–450) | 198 (196–202) |
+| `store.addRaw_durable` (µs/op) | 538 (519–545) | 275 (268–300) |
+| `wal.append_durable` (µs/record) — control | 945 (877–1,023) | 958 (862–1,081) |
+
+`wal.append_durable` did not move, as it should not: the control agrees. The
+`hnsw.insert` share of the durable write path drops accordingly.
+
+**`ef_construction` sweep (decision: keep 200).** recall@10 at `ef=100`,
+dim 384, 100 queries, same graph seed:
+
+| efc | 10k | 30k |
+|---|---|---|
+| 50 | 0.777 | 0.519 |
+| 100 | 0.819 | 0.599 |
+| 150 | 0.868 | 0.643 |
+| 200 (default) | **0.893** | **0.676** |
+
+Lower `efc` is faster, but it is strictly worse on recall at both sizes, so the
+default stays 200. The
+"efc=100 is better" bullet below compares `efc=100` after the pruning fix with
+`efc=200` before it, so it does not bear on this same-pruning comparison. Per-insert timings for the sweep
+were taken on a host whose load swung by 5×; only the first round, where the
+ordering is monotone (330 / 454 / 555 / 639 µs for efc 50 / 100 / 150 / 200 at
+10k), is quoted, and it is a single round.
+
+**Adaptive `ef_search` (new default).** `Config.hnsw_ef_search_divisor`
+(default 64): the search budget is `max(hnsw_ef_search, live_count / 64)`. It is
+inert below 6,400 cells, so the small-corpus numbers (including every
+LongMemEval run) are unchanged. The graph is fully reachable at every size
+(level-0 reachability 1.0000), so the loss was search budget, not connectivity.
+recall@10 at `hnsw_ef_search=100`, dim 384, 100 queries, same graph, one process
+per row; latency is the mean over 100 searches, timed in batches of 10 (the
+per-query p95 is **not** measured; "slowest batch" is the worst batch mean):
+
+| n | fixed ef=100 recall | adaptive recall | fixed ms/query | adaptive ms/query (slowest batch) |
+|---|---|---|---|---|
+| 10,000 | 0.893 | **0.944** | 0.89 | 0.80 (1.29) |
+| 30,000 | 0.676 | **0.926** | 1.44 | 4.39 (5.60) |
+| 100,000 | 0.430 | **0.928** | 0.81 | 9.88 (10.06) |
+
+For scale: at 100k a fixed ef of 800 gave 0.803, 1562 gave 0.928, 3200 gave
+0.989 (the 1562 row is the same budget the divisor selects, and agrees). Mean
+latency at 100k is under the < 50 ms MVP target and **at, not under,** the
+< 10 ms release target; the p95 target has not been measured on a 100k corpus.
+The 10k latency rows are within noise of each other. Since the search budget is
+also over-fetched ×1.5 for tombstones, the effective beam is wider than the
+divisor alone suggests.
+
+**Optional int8 storage (`Config.hnsw_vector_storage = .int8`, default OFF).**
+Per-vector scale so max |x| = 127, exact i8 dot product with i32 accumulation,
+cached integer norm (cosine is scale-invariant, so no scale is stored). Vectors
+are not persisted, so snapshots and the WAL are unchanged and readable either
+way. Vector payload 1,536 → 384 B/cell. recall@10 at `ef=100`: 1k 0.988 vs 0.998,
+10k 0.886 vs 0.893, 30k 0.666 vs 0.676 (int8 vs f32; 0.7–1.0 pt loss at 10k and
+30k). The gate for turning it on was < 0.5 pt at both sizes, so it stays off. At
+100k (100 queries) int8 read 0.453 / 0.822 / 0.941 against f32's 0.430 / 0.803 /
+0.928 at ef 100 / 800 / 1562: higher, but 100 queries cannot resolve a 1–2 pt
+difference, so this is not evidence int8 is better. Build time at 100k was 86.9 s
+against 244 s for f32 *in the same loaded host and not interleaved*; the
+user CPU for `mem3-bench footprint --cells=100000`, two interleaved
+rounds, was 13.3–14.2 s int8, 18.3–20.2 s f32, 33.0–35.6 s `main`.
+
+**Memory (`mem3-bench footprint`).** RSS is not a usable measurement on this
+host. `/usr/bin/time -l` at 100k cells, every run taken (two scripts, runs
+interleaved): `main` 426 / 991 / 2,768 MB; branch f32 331 / 337 / 579 MB; branch
+int8 333 / 463 / 463 MB. A 6× spread inside one build is, by the README's own
+account, macOS page compression and swap under a loaded host, so **no claim is made about the < 500 MB RSS target**. What is
+deterministic is the allocator's live request bytes, now read from a counting
+allocator inside `footprint` (a lower bound on RSS: it excludes allocator
+metadata, size-class rounding and fragmentation). Same corpus, one run per cell
+count (a deterministic count, so repeats were not needed):
+
+| Cells | `main` live B/cell | branch f32 | branch int8 |
+|---|---|---|---|
+| 10,000 | 2,975 | 2,926 | 1,747 |
+| 50,000 | 2,952 | 2,877 | 1,729 |
+| 100,000 | 3,013 (301.3 MB) | 2,940 (294.0 MB) | 1,784 (178.4 MB) |
+
+So at 100k cells the floor is ~294 MB (f32) or ~178 MB (int8) before the
+allocator's own overhead. The live bytes barely changed between `main` and the
+branch: the memory *win* of this work is not live bytes (−2.4% at 100k f32), it
+is that the arena layout stops `DebugAllocator` from holding thousands of small
+vector allocations, which showed up as in-process peak RSS in an earlier
+`hnsw-build` A/B at 10k (66.4 → 42.9 MB); the `time -l` RSS above is too noisy
+to quote as a ratio.
+
+**Where the live bytes go** (call-site profile of a 10,000-cell fill, scratch
+tool not committed; total 2,926 B/cell, agrees with the counting allocator's
+2,926):
+
+| Component | B/cell |
+|---|---|
+| HNSW vector arena (1,536 payload + chunk slack) | 1,573 |
+| BM25 posting lists (`Posting` arrays + term map) | ~520 |
+| MemCell structs and their strings (`commitBuiltCell`) | ~340 |
+| HNSW layer-0 neighbour lists (32 ids × 8 B) | 257 |
+| id→cell and related hash maps | ~100 |
+| HNSW node structs | 56 |
+
+The BM25 lexical arm is the largest non-vector item (~18% of live bytes) and
+was added after the original 27 KB/cell figure; it is not touched by this
+branch. The "~27 KB/cell marginal" in the README is dominated by
+`DebugAllocator` page caching and macOS RSS behaviour, not by live data: live
+data is ~3 KB/cell.
+
+**Not done / not verified.**
+
+- x86_64/Linux fingerprint pin and the int8 numbers there: not run.
+- RSS at 100k vs the < 500 MB target: **not verified** (noise above); the
+  live-bytes floor (294 MB f32) leaves room under 500 MB but is not RSS.
+- Recall figures use 100 queries; differences under ~2 pt are not resolved.
+- A 4-accumulator dot kernel was tried and gave no measurable gain (user CPU
+  0.98×, inside noise); it was reverted, not committed.
+- In `connect`, the neighbour-side `link` shrinks the neighbour's list using the
+  *new* node's query as the reference instead of the neighbour's own vector. A
+  scratch fix gave no recall gain (0.869 vs 0.893 at 10k, 100 queries) and was
+  left as is; this is a finding, not a fix.
+- Remaining levers for the 30 s build target, not attempted: int8 storage by
+  default (needs the recall gate to pass), lower `efc` (costs recall, above), or
+  a multi-threaded build (a different design; graph determinism, which the
+  fingerprint tests rely on, would need re-proving).
+
 ### 2. LongMemEval — 0.646 core, 0.000 padded, against a ≥80% target
 
 `./zig-out/bin/mem3-bench longmemeval` reports `met_target: false`.
@@ -432,7 +615,9 @@ raw text. See `scripts/embedder_adapter_example.py`.
   connectivity, not by search width. At dim=384 it degrades with `n`: 0.9980
   (1k), 0.8930 (10k), 0.6760 (30k), 0.4300 (100k) at `ef=100`, and needs
   `ef ≈ 0.08·n` to saturate (0.9890 at ef=3200 for n=100k). The default
-  `hnsw_ef_search` is 100.
+  `hnsw_ef_search` is 100. *Update 2026-10-21:* `hnsw_ef_search_divisor = 64`
+  now scales the budget with the corpus (0.893 → 0.944 at 10k, 0.676 → 0.926 at
+  30k, 0.430 → 0.928 at 100k); see "1a. HNSW rework".
 - **The graph used to be disconnected, and that — not search width — was the
   recall ceiling.** Before this round, a directed walk from the entry point
   reached only 307/400 nodes; `1 − 307/400 = 0.7675` against a measured
@@ -450,9 +635,12 @@ raw text. See `scripts/embedder_adapter_example.py`.
   product-level default that every benchmark inherits; changing it is a
   deliberate decision, not a side effect of a recall fix.
 - **The 100k build-time target is missed by 14x.** `spec.md` and the
-  constitution both state < 30s for 100k vectors; measured is **430.6 s**
+  constitution both state < 30s for 100k vectors; measured was **430.6 s**
   (dim=384, efc=200, whole-index build). Cost of the recall fix, which keeps
-  more edges alive. `efc=100` roughly halves it and still misses.
+  more edges alive. `efc=100` roughly halves it and still misses. *Update
+  2026-10-21:* interleaved against `main`, the build is now **115.3 s** median
+  (105.9–120.6) against `main`'s 543.4 s (437.3–580.0) on the same loaded host,
+  still 3.8× over; see "1a. HNSW rework".
 - **Group commit is opt-in and unproven as a speedup.** Default `wal.append`
   still fsyncs every record. `--wal-sync=group` exists and loses no
   acknowledged write across `kill -9` in the e2e test, but on the measured
