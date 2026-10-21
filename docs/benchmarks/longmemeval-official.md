@@ -100,7 +100,7 @@ per-type aggregation, a Store-backed end-to-end run) live in
 ## 3. What is measured
 
 For each question: a **fresh in-memory `Store`** (default goals seeded) ingests
-that question's haystack (`addRaw`, source 物), the question text is the query
+that question's haystack (`addRaw`, source `matter`), the question text is the query
 through **`Store.query`** — the same recall path as `mem3 query`, GHW
 goal-aware rerank included — and the returned cells are mapped back to corpus
 documents. The ranking depth requested is the whole corpus; the fraction the

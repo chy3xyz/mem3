@@ -1,6 +1,6 @@
 //! Minimal JSON parser for the MCP server's request side.
 //!
-//! **GHW layer**: Harness 层 (象源). Parsing a protocol envelope is
+//! **GHW layer**: Harness layer (form source). Parsing a protocol envelope is
 //! regulatory work: it turns an external byte stream into the shape the
 //! memory system is allowed to act on. It touches no memory cell.
 //!
@@ -8,7 +8,7 @@
 //!
 //! `src/utils/jsonl.zig` has writing helpers only — `writeJsonString`
 //! and `writeJsonKey`. It is *not* a parser, and JSON-RPC needs to read
-//! what a client sent. Constitution IV (零依赖) forbids pulling an MCP
+//! what a client sent. Constitution IV (zero dependency) forbids pulling an MCP
 //! or JSON library in, so the reader is hand-written here.
 //!
 //! ## Design

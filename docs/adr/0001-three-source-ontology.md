@@ -1,23 +1,25 @@
 # ADR-0001: Three-Source Ontology as Canonical `source_tag`
 
+Terminology: Chinese theory terms used in this repository are defined in [`docs/glossary.md`](../glossary.md).
+
 **Status**: Accepted | **Date**: 2026-06-07 | **Authors**: Mavis (drafted from `dev.md` + `ghw_memory_system.agent.final.md`)
 
 ## Context
 
 Two reference documents use different taxonomies for memory sources:
 
-- **`ghw_memory_system.agent.final.md` §4.1.2** uses `{M, F, S}` = {物 (Matter), 象 (Form), 性 (Spirit)} as the *canonical* source taxonomy. This is rooted in 三源合恰论.
+- **`ghw_memory_system.agent.final.md` §4.1.2** uses `{M, F, S}` = {Matter, Form, Spirit} as the *canonical* source taxonomy. This is rooted in Tri-Source Coherence Theory.
 - **`dev.md` §2.2.1** uses `{sensory, cognitive, action}` as the source taxonomy. This is rooted in cognitive activity types (input, reasoning, behavior).
 
 The two are not contradictory, but they are not identical either:
 
 | Paper's `source_tag` | `dev.md`'s source | Cognitive activity | Example |
 |---|---|---|---|
-| Matter (M) | sensory | 感知: 感官输入、环境观测 | "user said: 'how do I use Zig?'" |
-| Form (F) | cognitive | 认知: 推理、反思、抽象 | "I derived that Zig 0.17 replaces std.fs" |
-| Spirit (S) | action | 行动: 工具调用、执行结果 | "I ran `zig build` and it compiled in 4s" |
+| Matter (M) | sensory | Perception: sensory input, environment observations | "user said: 'how do I use Zig?'" |
+| Form (F) | cognitive | Cognition: reasoning, reflection, abstraction | "I derived that Zig 0.17 replaces std.fs" |
+| Spirit (S) | action | Action: tool calls, execution results | "I ran `zig build` and it compiled in 4s" |
 
-The misalignment: `dev.md` puts *action/execution* under the third source, but the paper puts *meaning/value-direction* under the third source (性). The paper's `goal_associations` and `foresight` are explicitly the 性 (spirit) dimension, NOT the action dimension.
+The misalignment: `dev.md` puts *action/execution* under the third source, but the paper puts *meaning/value-direction* under the third source (spirit). The paper's `goal_associations` and `foresight` are explicitly the spirit dimension, NOT the action dimension.
 
 ## Decision
 
@@ -27,16 +29,16 @@ The default mapping is:
 
 | `source_tag` | Default `activity_subtype` | Notes |
 |---|---|---|
-| Matter (M) | perception | 感官 / 工具返回的原始数据 |
-| Form (F) | cognition | 推理 / 反思 / 抽象知识 |
-| Spirit (S) | action (for *behavioral* spirit) or reflection (for *meta-cognitive* spirit) | 行动 vs 反思: 行为轨迹 vs 元认知 |
+| Matter (M) | perception | Raw data from the senses and tool returns |
+| Form (F) | cognition | Reasoning, reflection, abstract knowledge |
+| Spirit (S) | action (for *behavioral* spirit) or reflection (for *meta-cognitive* spirit) | Action vs reflection: behaviour traces vs meta-cognition |
 
 The Source Classifier (when implemented in v0.2.0 with an LLM) MUST set both fields. For the v0.1.0-alpha stub, the user explicitly sets `source_tag` via `--source=matter|form|spirit` and `activity_subtype` is inferred or default.
 
 ## Consequences
 
 - **Positive**: Aligns the implementation with the formal paper's theoretical scaffolding. The category-theoretic semantics (paper §5) cleanly map to M/F/S.
-- **Positive**: Constitution Principle I (三源完整性) is unambiguous: a memory is 物/象/性-tagged, period.
+- **Positive**: Constitution Principle I (Tri-Source Integrity) is unambiguous: a memory is tagged matter, form or spirit, period.
 - **Negative**: Adds a `metadata.activity_subtype` field that is not in the paper. This is a small extension; the paper's `source_tag` is the primary classification, the subtype is auxiliary.
 - **Negative**: The default mapping for `Spirit` is ambiguous (action vs reflection). Resolved by the weight ordering `w_reflection > w_cognition > w_action > w_perception` from the paper: reflection dominates when present.
 
@@ -53,4 +55,4 @@ The Source Classifier (when implemented in v0.2.0 with an LLM) MUST set both fie
 - `dev.md` §2.2.1 (sensory/cognitive/action)
 - `specs/001-trisource-everos-mvp/data-model.md` (concrete type definitions)
 - `specs/001-trisource-everos-mvp/spec.md` FR-002 (source_tag enforcement)
-- `.specify/memory/constitution.md` Principle I (三源完整性)
+- `.specify/memory/constitution.md` Principle I (Tri-Source Integrity)

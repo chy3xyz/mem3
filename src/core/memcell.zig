@@ -1,11 +1,11 @@
 //! Core types: TS-MemCell 7-tuple and its component structs.
 //!
-//! **GHW Layer**: 基础层 (foundation). Touches all three layers because
+//! **GHW Layer**: foundation layer. Touches all three layers because
 //! MemCell is the unit of memory across the system.
 //!
 //! **Constitution compliance**:
-//! - Principle I (三源完整性): `MemorySource` enum enforces tagging.
-//! - Principle V (零拷贝): comptime `serialized_size`.
+//! - Principle I (Tri-Source Integrity): `MemorySource` enum enforces tagging.
+//! - Principle V (zero-copy): comptime `serialized_size`.
 //! - All structs use explicit allocators, no globals.
 
 const std = @import("std");
@@ -28,15 +28,15 @@ pub const EdgeType = types.EdgeType;
 pub const MemCell = struct {
     /// Globally unique, monotonically increasing id (1-based; 0 is reserved).
     id: u64,
-    /// The ontological source (物/象/性). CONSTITUTIONAL: must be set.
+    /// The ontological source (matter/form/spirit). CONSTITUTIONAL: must be set.
     source: MemorySource,
-    /// 物 (matter): raw episode, causally efficacious trace.
+    /// Matter: raw episode, causally efficacious trace.
     episode: []const u8,
-    /// 象 (form): extracted atomic facts.
+    /// Form: extracted atomic facts.
     atomic_facts: []const Fact,
-    /// 性 (spirit): predictive memories with time validity.
+    /// Spirit: predictive memories with time validity.
     foresight: []const Foresight,
-    /// 性 (spirit): goal bindings with relevance + priority.
+    /// Spirit: goal bindings with relevance + priority.
     goal_associations: []const GoalAssociation,
     /// Metadata: timestamps, scores, decay rate, fuzzy flag.
     metadata: Metadata,
