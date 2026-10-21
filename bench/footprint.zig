@@ -250,8 +250,22 @@ fn measure(
     };
 }
 
-pub fn run(alloc: Allocator, init: std.process.Init.Minimal) !void {
+/// Which allocator the Store under measurement is built on. The shipped
+/// `mem3` binary uses `.debug`; the others exist to answer "how much of the
+/// RSS is the allocator, not the data".
+const AllocKind = enum {
+    /// The `alloc` passed in: `DebugAllocator(.{ .thread_safe = true })`, as
+    /// in `src/main.zig`.
+    debug,
+    /// `std.heap.smp_allocator`.
+    smp,
+    /// libc `malloc` (`std.heap.c_allocator`; the build links libc anyway).
+    c,
+};
+
+pub fn run(base_alloc: Allocator, init: std.process.Init.Minimal) !void {
     var common = harness.CommonArgs{};
+    var kind: AllocKind = .debug;
     var cells: ?usize = null;
     var sample_every: ?usize = null;
     var durable = false;
@@ -267,6 +281,13 @@ pub fn run(alloc: Allocator, init: std.process.Init.Minimal) !void {
             int8 = true;
             continue;
         }
+        if (std.mem.startsWith(u8, arg, "--allocator=")) {
+            kind = std.meta.stringToEnum(AllocKind, arg["--allocator=".len..]) orelse {
+                harness.out("footprint: --allocator must be debug, smp or c\n", .{});
+                return error.UnknownArgument;
+            };
+            continue;
+        }
         if (try harness.parseCommon(arg, &common)) continue;
         if (std.mem.startsWith(u8, arg, "--cells=")) {
             cells = try std.fmt.parseInt(usize, arg["--cells=".len..], 10);
@@ -279,6 +300,7 @@ pub fn run(alloc: Allocator, init: std.process.Init.Minimal) !void {
                 \\  --cells=N         cells to insert (default {d})
                 \\  --sample-every=N  RSS sample interval in cells (default cells/10)
                 \\  --int8            store HNSW vectors as int8 (1 B/dim instead of 4)
+                \\  --allocator=K     debug (default, the shipped binary's), smp, or c
                 \\  --durable         keep the WAL, and account for its bytes
                 \\  --data-dir=P      scratch dir (default: a fresh /tmp dir)
                 \\  --scale=F         multiply the defaults; --quick is 0.1
@@ -291,6 +313,13 @@ pub fn run(alloc: Allocator, init: std.process.Init.Minimal) !void {
         }
     }
 
+    // Only the Store under measurement moves to the chosen allocator; the
+    // harness's own bookkeeping stays on `base_alloc`.
+    const alloc = switch (kind) {
+        .debug => base_alloc,
+        .smp => std.heap.smp_allocator,
+        .c => std.heap.c_allocator,
+    };
     const n_cells = harness.scaled(cells orelse DEFAULT_CELLS, common);
     const n_sample = @max(harness.scaled(sample_every orelse @max(n_cells / 10, 1), common), 1);
 
@@ -367,10 +396,15 @@ pub fn run(alloc: Allocator, init: std.process.Init.Minimal) !void {
         "no WAL at all (data_dir=null), so the WAL contributes 0 bytes to " ++
             "both RSS and disk.");
     try j.key("allocator");
-    try j.str("std.heap.DebugAllocator(.{ .thread_safe = true }) — byte-for-byte " ++
-        "the allocator the shipped mem3 binary uses (src/main.zig), so this " ++
-        "is not a bench-harness artifact, but it does carry per-allocation " ++
-        "debug metadata and caches freed pages rather than returning them.");
+    try j.str(switch (kind) {
+        .debug => "std.heap.DebugAllocator(.{ .thread_safe = true }) — byte-for-byte " ++
+            "the allocator the shipped mem3 binary uses (src/main.zig), so this " ++
+            "is not a bench-harness artifact. (In ReleaseFast its `safety` is off, " ++
+            "so it keeps no per-allocation debug metadata; see docs/roadmap.md " ++
+            "for what it does cost.)",
+        .smp => "std.heap.smp_allocator (--allocator=smp). NOT the allocator the shipped binary uses.",
+        .c => "std.heap.c_allocator, libc malloc (--allocator=c). NOT the allocator the shipped binary uses.",
+    });
     try j.key("what_this_number_is");
     try j.str("Whole-process peak RSS (getrusage ru_maxrss) for a store " ++
         "filled through addRaw and still in memory. It is NOT the on-disk " ++

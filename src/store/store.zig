@@ -109,6 +109,18 @@ fn diag(comptime fmt: []const u8, args: anytype) void {
     /// is a quarter of the memory and lossy. Vectors are not persisted, so
     /// this can differ between runs over the same data directory.
     vector_storage: Config.VectorStorage = .f32,
+    /// Threads used to rebuild the vector index when a snapshot is restored
+    /// (`HNSW.insertBatch`). 1, the default, re-inserts cell by cell exactly
+    /// as before and rebuilds the identical graph. More than 1 is faster on
+    /// a large snapshot but the rebuilt graph is *not* reproducible run to
+    /// run (recall and connectivity are what is preserved — see
+    /// `docs/roadmap.md`, "1b"). Needs a thread-safe `alloc`; the daemon's
+    /// is. Only the restore path is affected: live `addRaw` and WAL replay
+    /// still insert one cell at a time.
+    hnsw_build_threads: u16 = 1,
+    /// Rebuild with int8 distances while keeping f32 vectors (see
+    /// `HNSW.BatchOptions.build_quant`). Off by default.
+    hnsw_build_quant: bool = false,
     /// Which embedder implementation the store embeds with. Default:
     /// `.lexical_hash` — the real lexical embedder. `.stub_xxhash`
     /// stays available because it is the historical default and
@@ -193,6 +205,9 @@ pub const Store = struct {
     /// read back off the live WAL, because `takeSnapshot` builds a new WAL
     /// object and must give it the same mode.
     wal_sync: Config.WalSync = .always,
+    /// How `loadSnapshot` rebuilds the vector index. The defaults make it
+    /// the plain per-cell insert loop.
+    hnsw_build: retrieval.hnsw.BatchOptions = .{},
     /// Set to true after `deinit` — guards double-free.
     deinit_called: bool = false,
 
@@ -346,6 +361,7 @@ pub const Store = struct {
 
         // Persistence (optional)
         self.wal_sync = opts.wal_sync;
+        self.hnsw_build = .{ .threads = opts.hnsw_build_threads, .build_quant = opts.hnsw_build_quant };
         if (opts.data_dir) |dir| {
             try self.openAndReplayPersistence(dir);
         }
@@ -1654,6 +1670,15 @@ pub fn encodeGoalWALPayloadRaw(
         // mint an id an existing snapshot row already uses.
         if (max_goal_id > 0) _ = self.ids.fetchMax(max_goal_id + 1, .monotonic);
 
+        // With one thread and no build-time quantisation the index is rebuilt
+        // cell by cell, exactly as it always was. Otherwise the vectors are
+        // gathered and handed to `HNSW.insertBatch` a chunk at a time, which
+        // bounds the transient copy (chunk * dim * 4 bytes) instead of
+        // doubling the index's footprint during the restore.
+        const batched = self.hnsw_build.threads > 1 or self.hnsw_build.build_quant;
+        var pending = PendingVectors{};
+        defer pending.deinit(self.alloc);
+
         for (data.cells) |cs| {
             const snapshot_cell: MemCell = .{
                 .id = cs.id,
@@ -1691,9 +1716,15 @@ pub fn encodeGoalWALPayloadRaw(
                 // probe for ids above it.
                 const v = try self.emb.embed(self.alloc, stored.episode);
                 defer self.alloc.free(v);
-                self.hnsw.insert(cs.id, v) catch |err| {
-                    std.log.warn("snapshot: hnsw insert failed for id={d}: {}", .{ cs.id, err });
-                };
+                if (batched) {
+                    try pending.ids.append(self.alloc, cs.id);
+                    try pending.vecs.appendSlice(self.alloc, v);
+                    if (pending.ids.items.len >= restore_batch_cells) self.flushPendingVectors(&pending);
+                } else {
+                    self.hnsw.insert(cs.id, v) catch |err| {
+                        std.log.warn("snapshot: hnsw insert failed for id={d}: {}", .{ cs.id, err });
+                    };
+                }
                 // The lexical arm rides the exact same restore path, for
                 // the exact same reason. Rebuilding it from the cells —
                 // rather than persisting a posting list alongside the
@@ -1706,6 +1737,7 @@ pub fn encodeGoalWALPayloadRaw(
                 self.indexLexicalText(cs.id, stored);
             }
         }
+        self.flushPendingVectors(&pending);
         for (data.fuzzy_cells) |cs| {
             const cell = try self.alloc.create(MemCell);
             errdefer self.alloc.destroy(cell);
@@ -1720,6 +1752,33 @@ pub fn encodeGoalWALPayloadRaw(
             };
             try self.lc.fuzzy.transfer(cell);
         }
+    }
+
+    /// Cells per `HNSW.insertBatch` call during a batched restore. 4,096
+    /// cells of 384 floats is 6 MiB of transient vectors.
+    const restore_batch_cells: usize = 4096;
+
+    /// Vectors waiting for the next `insertBatch` of a snapshot restore.
+    const PendingVectors = struct {
+        ids: std.ArrayList(u64) = .empty,
+        vecs: std.ArrayList(f32) = .empty,
+
+        fn deinit(self: *PendingVectors, alloc: Allocator) void {
+            self.ids.deinit(alloc);
+            self.vecs.deinit(alloc);
+        }
+    };
+
+    /// Index the gathered vectors and empty the buffer. A failure is logged,
+    /// not returned, as a failed per-cell insert always was: the cells are
+    /// the truth and the dense arm is a cache over them.
+    fn flushPendingVectors(self: *Store, pending: *PendingVectors) void {
+        if (pending.ids.items.len == 0) return;
+        self.hnsw.insertBatch(pending.ids.items, pending.vecs.items, self.hnsw_build) catch |err| {
+            std.log.warn("snapshot: hnsw batch insert of {d} cells failed: {}", .{ pending.ids.items.len, err });
+        };
+        pending.ids.clearRetainingCapacity();
+        pending.vecs.clearRetainingCapacity();
     }
 
     /// Put one snapshot goal row back into the poset, under the id the
@@ -4134,6 +4193,56 @@ test "Store: a snapshot restore rebuilds the vector index, not just the cells" {
         }
     }
     try std.testing.expect(saw_coffee);
+}
+
+test "Store: a snapshot restore with a parallel index build keeps the index whole and findable" {
+    const alloc = std.testing.allocator;
+    var dir_buf: [128]u8 = undefined;
+    const data_dir = testDataDir(&dir_buf, "snapparidx");
+    wipeStoreDir(data_dir);
+    defer wipeStoreDir(data_dir);
+
+    // More cells than `BatchOptions.seed_nodes`, so the restore really does
+    // link some of them from several threads.
+    const n: usize = 1400;
+    const ids = try alloc.alloc(u64, n);
+    defer alloc.free(ids);
+    {
+        var store = try Store.init(alloc, .{ .data_dir = data_dir, .seed_default_goals = false });
+        defer store.deinit();
+        for (ids, 0..) |*slot, i| {
+            var buf: [96]u8 = undefined;
+            slot.* = try store.addRaw(.matter, try std.fmt.bufPrint(&buf, "note {d} concerning subject {d} and topic {d}", .{ i, i * 7 % 101, i * 13 % 97 }), "u|has|note", 0, 0.5);
+        }
+        try store.sync();
+    }
+
+    var store = try Store.init(alloc, .{
+        .data_dir = data_dir,
+        .seed_default_goals = false,
+        .hnsw_build_threads = 3,
+    });
+    defer store.deinit();
+
+    try std.testing.expectEqual(n, store.cellCount());
+    try std.testing.expectEqual(n, store.hnsw.count);
+    // Connected: the walk from the entry point reaches (almost) every node.
+    const reached = try store.hnsw.level0Reachable(alloc);
+    try std.testing.expect(reached * 1000 >= n * 995);
+
+    // Findable by the right cell: a cell's own text embeds to its own
+    // vector, which must come back first.
+    var found: usize = 0;
+    var probe: usize = 0;
+    while (probe < n) : (probe += 37) {
+        const cell = store.mgr.get(ids[probe]) orelse return error.TestExpectedCellMissing;
+        const q = try store.emb.embed(alloc, cell.episode);
+        defer alloc.free(q);
+        const hits = try store.hnsw.search(alloc, q, 1);
+        defer alloc.free(hits);
+        if (hits.len == 1 and hits[0].id == ids[probe]) found += 1;
+    }
+    try std.testing.expect(found * 100 >= (n / 37 + 1) * 97);
 }
 
 test "Store: a failed insert leaks its id instead of returning it" {

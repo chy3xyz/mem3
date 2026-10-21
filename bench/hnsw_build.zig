@@ -107,9 +107,27 @@ const BuildResult = struct {
     indexed: usize,
     errors: usize,
     build_ns: u64,
+    /// One sample per `insert` in the sequential mode; one per batch (that
+    /// batch's mean) in the batch mode, where no single insert is timed.
     per_insert: harness.Latencies,
     shape: []GraphShape,
     peak_rss_kb: ?u64,
+    user_cpu_ms: ?f64,
+};
+
+/// How the corpus goes into the index.
+const Mode = struct {
+    /// Worker threads of `insertBatch`. 1 with `quant == false` is the
+    /// sequential `insert` loop, the baseline every other mode is read against.
+    threads: usize = 1,
+    seed_nodes: usize = 1000,
+    quant: bool = false,
+    /// Vectors per `insertBatch` call (0 = the whole corpus in one call).
+    batch: usize = 0,
+
+    fn isBatch(self: Mode) bool {
+        return self.threads > 1 or self.quant;
+    }
 };
 
 fn build(
@@ -117,25 +135,55 @@ fn build(
     hnsw: *mem3.HNSW,
     corpus: harness.VectorCorpus,
     want_vectors: usize,
+    mode: Mode,
 ) !BuildResult {
     const n = @min(want_vectors, corpus.count);
-    const samples = try alloc.alloc(u64, n);
+    const chunk = if (mode.batch == 0) @max(n, 1) else mode.batch;
+    const samples = try alloc.alloc(u64, if (mode.isBatch()) (n + chunk - 1) / chunk + 1 else n);
     defer alloc.free(samples);
 
     var ok: usize = 0;
     var failed: usize = 0;
+    var ns_used: usize = 0;
 
+    const cpu0 = harness.userCpuMs();
     const t0 = harness.clockNs();
-    for (0..n) |i| {
-        const one = harness.clockNs();
-        hnsw.insert(@intCast(i + 1), corpus.vector(i)) catch {
-            failed += 1;
-            continue;
-        };
-        samples[ok] = harness.sinceNs(one);
-        ok += 1;
+    if (mode.isBatch()) {
+        const ids = try alloc.alloc(u64, chunk);
+        defer alloc.free(ids);
+        var at: usize = 0;
+        while (at < n) {
+            const len = @min(chunk, n - at);
+            for (ids[0..len], 0..) |*id, k| id.* = @intCast(at + k + 1);
+            const one = harness.clockNs();
+            hnsw.insertBatch(ids[0..len], corpus.data[at * DIM ..][0 .. len * DIM], .{
+                .threads = mode.threads,
+                .seed_nodes = mode.seed_nodes,
+                .build_quant = mode.quant,
+            }) catch {
+                failed += len;
+                at += len;
+                continue;
+            };
+            samples[ns_used] = harness.sinceNs(one) / len;
+            ns_used += 1;
+            ok += len;
+            at += len;
+        }
+    } else {
+        for (0..n) |i| {
+            const one = harness.clockNs();
+            hnsw.insert(@intCast(i + 1), corpus.vector(i)) catch {
+                failed += 1;
+                continue;
+            };
+            samples[ok] = harness.sinceNs(one);
+            ok += 1;
+        }
+        ns_used = ok;
     }
     const build_ns = harness.sinceNs(t0);
+    const cpu1 = harness.userCpuMs();
 
     const levels: usize = @as(usize, hnsw.max_level) + 1;
     const shape = try measureGraphShape(alloc, hnsw, levels);
@@ -143,21 +191,31 @@ fn build(
         .indexed = ok,
         .errors = failed,
         .build_ns = build_ns,
-        .per_insert = try harness.Latencies.fromSlice(alloc, samples[0..ok]),
+        .per_insert = try harness.Latencies.fromSlice(alloc, samples[0..ns_used]),
         .shape = shape,
         .peak_rss_kb = harness.peakRssKb(),
+        .user_cpu_ms = if (cpu0 != null and cpu1 != null) cpu1.? - cpu0.? else null,
     };
 }
 
 pub fn run(alloc: Allocator, init: std.process.Init.Minimal) !void {
     var common = harness.CommonArgs{};
     var vectors: ?usize = null;
+    var mode = Mode{};
 
     var it = harness.argIterator(init);
     while (it.next()) |arg| {
         if (try harness.parseCommon(arg, &common)) continue;
         if (std.mem.startsWith(u8, arg, "--vectors=") or std.mem.startsWith(u8, arg, "--corpus=")) {
             vectors = try std.fmt.parseInt(usize, arg[std.mem.indexOfScalar(u8, arg, '=').? + 1 ..], 10);
+        } else if (std.mem.startsWith(u8, arg, "--threads=")) {
+            mode.threads = try std.fmt.parseInt(usize, arg["--threads=".len..], 10);
+        } else if (std.mem.startsWith(u8, arg, "--seed-nodes=")) {
+            mode.seed_nodes = try std.fmt.parseInt(usize, arg["--seed-nodes=".len..], 10);
+        } else if (std.mem.startsWith(u8, arg, "--batch=")) {
+            mode.batch = try std.fmt.parseInt(usize, arg["--batch=".len..], 10);
+        } else if (std.mem.eql(u8, arg, "--build-quant")) {
+            mode.quant = true;
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             harness.out(
                 \\hnsw_build — time to build the vector index, and its shape
@@ -165,6 +223,11 @@ pub fn run(alloc: Allocator, init: std.process.Init.Minimal) !void {
                 \\  --vectors=N   vectors to insert (default {d})
                 \\  --scale=F     multiply the default; --quick is 0.1
                 \\  --seed=N      PRNG seed for the corpus
+                \\  --threads=N   link with N threads via HNSW.insertBatch (default 1:
+                \\                the sequential insert loop). Not graph-reproducible for N>1
+                \\  --build-quant build with int8 distances, keep f32 vectors (insertBatch)
+                \\  --seed-nodes=N  nodes linked one at a time before going parallel (1000)
+                \\  --batch=N     vectors per insertBatch call (default: all in one)
                 \\
                 , .{DEFAULT_VECTORS});
             return;
@@ -186,7 +249,7 @@ pub fn run(alloc: Allocator, init: std.process.Init.Minimal) !void {
     defer hnsw.deinit();
 
     harness.progress("hnsw_build: inserting...\n", .{});
-    var res = try build(alloc, &hnsw, corpus, n_vectors);
+    var res = try build(alloc, &hnsw, corpus, n_vectors, mode);
     defer res.per_insert.deinit(alloc);
     defer alloc.free(res.shape);
 
@@ -220,6 +283,14 @@ pub fn run(alloc: Allocator, init: std.process.Init.Minimal) !void {
     try j.int(@as(u64, @intCast(res.errors)));
     try j.key("build_seconds");
     try j.float(build_s);
+    try j.key("user_cpu_seconds");
+    try j.optFloat(if (res.user_cpu_ms) |ms| ms / 1000.0 else null);
+    try j.key("threads");
+    try j.int(@as(u64, @intCast(mode.threads)));
+    try j.key("build_quant");
+    try j.boolean(mode.quant);
+    try j.key("insert_mode");
+    try j.str(if (mode.isBatch()) "insertBatch (insert_latency_ns samples are per-batch means)" else "insert loop");
     try j.key("vectors_per_second");
     try j.float(if (build_s == 0) 0 else @as(f64, @floatFromInt(res.indexed)) / build_s);
     try j.key("insert_latency_ns");
@@ -228,6 +299,9 @@ pub fn run(alloc: Allocator, init: std.process.Init.Minimal) !void {
     try j.key("insert_latency_ms_by_decile");
     try j.beginArray();
     for (0..10) |d| {
+        // Batch mode has one sample per batch, so a decile of samples is not
+        // a decile of the corpus.
+        if (mode.isBatch()) break;
         const lo = (res.per_insert.count() * d) / 10;
         const hi = (res.per_insert.count() * (d + 1)) / 10;
         if (lo >= hi or hi > res.per_insert.count()) continue;
