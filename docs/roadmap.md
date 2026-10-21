@@ -431,8 +431,8 @@ data is ~3 KB/cell.
 **Not done / not verified.**
 
 - x86_64/Linux fingerprint pin and the int8 numbers there: not run.
-- RSS at 100k vs the < 500 MB target: **not verified** (noise above); the
-  live-bytes floor (294 MB f32) leaves room under 500 MB but is not RSS.
+- RSS at 100k vs the < 500 MB target: **not verified** here (noise above);
+  re-measured in 1b.
 - Recall figures use 100 queries; differences under ~2 pt are not resolved.
 - A 4-accumulator dot kernel was tried and gave no measurable gain (user CPU
   0.98×, inside noise); it was reverted, not committed.
@@ -444,6 +444,153 @@ data is ~3 KB/cell.
   default (needs the recall gate to pass), lower `efc` (costs recall, above), or
   a multi-threaded build (a different design; graph determinism, which the
   fingerprint tests rely on, would need re-proving).
+
+### 1b. Parallel build, construction-time int8, RSS re-measured (2026-10-22, branch `p2/hnsw2`)
+
+Follow-up to 1a. Same rules: interleaved A/B against a build of `main`,
+ReleaseFast, Apple M1 Pro (10 cores: 8 performance + 2 efficiency). The host was
+shared and loaded for almost all of it (load average 16–270; swap 15–20 GB in
+use throughout), so **wall time is reported with its range and user CPU next to
+it**, and every number below that depends on idle cores says so. Method:
+`scripts/ab_matrix.py` (N-way interleaved runner; wall, user, sys and
+`max_rss` from `/usr/bin/time -l`) and `scripts/hnsw_ab.py`. Raw logs were kept
+in `/tmp` during the work and are not committed.
+
+**What was added.**
+
+- `HNSW.insertBatch(ids, vectors, BatchOptions{threads, seed_nodes,
+  build_quant})`. Phase A commits every node sequentially (arena slot, norm,
+  level from the persistent PRNG, id map), so all per-node tables are immutable
+  while linking runs. Phase B links nodes on `threads` workers, each with a
+  private `Scratch` (visit stamps, heaps, buffers). Adjacency lists are read
+  (copied) and written under a table of 4,096 striped libc `pthread_mutex_t`
+  (`std.Thread.Mutex` does not exist in Zig 0.17); no worker ever holds two
+  locks, so there is no lock ordering to get wrong. The first `seed_nodes`
+  (1,000) nodes and every node that raises the top level are linked one at a
+  time on the calling thread, so `entry_point`/`max_level` are never written by
+  a worker. Needs a thread-safe allocator when `threads > 1`.
+- `build_quant`: during the build only, scoring and pruning use an int8 copy of
+  the vectors (`dotI8`); stored vectors stay f32 and queries are f32.
+- `threads = 1` without `build_quant` is the plain `insert` loop: the pinned
+  graph fingerprints are unchanged (aarch64). The parallel graph is **not**
+  reproducible between runs.
+- Library only, not on the CLI: `Store.BuildOptions.hnsw_build_threads` /
+  `hnsw_build_quant` (defaults 1 / false; live `insert` unchanged) apply to
+  snapshot restore. Bench flags: `hnsw-build --threads N --seed-nodes N
+  --batch N --build-quant`, `footprint --allocator=debug|smp|c`,
+  `mem3-hnsw-recall --threads N --build-quant --rescore F --hnsw-seed N`.
+
+**100K build, dim 384, efc 200** (`mem3-bench hnsw-build --vectors=100000`;
+3 interleaved rounds, median (min–max); load at start of each run 16–64):
+
+| Variant | Wall s | User CPU s |
+|---|---|---|
+| `main`, 1 thread (the live-store path) | 142.6 (123.7–189.7) | 125.1 (116.2–128.9) |
+| 8 threads, f32 distances | 39.4 (23.4–49.3) | 130.4 (129.0–132.5) |
+| 1 thread, `--build-quant` | 62.2 (57.2–71.9) | 50.5 (49.5–52.8) |
+| 4 threads, `--build-quant` | 27.3 (13.3–31.6) | 54.8 (46.8–57.0) |
+| 8 threads, `--build-quant` | **13.3 (10.4–19.9)** | 51.9 (51.3–54.8) |
+
+An earlier set of 3 rounds at load 40–190 gave 28 s for the same 8-thread +
+`--build-quant` variant at its best and 81 s at its worst, with user CPU
+53.5–62.6 s: the wall spread is mostly the host; the user CPU is the variant. Two
+direct runs of the 8-thread `--build-quant` configuration at load 12–17 printed
+13.29 s and 14.27 s, both `"met_target": true` in `mem3-bench hnsw-build`'s own
+JSON.
+
+Reading: construction-time int8 is the big lever on CPU (2.5× less user CPU,
+single thread: 125 → 50.5 s); threads then convert it to wall time. Threads
+alone do not reduce CPU (130 s) and scale only as far as cores are free.
+**The 100K < 30 s target is met only for `insertBatch` with 8 threads and
+`build_quant`**, on a 10-core machine. The single-thread path the live store
+uses is 62.2 s (2.1× over) with `build_quant` and 142.6 s (4.8× over) without.
+x86_64/Linux was not run.
+
+**Recall cost** (`mem3-hnsw-recall`, dim 384, efc 200, 500 queries, 4 level
+seeds, mean of recall@10; seed-to-seed spread of the single-thread build alone
+is 0.9–1.2 pt):
+
+| Build | 10k ef=100 | 10k ef=400 | 30k ef=100 | 30k ef=400 | level-0 reachable (all) |
+|---|---|---|---|---|---|
+| 1 thread, f32 (`insert`) | 0.8913 | 0.9943 | 0.6786 | 0.9077 | 1.0000 |
+| 4 threads, f32 | 0.8906 | 0.9932 | 0.6802 | 0.9051 | 0.9998 |
+| 1 thread, `build_quant` | 0.8875 | 0.9927 | 0.6792 | 0.9064 | 1.0000 |
+| 4 threads, `build_quant` | 0.8864 | 0.9930 | 0.6786 | 0.9059 | 0.9999 |
+
+Worst case against single-thread f32: −0.49 pt (4 threads + `build_quant`, 10k,
+ef=100), i.e. inside the 0.5 pt gate and inside the noise floor. The parallel
+build left up to 0.04% of nodes unreachable on layer 0 (lowest single run
+0.9996), so reachability is ≈ 1.0, not exactly 1.0. The unit tests require within 0.03
+recall and connectedness at 2,500 nodes; removing the lock table
+(mutation check) makes them abort in 3 of 3 runs, so the tests can go red.
+
+**Not pursued: smaller candidate lists on the early graph.** No
+implementation and no measurement; the build_quant result already moved CPU by
+more than any early-graph saving could.
+
+**int8 storage plus f32 re-ranking.** `examples/hnsw_recall.zig --int8 --rescore
+3` re-ranks the top 3k results of an int8 index with exact f32 vectors (3
+seeds, 500 queries, mean recall@10, loss vs f32 index in brackets):
+
+| | 10k ef=100 | 10k ef=400 | 30k ef=100 | 30k ef=400 |
+|---|---|---|---|---|
+| f32 index | 0.8900 | 0.9943 | 0.6783 | 0.9087 |
+| int8 index | 0.8843 (−0.57) | 0.9829 (−1.15) | 0.6791 (+0.08) | 0.9014 (−0.73) |
+| int8 + f32 re-rank ×3 | 0.8880 (−0.20) | 0.9928 (−0.15) | 0.6793 (+0.10) | 0.9057 (−0.30) |
+
+With re-ranking the loss is under 0.5 pt in every cell, but **int8 stays off
+by default**. The int8 index holds no f32 vectors and `MemCell` does not keep
+its embedding, so re-ranking in `Store` would mean re-embedding up to 3k
+episodes per query (a process round trip per candidate with `--embedder-cmd`),
+or keeping the f32 vectors, which removes the memory saving. That mechanism
+was not built, so the re-rank figures above come from the recall tool, which has
+the corpus; they are not a `Store` result.
+
+**Memory at 100K, re-measured.** The 1a note that RSS could not be measured
+holds for `ru_maxrss`: on this swapped host the same 100K run read 311–318 MB
+in most runs and 551.75 MB in one, `smp_allocator` runs read 135–258 MB, and
+in-process readings were lower still. macOS `peak memory footprint` (also
+printed by `/usr/bin/time -l`, includes compressed pages) did not move: every
+repeat matched to four digits. In the one `DebugAllocator` run where
+`ru_maxrss` reads 551.75, it equals the footprint (551.705), which is why the
+footprint is taken as the true peak. Units are MiB, as in the benchmark.
+
+| Cells | `main`, `DebugAllocator` | branch, `DebugAllocator` | branch f32 `smp` | branch int8 `DebugAllocator` | branch int8 `smp` |
+|---|---|---|---|---|---|
+| 10,000 | 61.0 | 61.0 | 46.3 | 49.9 | 37.6 |
+| 50,000 | 278.6 | 278.6 | 188.8 | 223.6 | 128.0 |
+| 100,000 | 551.7 (×2) | 551.7 (×4) | 378.9 (×4) | 441.9 (×4) | 227.3 (×4) |
+
+(10k and 50k: one run per cell.) The branch's data-structure changes did not
+alter the footprint against `main` (551.7 vs 551.7); the difference is the
+allocator. 100K live-allocation floor: 280.4 MiB f32 / 170.2 MiB int8, so the
+allocator overhead is 271 MiB with `DebugAllocator`, 98 MiB with
+`smp_allocator`.
+
+*Why the allocator.* In ReleaseFast, `DebugAllocator`'s `safety` option
+(default `std.debug.runtime_safety`) is off: there is no leak check and no
+per-allocation metadata, and what remains is a mutex, power-of-two size classes
+(a 264 B neighbour list takes a 512 B slot) and page retention.
+`std.heap.smp_allocator` is pure Zig and thread-safe. Interleaved, 100K f32:
+user CPU 19.5 vs 20.8 s (one set) and 22.3 vs 23.9 s (3-round medians), system
+CPU 0.65 vs 3.28 s; i8: 14.8 vs 16.5 s. No speed regression. `c_allocator`
+(libc `malloc`) was built into the benchmark flag but not measured, since
+routing through libc conflicts with the zero-libc-wrapper principle.
+
+*Change made:* `src/main.zig` uses `DebugAllocator` only in Debug and
+ReleaseSafe (leak checking kept where it works) and `smp_allocator` in
+ReleaseFast/ReleaseSmall. The unit tests use `std.testing.allocator` and are
+unaffected. **Status against < 500 MB:** 378.9 MiB with this change (397 MB
+decimal), 551.7 MiB without it. Not measured: `mem3 serve` RSS under real
+traffic, durable mode, consolidation.
+
+**Not verified.** x86_64/Linux (graph fingerprint pins exist for aarch64 only;
+the parallel path has only been run on macOS aarch64, so the memory ordering of
+the striped locks has not been exercised on a weaker-ordered or different
+scheduler); a genuinely idle host (`ru_maxrss` vs footprint equality at 100K
+was seen once, not as a rule); `Store`-level int8 re-ranking; 8-thread wall time
+when fewer than 8 cores are free (the 10.4–19.9 s range is the evidence that it
+degrades, not a model of how much).
 
 ### 2. LongMemEval — 0.729 core / 0.708 padded (offline), against a ≥80% target
 

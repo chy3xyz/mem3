@@ -38,21 +38,32 @@ zig-out/bin/mem3` lists exactly one library, `libSystem`.
 
 ### How much memory it actually takes
 
-This is whole-process **peak RSS** (`getrusage` `ru_maxrss`) for a store filled
-through `Store.addRaw` and still resident in memory. Each row is one process,
-one scale, measured on an Apple M1 Pro (arm64, macOS 26.6.2), `-Doptimize=ReleaseFast`,
-on an otherwise idle host.
+The figure is the whole-process **peak memory footprint** that macOS reports
+for a store filled through `Store.addRaw` and still resident in memory
+(`peak memory footprint` in `/usr/bin/time -l`; it counts compressed and
+swapped pages, unlike `ru_maxrss`, see the host caveat below). Each cell of the
+table is one process at one scale, measured on an Apple M1 Pro (arm64, macOS
+26.6.2), `-Doptimize=ReleaseFast`, re-measured 2026-10-22 on `p2/hnsw2`
+(the previous table, 687.6 MB at 100K, predates the HNSW rework and is
+superseded).
 
-| Cells | Peak RSS | of which HNSW vectors + edge IDs | marginal cost per cell |
-|---|---|---|---|
-| 1,000 | 26.1 MB | 1.7 MB | — |
-| 2,000 | 53.2 MB | 3.4 MB | 27.7 KB |
-| **3,000** | **79.4 MB** | 5.2 MB | 26.8 KB |
-| 5,000 | 132.8 MB | 8.6 MB | 27.4 KB |
-| 10,000 | 266.9 MB | 17.2 MB | 27.5 KB |
-| 20,000 | 405.4 MB | 34.3 MB | 14.2 KB |
-| 50,000 | 695.0 MB | 85.9 MB | 9.9 KB |
-| 100,000 | 687.6 MB | 171.7 MB | −0.2 KB |
+| Cells | `main` as shipped (f32, `DebugAllocator`) | f32, `smp_allocator` | int8 vectors, `DebugAllocator` | int8 vectors, `smp_allocator` |
+|---|---|---|---|---|
+| 10,000 | 61.0 MB | 46.3 MB | 49.9 MB | 37.6 MB |
+| 50,000 | 278.6 MB | 188.8 MB | 223.6 MB | 128.0 MB |
+| 100,000 | **551.7 MB** (6 runs, all 551.7) | **378.9 MB** (4 runs, all 378.9) | 441.9 MB (4 runs) | 227.3 MB (4 runs) |
+
+"MB" in this section is MiB (1,048,576 B), the unit the benchmark's own
+`met_target` uses; in decimal MB every figure is 4.9% larger and every verdict
+below is unchanged.
+
+Against the < 500 MB target: the allocator the shipped binary used
+(`DebugAllocator`) is **551.7 MB, a miss by 10%**. With `std.heap.smp_allocator`
+(now what a ReleaseFast/ReleaseSmall `mem3` uses, see the Allocator bullet) f32
+vectors are **378.9 MB**, under the target. int8 vector storage (off by
+default, 0.6–1.2 pt recall@10 loss) is not needed to meet it. "Met" here means
+`mem3-bench footprint --cells=100000 --allocator=smp`; the `mem3 serve` daemon's
+RSS was not measured.
 
 **The conditions these numbers carry.** An RSS figure without them is not a
 measurement, so they are stated rather than implied — the benchmark also emits
@@ -68,56 +79,45 @@ them as a `conditions` object in its own JSON:
   decay sweep. A long-running daemon that also holds abstracts is larger.
 - **WAL: none.** `data_dir = null`, so the WAL contributes 0 bytes to RSS and 0
   to disk. No snapshot is taken.
-- **Allocator: `std.heap.DebugAllocator(.{ .thread_safe = true })`** — the same
-  allocator the shipped `mem3` binary uses, so this is not a bench-harness
-  artifact. It does carry per-allocation debug metadata and caches freed pages
-  rather than returning them, which is what makes the marginal cost collapse
-  above 20K cells. Do not read the flattening as a property of the data model.
+- **Allocator: stated per column.** `DebugAllocator(.{ .thread_safe = true })`
+  is what `main.zig` used before 2026-10-22 and still uses in Debug and
+  ReleaseSafe builds. In ReleaseFast its safety checks (and with them leak
+  detection) are compiled out, but it keeps power-of-two size classes (a 264 B
+  neighbour list occupies a 512 B slot) and a mutex. `smp_allocator` is pure
+  Zig, thread-safe, and is what a ReleaseFast/ReleaseSmall `mem3` now uses.
+  Same workload, same user CPU within noise (f32: 19.5 s vs 20.8 s, 22.3 s vs
+  23.9 s in two interleaved sets), 80% less system CPU.
 - **Not measured here:** on-disk footprint, durable/WAL mode, `--embedder-cmd`,
   and steady-state RSS of a consolidating daemon. Those are different numbers.
 
-Reproduce any row:
+Reproduce any cell:
 
 ```bash
 zig build -Doptimize=ReleaseFast
-/usr/bin/time -l ./zig-out/bin/mem3-bench footprint --cells=10000
+/usr/bin/time -l ./zig-out/bin/mem3-bench footprint --cells=100000 --allocator=smp
+#   --allocator=debug|smp|c   which allocator the Store runs on (default debug)
+#   --int8                    int8 vector storage
 ```
 
-Use the external `/usr/bin/time -l` figure, not the benchmark's self-report.
-On a memory-pressured host macOS purges and compresses pages, and in-process
-`ru_maxrss` then reads **low** — this measurement was caught reporting 71.7 MB
-for a store whose vectors alone are 73.2 MB, which is impossible. Under load
-the in-process and external readings diverged by as much as 4×. On an idle host
-the two agree exactly and repeated runs are bit-identical; every row above was
-checked for that agreement. Treat any RSS number taken on a busy host as
-unverified.
+Read `peak memory footprint` from `time -l`, not the benchmark's self-report and
+not `maximum resident set size`. On this host (swap 15–20 GB in use the whole
+time) macOS compresses and swaps pages, and `ru_maxrss` reads **low**: the same
+100K `DebugAllocator` run read 551.75 MB once (equal to the footprint, so the
+footprint is the real peak) and 311–318 MB in most other runs, and
+f32 `smp_allocator` read 135–258 MB against a 378.9 MB footprint. In-process
+`ru_maxrss` was lower still. The footprint was identical to four digits in
+every repeat. **No RSS-based row is claimed**: a quiet, un-swapped host was not
+available, so whether `ru_maxrss` would equal the footprint there was not
+re-verified (it did once, on this host, for the 551.7 MB case).
 
-Two honest readings of the table:
-
-1. **64 MB holds 2,000 cells and does not hold 3,000.** The crossover sits
-   between those two points, and it stayed there across every replicate taken
-   while this was measured — 3,000 cells was never observed below 67.6 MB.
-2. **100K cells is 687.6 MB, which misses the project's own < 500 MB
-   target** recorded in `AGENTS.md`. That row was previously marked UNVERIFIED;
-   it is now measured, and the answer is a miss, not a pass. Repeated
-   measurements of the 100K point ranged from 608.7 MB to 1,644.6 MB on a
-   loaded host; every single one exceeded 500 MB, so the miss does not depend on
-   which run you believe.
-
-**Update after the HNSW rework (2026-10-21, loaded host).** The table above
-is the older idle-host measurement and has not been re-taken. On a loaded host
-RSS was unusable: at 100k cells `/usr/bin/time -l` read 426 / 991 / 2,768 MB for
-`main` and 331 / 337 / 579 MB for the branch, so **nothing is claimed about the
-< 500 MB target**. What can be stated is the deterministic live-allocation count
-(`mem3-bench footprint` now reports it from a counting allocator; it excludes
-allocator overhead, so it is a lower bound on RSS): at 100k cells **~3,013 B/cell
-(301 MB) on `main`, ~2,940 B/cell (294 MB) on the branch, ~1,784 B/cell (178 MB)
-with the optional int8 vector storage**. Of the ~2,926 B/cell on the branch at
-10k cells, 1,573 are the vector arena, ~520 the BM25 posting lists, ~340 the
-cells and their strings, 257 the layer-0 neighbour lists. The ~27 KB/cell
-marginal figure above is therefore mostly allocator page caching and macOS RSS
-behaviour, not live data. Full tables and method:
-[`docs/roadmap.md`](docs/roadmap.md), "1a. HNSW rework".
+Deterministic live-allocation count (`mem3-bench footprint` reports it from a
+counting allocator; it excludes allocator overhead): at 100K cells **~2,940
+B/cell (280 MB) f32, ~1,784 B/cell (170 MB) int8**. Of the ~2,926 B/cell at 10K
+cells, 1,573 are the vector arena, ~520 the BM25 posting lists, ~340 the cells
+and their strings, 257 the layer-0 neighbour lists. The footprint minus that
+floor is allocator overhead: 271 MB for `DebugAllocator` at 100K f32, 98 MB for
+`smp_allocator`. Full tables and method:
+[`docs/roadmap.md`](docs/roadmap.md), "1b".
 
 This is early software. It has no external users, no published benchmarks, and
 several known gaps listed under [Status and limitations](#status-and-limitations).
@@ -748,7 +748,7 @@ Because `zig build test` re-runs are served from the build cache and report gree
 without re-executing, drive the roots directly when you need a real count:
 
 ```bash
-zig test --dep mem3 -Mroot=src/main.zig  -Mmem3=src/lib.zig   # -> All 421 tests passed.
+zig test --dep mem3 -Mroot=src/main.zig  -Mmem3=src/lib.zig   # -> All 441 tests passed.
 zig test --dep mem3 -Mroot=tests/main.zig -Mmem3=src/lib.zig   # -> All 120 tests passed.
 zig test --dep mem3 -Mroot=tests/constitution/main.zig -Mmem3=src/lib.zig  # -> All 12 tests passed.
 ```
@@ -862,6 +862,17 @@ Known and measured, not discovered after the fact:
   Note also that `abstracts` per pass sits flat at 155 from 5k cells onward —
   that is a property of the harness's 5-topic synthetic corpus saturating, not
   evidence of convergence.
+- **HNSW build of 100K vectors (< 30 s target): met only with 8 build threads
+  and construction-time int8 distances** (`HNSW.insertBatch`,
+  `mem3-bench hnsw-build --threads=8 --build-quant`: 13.3 s median, 10.4–19.9
+  over 3 interleaved rounds, `met_target: true`, 10-core M1 Pro). The path the
+  live store uses (one-at-a-time `insert`, one thread) is not that: `main` took
+  142.6 s median (123.7–189.7) in the same rounds, and one thread with
+  `--build-quant` 62.2 s (57.2–71.9). The parallel graph is not reproducible
+  run to run; recall@10 stayed within 0.5 pt of the single-thread build at
+  10k and 30k. Not exposed on the CLI; `Store` takes `hnsw_build_threads` /
+  `hnsw_build_quant` for snapshot restore. x86_64/Linux not run. Details:
+  `docs/roadmap.md`, "1b".
 - **`mem3 bench` is a fast in-process smoke suite, not the gate.** It is
   implemented (600 cells, 200 hyperedges, in-memory, finishes in ~0.6 s
   optimised). The release-blocking constitutional gates are `zig build bench`.
