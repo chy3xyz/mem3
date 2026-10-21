@@ -404,7 +404,7 @@ section "Not verified by this script"
 # reader does not mistake silence for coverage.
 NOT_VERIFIED=$(cat <<'EOF'
 [
-  {"item":"Linux runtime behaviour","why":"Cross-compilation proves the source builds for Linux. Nothing here executes it: this host has no Linux environment and no qemu, so every Linux claim in this repository is a compile-time claim only."},
+  {"item":"Linux runtime behaviour","why":"Cross-compilation proves the source builds for Linux. This script never executes the result. A one-off run of the test suite in Ubuntu 24.04 containers (aarch64 native, x86_64 under Rosetta) is recorded in the README section 'Continuous integration'; it is not reproduced by this script, and no Linux GitHub runner has run CI yet."},
   {"item":"Windows","why":"Not a target. Constitution v1.1.0 (amendment 2026-10-14) narrowed Principle IV to macOS + Linux. Unsupported targets are refused at compile time with a stated reason rather than left to fail obscurely."},
   {"item":"Official LongMemEval score","why":"The published benchmark requires downloading a dataset and running an LLM judge. This project has zero external dependencies and no network access, so it is structurally unreachable. The `longmemeval` bench is an in-house proxy; its number is NOT comparable to any published result and must not be presented beside one."},
   {"item":"Line coverage","why":"spec.md SC-009 asks for >=80% line coverage on core modules. This project ships no coverage tooling (that would be an external dependency). The claim is therefore neither made nor met."},

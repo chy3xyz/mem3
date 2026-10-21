@@ -774,6 +774,77 @@ These are enforced conventions, not style preferences. Do not regress them:
    confirm `zig build test` exits non-zero — a green gate that cannot go red is
    worse than no gate.
 
+### Continuous integration
+
+`.github/workflows/ci.yml` defines three jobs. **No GitHub runner has executed it
+yet; nothing here says CI is green.** The table separates what was run on a
+developer machine (macOS arm64 host, 2026-10-21) from what is only written.
+
+| Job | What it does |
+|---|---|
+| `build-and-test` (matrix: `ubuntu-latest` x86_64, `ubuntu-24.04-arm` aarch64, `macos-latest` arm64) | pinned-toolchain check, `zig build`, `scripts/check_linked_libs.sh` (Linux `ldd` / macOS `otool -L` allow-list, Constitution IV) on every installed executable, `zig build test`, `zig build check-constitution`, `zig build test -Doptimize=ReleaseFast` (**continue-on-error**: the `platform.clock.Timer` defect under "Known misses"; failures are annotated, not hidden), `zig build bench` smoke (never a gate), clean-working-tree check, and the "gate can go red" guard |
+| `cross-compile` (matrix: `x86_64-linux-gnu`, `aarch64-linux-gnu`, `x86_64-macos`, `aarch64-macos`) | whole project in Debug and ReleaseFast, artifact-format check with `file`, and `zig test --test-no-exec` of all three test roots. Compile-only |
+| `unsupported-targets` | `-Dtarget=x86_64-windows`, `wasm32-wasi`, `wasm32-freestanding` must fail **and** print the documented refusal (`mem3 supports macOS and Linux only`) |
+
+**Validated locally** (the shell of each step was extracted from the YAML and run
+by a small harness; Linux runs used Ubuntu 24.04 containers under OrbStack with
+the official Zig 0.17.0 tarball, sha256-checked):
+
+- YAML parses; `actionlint` 1.7.12 with `shellcheck` 0.11.0 reports nothing for
+  `ci.yml`; `shellcheck` is clean on `scripts/check_linked_libs.sh`.
+- `scripts/check_linked_libs.sh --self-test`: 23 cases (good and bad `ldd` and
+  `otool` output, prefix traps such as `libcrypto` vs `libc`, `not found`,
+  tool exiting non-zero, empty output, missing binary). Breaking the allow-list
+  turns it red (5 and 4 failing cases for the Linux and macOS mutations). Real
+  `otool -L` on macOS, and real `ldd` from aarch64 and x86_64 Ubuntu 24.04, accept
+  all 8 installed executables; x86_64 also lists `libm`/`libpthread`, both allowed.
+- `build-and-test` steps, in order, on macOS arm64 (fresh clone) and on Linux
+  aarch64 (container): everything passed except the two expected items — the
+  ReleaseFast test step (macOS: 550/551, only `Timer measures a non-zero,
+  monotonic duration`; **Linux aarch64: 551/551, the fold did not reproduce**) and
+  the Linux `zig build test` race below. The gate-can-go-red guard went red on
+  both. `python3 scripts/mcp_conformance.py` passes on both (and 56/56 on x86_64).
+- `cross-compile` commands: all four targets built in Debug and ReleaseFast;
+  `file` output matched the expected format for all eight artifacts under
+  macOS `file` and Ubuntu's `file` 5.45; the test roots compiled for all four.
+- `unsupported-targets`: all three targets fail with the documented message;
+  substituting a bogus target makes the step go red.
+- x86_64 Linux was **executed** only through a cross-build (Debug mem3 and the three
+  test roots built on the Mac) run under Rosetta in an `amd64` container, because
+  Zig itself does not start under Rosetta (`bss_size overflow`). Results: 120/120 and
+  12/12 on `tests/main.zig` and the constitution root after the fix below;
+  `src/main.zig` 428 passed / 3 skipped (the pinned HNSW fingerprint tests skip by
+  design) with the embedder race failing intermittently.
+
+**Written but not run anywhere:** the GitHub-hosted runners themselves
+(`ubuntu-24.04-arm`, `macos-latest`), `mlugg/setup-zig@v2` and its cache, the
+`concurrency` block, `$GITHUB_STEP_SUMMARY` rendering and `::warning`
+annotations, and the `x86_64-macos` binary (compile-only; no Intel runner and no
+Intel Mac). No qemu was installed or used; the only emulation was Rosetta.
+
+**What the first Linux runs found** (the suite had only ever been cross-compiled
+for Linux before):
+
+1. `src/storage/wal.zig` test called `std.c.fstat`; `std.c.Stat` is `void` on Linux,
+   so the whole `src/main.zig` test binary did not compile there. Fixed (the test
+   now reads through `platform/fs`).
+2. `tests/unit/cli.zig` used `expectEqual` on two string slices (pointer
+   comparison); it failed on x86_64 Debug builds. Fixed (`expectEqualStrings`).
+3. **Not fixed:** `ExternalEmbedder: a backend that dies mid-request is
+   BackendExited` is a race in `src/retrieval/embedder.zig`. When the backend
+   exits between the liveness check and the pipe write, `embed` sees `EPIPE`,
+   re-checks `waitpid(WNOHANG)`, and the child — its pipes already closed but not yet
+   reapable — still looks alive, so it returns `WriteFailed` instead of
+   `BackendExited`. Measured over 200 runs of that test alone: Linux aarch64
+   111/200 (Debug) and 120/200 (ReleaseFast) failed, Linux x86_64 76/200, macOS
+   arm64 4/200. A Linux `zig build test` will therefore fail on most runs until
+   `embed` waits a bounded time for the child after `EPIPE`. This is a `src/`
+   behaviour change, outside what this CI work was allowed to touch.
+
+The `scripts/verify.sh` "Linux runtime behaviour" caveat still holds for that
+script itself (it only cross-compiles); the container runs above are a one-off,
+recorded here, not something `verify.sh` reproduces.
+
 ## Status and limitations
 
 Known and measured, not discovered after the fact:
@@ -932,9 +1003,11 @@ What remains is an architecture-specific non-foldable counter — `rdtsc` on
 x86_64, `cntvct_el0` on aarch64 — read through inline `asm volatile` with an
 output operand, which LLVM cannot fold by construction. That is a real change to
 the platform layer that every benchmark depends on, and **it has not been
-written**: it cannot be validated on Linux from this machine (no qemu, no
-container, no Linux host), and shipping an unverified timing primitive would be
-worse than the bug, because it would fail silently in the same way.
+written**. A Linux container turned out to be available (see "Continuous
+integration"), and in it the fold did not reproduce on aarch64
+(`-Doptimize=ReleaseFast` test run: 551/551, versus 550/551 on macOS arm64);
+Linux x86_64 is unmeasured. Shipping an unverified timing primitive would still
+be worse than the bug, because it would fail silently in the same way.
 
 **Write throughput meets its amended target; the old 10,000 figure did not.**
 The release target is now 1,750 cells/sec sustained, judged on the

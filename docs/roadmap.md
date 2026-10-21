@@ -513,9 +513,14 @@ raw text. See `scripts/embedder_adapter_example.py`.
   clobber, `@call(.never_inline)`, function-pointer indirection, and
   `mach_absolute_time` — and all four still fold. The remaining approach is a
   per-architecture non-foldable cycle counter through inline asm (`rdtsc` /
-  `cntvct_el0`), which is **not written** because it cannot be validated on
-  Linux from this machine. Until then, treat min/tail-percentile latencies as
-  unreliable and report p50.
+  `cntvct_el0`), which is **not written**. Update 2026-10-21: a Linux
+  container is available after all (OrbStack), and in it the fold did **not**
+  reproduce on aarch64 — `zig build test -Doptimize=ReleaseFast` passed 551/551
+  there, while the same command on macOS arm64 fails exactly the Timer test
+  (550/551). So the defect is at least macOS-specific as measured; Linux x86_64
+  is unmeasured. CI runs the ReleaseFast test step as `continue-on-error` for
+  this reason. Until then, treat min/tail-percentile latencies as unreliable and
+  report p50.
 - **Snapshot restore now rebuilds the vector index** (fixed 2026-10-15).
   `Store.loadSnapshot` restored `addCell` + `cell_index.put` but never
   `hnsw.insert`, and `sync` is snapshot-and-truncate: `takeSnapshot` unlinks
