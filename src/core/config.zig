@@ -3,6 +3,9 @@
 const std = @import("std");
 
 /// All thresholds / parameters. CLI flags override these.
+/// Which predicates may supersede an older cell. See `Config.supersede_mode`.
+pub const SupersedeMode = enum { off, functional, all };
+
 pub const Config = struct {
     /// How the HNSW index stores the vectors it scores against.
     pub const VectorStorage = enum {
@@ -88,6 +91,31 @@ pub const Config = struct {
     consolidation_threshold: f32 = 0.75,
     forgetting_threshold: f32 = 0.1,
     consolidation_min_cluster: usize = 3,
+    /// Near-duplicate floor for the forgetting sweep's redundancy term:
+    /// Jaccard similarity of two cells' exact token sets (episode + facts)
+    /// below this contributes nothing. See docs/adr/0005-existence-gain-forgetting.md.
+    redundancy_threshold: f32 = 0.7,
+    /// Write-time and sweep-time PCR conflict resolution: which predicates may
+    /// mark an older cell `superseded_at`. Never deletes anything.
+    ///   * `functional` (default): only predicates on the single-valued list
+    ///     (see `functional_predicates`). Everything else is multi-valued and
+    ///     can never supersede or score as a conflict.
+    ///   * `all`: every (subject, predicate) is single-valued. The first
+    ///     heuristic, kept as an explicit opt-in; it hides "likes tea" behind
+    ///     "likes coffee".
+    ///   * `off`: no supersession at all.
+    supersede_mode: SupersedeMode = .functional,
+    /// Comma-separated predicates that count as single-valued in `functional`
+    /// mode. `null` is the built-in list (`memory/conflict.zig`,
+    /// ADR 0005). A plain list REPLACES the built-in one; a list starting with
+    /// `+` extends it. A trailing `*` is a prefix match (`current_*`). Borrowed:
+    /// it must outlive the Config (`Store.setFunctionalPredicates` copies).
+    functional_predicates: ?[]const u8 = null,
+    /// Most Jaccard evaluations the duplicate pass spends on one cell (see
+    /// `memory/redundancy.zig`). Bounds a sweep at O(n * this) on a corpus
+    /// where every pair is similar; costs only missed duplicates, never
+    /// wrongly forgotten cells.
+    redundancy_max_candidates: u32 = 256,
 
     // Decay rates — constitution asymmetry: λ_m > λ_f > λ_s
     decay_rate_matter: f32 = 0.05,

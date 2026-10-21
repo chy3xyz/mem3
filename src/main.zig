@@ -15,6 +15,7 @@
 //! - `inspect`   — show one MemCell + its hypergraph neighborhood
 //! - `consolidate` — run the consolidation pipeline
 //! - `forget`    — run the existence-gain-driven forgetting sweep
+//! - `unsupersede` — restore a cell a newer fact wrongly superseded
 //! - `serve`     — start the HTTP daemon
 //! - `mcp`       — serve the Model Context Protocol over stdio
 //! - `bench`     — run performance benchmarks
@@ -61,6 +62,8 @@ comptime {
     _ = @import("store/store.zig");
     _ = @import("memory/encoder.zig");
     _ = @import("memory/forgetter.zig");
+    _ = @import("memory/conflict.zig");
+    _ = @import("memory/redundancy.zig");
     _ = @import("memory/lifecycle.zig");
     _ = @import("storage/wal.zig");
     // `snapshot.zig` carries the durability round-trip test but was not
@@ -219,6 +222,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         .inspect => @import("cli_commands/inspect.zig").run(alloc, parsed),
         .consolidate => @import("cli_commands/consolidate.zig").run(alloc, parsed),
         .forget => @import("cli_commands/forget.zig").run(alloc, parsed),
+        .unsupersede => @import("cli_commands/unsupersede.zig").run(alloc, parsed),
         .serve => @import("cli_commands/serve.zig").run(alloc, parsed),
         .bench => @import("cli_commands/bench.zig").run(alloc, parsed),
         .mcp => @import("cli_commands/mcp.zig").run(alloc, parsed),

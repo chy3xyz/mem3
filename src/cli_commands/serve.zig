@@ -3,6 +3,7 @@
 
 const std = @import("std");
 const cli = @import("../cli.zig");
+const cli_common = @import("cli_common.zig");
 const server = @import("../server/http_server.zig");
 const signal = @import("../platform/signal.zig");
 const platform_stdio = @import("../platform/stdio.zig");
@@ -123,6 +124,7 @@ pub fn run(alloc: std.mem.Allocator, p: cli.Parsed) !void {
         std.process.exit(1);
     };
     defer srv.deinit();
+    try cli_common.applySupersedePolicy(srv.store, p);
 
     // SIGINT/SIGTERM become a graceful stop: `serve` returns, having
     // refused new connections, drained in-flight ones and flushed the WAL.

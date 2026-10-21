@@ -261,10 +261,14 @@ hyperedge added: id=8 type=causal nodes=2
 consolidate: abstracts_created=0
   cells: 3 -> 3
 forget: dry_run=false
-  fuzzied: 0
-  kept:    3
-  active:  3
-  fuzzy:   0
+  fuzzied:    0
+    decayed:    0
+    redundant:  0
+    conflicted: 0
+  superseded: 0 (newly marked, not deleted)
+  kept:       3
+  active:     3
+  fuzzy:      0
 ```
 
 Run the HTTP daemon:
@@ -338,8 +342,80 @@ HTTP `POST /api/memcells` body (`"foresight":[{"description":..,"valid_from":..,
 (`"foresight":["desc|from|until|conf"]`).
 
 `query` flags: `--topk` (`-k`, default 10), `--source-filter` (comma-separated
-sources), `--goal-ids` (comma-separated ids). With `--json` it prints
-`{"query":[ids...],"count":N}`.
+sources), `--goal-ids` (comma-separated ids), `--include-superseded` (see
+[Forgetting and supersession](#forgetting-and-supersession)). With `--json` it
+prints `{"query":[ids...],"count":N}`.
+
+### Forgetting and supersession
+
+`mem3 forget [--dry-run] [--json]` runs the sweep. A cell moves to the fuzzy
+store (never deleted) when it has **decayed** (`importance × exp(−decay × age)
+< 0.1`, the original rule) or when
+`net_existence = importance − redundancy − conflict_score < 0`:
+
+- **redundancy** — a more important cell of the same source, goals, facts and
+  foresight already says it: exact token-set Jaccard ≥ 0.7, scaled up to the
+  cell's own `importance + 0.1`. An exact duplicate is always forgotten; a
+  near-duplicate has its net existence lowered and is forgotten only above
+  roughly 0.96 similarity at typical importance. The first cell of a group is
+  never forgotten for redundancy.
+- **conflict** — a newer cell has the same subject and a *single-valued*
+  predicate with a different object, for *every* fact of the older cell (see
+  below for which predicates). The older cell is marked `superseded_at` /
+  `superseded_by` (never deleted); it is forgotten only if the superseder is
+  more important.
+
+The output reports the count per reason (`decayed`, `redundant`, `conflicted`),
+`superseded` (cells newly marked by the sweep), `kept`, `active`, `fuzzy`;
+`--json` keeps `dry_run`, `fuzzied`, `kept`, `active`, `fuzzy` and adds
+`reasons{decayed,redundant,conflicted}` and `superseded`. Definitions,
+deviations from the spec, and measurements: [`docs/adr/0005-existence-gain-forgetting.md`](docs/adr/0005-existence-gain-forgetting.md).
+
+Supersession happens when a cell is **added**, and it is reported: `mem3 add`
+prints `added memory id=7 (superseded: 4 [lives_in]; undo with mem3 unsupersede
+<id>)`, and with `--json` (also the HTTP `POST /api/memcells` response and the
+MCP `memory_add` result) `{"id":7,"superseded":[{"id":4,"subject":"user",
+"predicate":"lives_in"}]}`: which cells, on which predicate. A superseded cell is
+history, not an answer: it is left out of `query` unless you pass
+`--include-superseded` (HTTP body `"includeSuperseded":true`, MCP
+`include_superseded`).
+
+**Which predicates supersede.** By default only a short list of single-valued
+predicates: `lives_in`, `resides_in`, `located_in`, `works_at`, `employed_by`,
+`has_status`, `status`, `version`, `name`, `email`, `owner`, `born_in`,
+`birthday` and `current_*`. Everything else (`likes`, `knows`, `uses`, `is`,
+...) is treated as multi-valued: a second value never hides the first. A cell
+that also asserts a multi-valued fact is never hidden. Choose with
+`--supersede=functional|all|off` (default `functional`; `--no-supersede` is
+`off`; `all` treats *every* predicate as single-valued and hides "likes tea"
+behind "likes coffee") and replace the list with
+`--functional-predicates=a,b,c` (`+a,b` extends it, a trailing `*` is a prefix).
+Both apply to `add`, `forget`, `serve` and `mcp` for that process. The cost: a
+genuinely single-valued predicate that is *not* on the list (`shoe_size`) is no
+longer superseded automatically; both values stay visible.
+
+`mem3 unsupersede <id>` (MCP `memory_unsupersede`) undoes a wrong supersession:
+the cell is current again and pinned so a later write or sweep does not
+supersede it a second time. It is journaled first, and works on a cell that was
+already forgotten into the fuzzy store. An unknown id or a cell that is not
+superseded exits non-zero.
+
+`mem3 inspect <id>` prints `is_fuzzy`, `superseded_at`, `superseded_by`,
+`supersede_pinned` and `supersedes` (the ids this cell replaced), and also finds
+cells that have been forgotten. `mem3 dump` carries `superseded_at` /
+`superseded_by` / `supersede_pinned` on every line;
+`mem3 dump --include-fuzzy` appends the forgotten cells too.
+`--include-superseded` and `--include-fuzzy` are valueless switches (they do not
+swallow the next argument).
+
+> **Known weak spots.** (1) A *listed* predicate that is multi-valued in your
+> data (two jobs under `works_at`, several `email`s) will still hide an earlier
+> value; the add reports it and `unsupersede` undoes it, or drop the predicate
+> with `--functional-predicates`. (2) Single-valued predicates not on the list
+> are not superseded (row (c) of the evaluation in the ADR: the old value ranked
+> first in 39 of 60 queries). The first cut, which treated every predicate as
+> single-valued, wrongly superseded 120 of 180 multi-valued cells in the
+> synthetic evaluation and is now `--supersede=all`.
 
 Global flags: `--json`, `--data-dir=<path>` (default `data`), `--log-format=human|jsonl|silent`,
 `--log-every=<seconds>`, `--wal-sync=always|group|interval:<ms>`,
@@ -365,8 +441,8 @@ seconds; `--log-format=silent` also suppresses the startup banner.
 `serve` flags: `--port=<n>` (default 7777), `--bind=<addr>` (default 127.0.0.1).
 
 `mcp` speaks JSON-RPC 2.0 over stdin/stdout, one message per line, and exposes
-five tools: `memory_add`, `memory_query`, `goal_list`, `memory_forget`,
-`memory_stats`. `memory_forget` defaults to `dry_run: true`. It is hand-written
+six tools: `memory_add`, `memory_query`, `goal_list`, `memory_forget`,
+`memory_stats`, `memory_unsupersede`. `memory_forget` defaults to `dry_run: true`. It is hand-written
 against the std library — the zero-dependency rule is not relaxed here. Point an
 MCP client at it with:
 

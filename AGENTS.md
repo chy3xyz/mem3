@@ -15,7 +15,7 @@
 | Theory | 三源合恰论 (物/象/性) + GHW 范式 (Goal/Harness/World) |
 | Spec-kit | Initialized; spec at `specs/001-trisource-everos-mvp/` |
 | Platforms | **macOS and Linux only** — Windows and WASM refused at compile time (see [Platforms](#platforms)) |
-| Status | **v0.1.0-alpha** (CLI + MCP + persistence + 507 tests + 12 constitution invariants, all measured). All 7 constitutional principles active. |
+| Status | **v0.1.0-alpha** (CLI + MCP + persistence + 623 tests + 12 constitution invariants, all measured). All 7 constitutional principles active. |
 
 ## Read Order for New Agents
 
@@ -68,7 +68,9 @@ src/
 ├── ghw/                      # GHW L2: goal_tree, goal_node, harness_registry, world_model
 ├── memory/                   # GHW L3: tri_source_manager, lifecycle, encoder, consolidator,
 │                             #   cluster_index (incremental single-linkage state),
-│                             #   forgetter, fuzzy, coherence
+│                             #   forgetter (net_existence sweep), conflict (subject+predicate
+│                             #   supersession index), redundancy (prefix-filter duplicate
+│                             #   pass), fuzzy, coherence
 ├── hypermem/                 # GHW L4: engine, hyperedge, multi_hop, msg_passing, graph_index
 ├── retrieval/                # GHW L4: hnsw, kv_index, keyword, hybrid_retriever, reranker,
 │                             #   embedder
@@ -100,11 +102,15 @@ src/
 
 tests/
 ├── main.zig                  # Master test runner (comptime-imports everything)
-├── unit/                     # cli, coherence, consolidator, consolidator_incremental, hnsw
+├── unit/                     # cli, coherence, consolidator, consolidator_incremental, hnsw,
+│                             #   forgetting_netexistence (redundancy / conflict / determinism / oracle),
+│                             #   supersede_policy (which predicates may supersede: functional / all / off / custom)
 ├── integration/
 │   ├── store_persistence_e2e.zig   # insert, goal, snapshot+replay, forget+restart, isolation
 │   ├── http_server_e2e.zig         # /healthz, POST+GET /api/memcells, restart preservation
-│   └── consolidate_incremental_e2e.zig  # Store-owned cache, forget tracking, abstract foresight via WAL
+│   ├── consolidate_incremental_e2e.zig  # Store-owned cache, forget tracking, abstract foresight via WAL
+│   └── supersede_e2e.zig           # supersession: WAL-only + snapshot restart, query exclusion, sweep repair, forget replay → fuzzy;
+│                                   #   single-/multi-valued/unknown-predicate scenarios; unsupersede via WAL, snapshot, fuzzy
 ├── property/                 # Randomized round-trip coverage
 │   ├── serializer_roundtrip.zig    # Fact slice, primitives, array of struct
 │   └── adjoint.zig                 # every encoded record decodes back; replay is idempotent
@@ -121,17 +127,17 @@ tests/
 | `mem3 goal` | ✅ | Add/list goals; default seeds (general/research/system); created goals are WAL-journaled |
 | `mem3 hyperedge` | ✅ | `add` / `list` / `multi-hop` |
 | `mem3 dump` | ✅ | JSONL export of the full store |
-| `mem3 inspect` | ✅ | MemCell + hypergraph neighborhood; emits valid JSON |
+| `mem3 inspect` | ✅ | MemCell + hypergraph neighborhood; emits valid JSON. Also finds forgotten (fuzzy) cells and shows `superseded_at` / `superseded_by` / `supersede_pinned` / `supersedes` |
 | `mem3 consolidate` | ✅ | HAC clustering, abstract generation, PCR preserved. Incremental across passes within one process (`Store` owns the cache); a fresh CLI process does one full O(n²) pass |
-| `mem3 forget` | ✅ | Existence-gain-driven forgetting sweep |
+| `mem3 forget` | ✅ | `net_existence = importance − redundancy − conflict_score` sweep (ADR 0005). Reports counts per reason: decayed / redundant / conflicted, plus newly superseded. `mem3 add` marks a cell `superseded_at` only when a newer fact contradicts it on a **single-valued predicate** (default list: `lives_in`, `works_at`, `status`, `name`, `email`, `owner`, `current_*`, ...; everything else is multi-valued and never supersedes; `--supersede=off|functional|all`, `--functional-predicates=a,b`) and *all* of the older cell's facts are contradicted; the add reports `superseded:[{id,subject,predicate}]`, `query` hides superseded cells unless `--include-superseded`, and `mem3 unsupersede <id>` undoes a wrong one (pinned against re-supersession; WAL-journaled). Unlisted single-valued predicates (`shoe_size`) are deliberately not superseded. Nothing is ever deleted; forgotten cells go to the fuzzy store |
 | `mem3 bench` | ✅ | Fast in-process smoke suite; the release gate is `zig build bench` |
 | `mem3 serve` | ✅ | HTTP daemon with /healthz /metrics /api/sync /api/memcells /api/memcells/:id |
-| `mem3 mcp` | ✅ | MCP server over stdio (JSON-RPC 2.0, hand-written, zero deps). 5 tools: `memory_add` / `memory_query` / `goal_list` / `memory_forget` / `memory_stats`. **Dual-era**: modern `2026-07-28` (per-request `_meta`, `resultType`, `server/discover`) and the legacy handshake, decided per request. Accepts JSON-RPC batches. Checked by `scripts/mcp_conformance.py` against the live binary. **Real-client evidence (2026-10-21, legacy `2025-11-25` handshake only)**: MCP Inspector CLI 2.11.0, Claude Code 2.1.289 and the Cursor CLI agent 2026.10.21 each ran `tools/list` + `memory_add` + `memory_query` + `memory_stats` cleanly; opencode 2.0.32 only handshake + `tools/list`. **Not verified**: the modern `2026-07-28` path against any real client, Claude Desktop, Cursor IDE, Codex, Gemini CLI. See `docs/mcp-hosts.md` |
+| `mem3 mcp` | ✅ | MCP server over stdio (JSON-RPC 2.0, hand-written, zero deps). 6 tools: `memory_add` / `memory_query` / `goal_list` / `memory_forget` / `memory_stats` / `memory_unsupersede`. **Dual-era**: modern `2026-07-28` (per-request `_meta`, `resultType`, `server/discover`) and the legacy handshake, decided per request. Accepts JSON-RPC batches. Checked by `scripts/mcp_conformance.py` against the live binary. **Real-client evidence (2026-10-21, legacy `2025-11-25` handshake only)**: MCP Inspector CLI 2.11.0, Claude Code 2.1.289 and the Cursor CLI agent 2026.10.21 each ran `tools/list` + `memory_add` + `memory_query` + `memory_stats` cleanly; opencode 2.0.32 only handshake + `tools/list`. **Not verified**: the modern `2026-07-28` path against any real client, Claude Desktop, Cursor IDE, Codex, Gemini CLI. See `docs/mcp-hosts.md` |
 | Embedding | ✅ | Built-in hashed lexer is the default and is byte-identical to pre-MCP builds. `--embedder-cmd` delegates to a long-lived external program over a line protocol (the "optional tier"); no new link dependency either way. Requests are **hex-encoded**, not raw text — see `scripts/embedder_adapter_example.py` |
 | Lexical arm | ✅ | `src/retrieval/bm25.zig`, Okapi BM25 over unigrams + bigrams, max-normalised inside the existing `λ_dense=0.5 / λ_sparse=0.2 / λ_graph=0.3` sum. Rebuilt from cells on snapshot restore, never serialised. Identifiers that live only in an `atomic_facts` triple went from 1/12 recall to 12/12 |
 | Persistence | ✅ | WAL-first + snapshot. WAL truncated on sync. `--wal-sync=always\|group\|interval:N` (default `always`, byte-identical); `interval` is weaker and documented as such. |
 | Daemon hygiene | ✅ | `serve`/`mcp` exit 0 on SIGINT/SIGTERM (`src/platform/signal.zig`: handler only stores an atomic; loops poll with a timeout). `--log-format`/`--log-every` feed `src/utils/logger.zig`; default is silent and byte-identical. JSONL goes to stderr only. |
-| Tests | ✅ | 551: 431 (`src/main.zig`-rooted) + 120 (`tests/main.zig`-rooted), plus 12 constitution invariants as a separate gate, 0 leaks |
+| Tests | ✅ | 623: 439 (`src/main.zig`-rooted) + 184 (`tests/main.zig`-rooted), plus 12 constitution invariants as a separate gate, 0 leaks |
 | Binary | ✅ | 963,704 bytes `ReleaseFast` / 4,569,032 bytes Debug, only links libSystem. The lexical arm added 49 KB ReleaseFast (+5.4%) over the 914,456 B measured before it |
 | Toolchain | ✅ | Pinned via `.zigversion` (Zig 0.17.0) |
 | Platforms | ✅ | macOS + Linux (x86_64 and aarch64). Windows/WASM refused at compile time — see [Platforms](#platforms) |
@@ -146,6 +152,19 @@ tests/
 7. **`zig build` never compiles the test roots, so a cross-compile can be green while the tests do not build on that target.** `std.c.Stat` is `void` on Linux (a test calling `std.c.fstat` broke the whole `src/main.zig` test binary there), and `testing.expectEqual` on two string slices compares *pointers* (fails on x86_64 Debug, whose self-hosted backend does not fold equal literals — use `expectEqualStrings`). Check any target with `zig test -target <t> --test-no-exec -femit-bin=/tmp/x --dep mem3 -Mroot=<root> -lc -Mmem3=src/lib.zig -lc`; CI's `cross-compile` job does this for all three roots.
 
 **Known limitations tracked for v0.2.1:**
+- Forgetting's conflict term only knows single-valued predicates from a short
+  list (or `--functional-predicates`). Default `functional` mode: on the
+  synthetic corpus in `mem3-forgetting-eval --mode=netex`, 0 of 180
+  multi-valued cells superseded or forgotten (asserted), 60/60 listed
+  contradictions superseded; the price is that 60/60 contradictions on an
+  *unlisted* single-valued predicate (`shoe_size`) are no longer superseded and
+  the old value ranks first in 39 of 60 queries. A *listed* predicate that is
+  multi-valued in real data (two jobs) still hides an earlier value;
+  `unsupersede` is the way back. `--supersede=all` is the old every-predicate
+  heuristic (120/180 multi-valued cells wrongly superseded). Near-duplicates are lowered, not
+  forgotten (only ~0.96+ similarity evicts). A snapshot written by this build
+  (format v3) is refused by older builds. See ADR 0005. The sweep's wall time on
+  a dense templated corpus is still superlinear at 20k cells (not profiled).
 - Foresight is durable (WAL + snapshot, CLI/HTTP/MCP) but not searchable: it is
   not embedded and not in the BM25 text, and a cell that names no goal still
   carries the synthetic goal id 0 beside it.
@@ -266,6 +285,7 @@ Located in `docs/adr/`. Read in order:
 - `0002-ghw-mapping.md` — formal mapping Goal↔性, Harness↔象, World↔物
 - `0003-hnsw-from-scratch.md` — why we don't use FAISS
 - `0004-wal-first-persistence.md` — why we don't use RocksDB
+- `0005-existence-gain-forgetting.md` — what redundancy and conflict_score *are*, supersession, snapshot v3, measured cost and false-positive rate
 
 ## Spec-Kit Quick Reference
 
@@ -290,7 +310,7 @@ The current spec-kit artifacts:
 ## Testing
 
 ```bash
-# All tests: 541 (421 src/main.zig-rooted + 120 tests/main.zig-rooted)
+# All tests: 623 (439 src/main.zig-rooted + 184 tests/main.zig-rooted)
 zig build test
 
 # Just the constitution invariants (12, separate root)
@@ -310,8 +330,8 @@ without re-executing**. When you need a count you can trust, drive the roots
 directly:
 
 ```bash
-zig test --dep mem3 -Mroot=src/main.zig  -Mmem3=src/lib.zig   # All 421 tests passed.
-zig test --dep mem3 -Mroot=tests/main.zig -Mmem3=src/lib.zig   # All 120 tests passed.
+zig test --dep mem3 -Mroot=src/main.zig  -Mmem3=src/lib.zig   # All 439 tests passed.
+zig test --dep mem3 -Mroot=tests/main.zig -Mmem3=src/lib.zig   # All 184 tests passed.
 zig test --dep mem3 -Mroot=tests/constitution/main.zig -Mmem3=src/lib.zig  # All 12 tests passed.
 ```
 
