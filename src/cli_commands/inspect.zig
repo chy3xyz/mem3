@@ -33,7 +33,10 @@ pub fn run(alloc: std.mem.Allocator, parsed: cli.Parsed) !void {
     }
     const id = target_id orelse cli_common.fatal("error: missing id (usage: mem3 inspect <id>)\n", .{});
 
-    const cell = store.getCell(id) orelse cli_common.fatal("error: id {d} not found\n", .{id});
+    // A forgotten cell is in the fuzzy store, not gone: `inspect` still shows
+    // it (with `is_fuzzy`), which is how a conflict-forgotten fact is audited.
+    const cell = store.getCell(id) orelse store.lc.fuzzy.cells.get(id) orelse
+        cli_common.fatal("error: id {d} not found\n", .{id});
 
     var buf = std.ArrayList(u8).empty;
     defer buf.deinit(alloc);
@@ -48,6 +51,35 @@ pub fn run(alloc: std.mem.Allocator, parsed: cli.Parsed) !void {
     try cli_common.appendFmt(&buf, alloc, ",\"decay_rate\":{d:.6}", .{cell.metadata.decay_rate});
     try cli_common.appendFmt(&buf, alloc, ",\"created_at\":{d}", .{cell.metadata.created_at});
     try cli_common.appendFmt(&buf, alloc, ",\"access_count\":{d}", .{cell.metadata.access_count});
+    try cli_common.appendFmt(&buf, alloc, ",\"is_fuzzy\":{}", .{cell.metadata.is_fuzzy});
+    // Supersession history: null while the cell is current.
+    if (cell.metadata.superseded_at) |at| {
+        try cli_common.appendFmt(&buf, alloc, ",\"superseded_at\":{d}", .{at});
+    } else {
+        try buf.appendSlice(alloc, ",\"superseded_at\":null");
+    }
+    if (cell.metadata.superseded_by) |by| {
+        try cli_common.appendFmt(&buf, alloc, ",\"superseded_by\":{d}", .{by});
+    } else {
+        try buf.appendSlice(alloc, ",\"superseded_by\":null");
+    }
+    // The cells this one replaced, found by scanning both stores: one
+    // inspect call, not a hot path, so no reverse index is kept for it.
+    try buf.appendSlice(alloc, ",\"supersedes\":[");
+    {
+        var ids: std.ArrayList(u64) = .empty;
+        defer ids.deinit(alloc);
+        var ait = store.cell_index.iterator();
+        while (ait.next()) |e| if (e.value_ptr.*.metadata.superseded_by == id) try ids.append(alloc, e.key_ptr.*);
+        var fit = store.lc.fuzzy.cells.iterator();
+        while (fit.next()) |e| if (e.value_ptr.*.metadata.superseded_by == id) try ids.append(alloc, e.key_ptr.*);
+        std.mem.sort(u64, ids.items, {}, std.sort.asc(u64));
+        for (ids.items, 0..) |sid, i| {
+            if (i > 0) try buf.append(alloc, ',');
+            try cli_common.appendFmt(&buf, alloc, "{d}", .{sid});
+        }
+    }
+    try buf.append(alloc, ']');
 
     // Find the hypergraph neighborhood if requested.
     //

@@ -624,7 +624,7 @@ test "sizeOf equals the encoded length: an array of slices, not len times the pr
 // Regression: the MemCell `location` data-loss bug
 // =============================================================================
 
-/// Mirrors `core.MemCell` field-for-field, including all thirteen
+/// Mirrors `core.MemCell` field-for-field, including all fourteen
 /// `core.Metadata` fields, so the exact production encoding is exercised.
 /// Declared here rather than imported so this module stays standalone
 /// (`zig test src/utils/serializer.zig`) and free of a dependency cycle
@@ -642,6 +642,7 @@ const MetaShape = struct {
     decay_rate: f32 = 0.01,
     is_fuzzy: bool = false,
     superseded_at: ?i64 = null,
+    superseded_by: ?u64 = null,
     fuzzed_at: ?i64 = null,
 };
 

@@ -22,6 +22,8 @@ comptime {
     _ = @import("unit/coherence.zig");
     _ = @import("unit/consolidator.zig");
     _ = @import("unit/consolidator_incremental.zig");
+    // net_existence = importance - redundancy - conflict_score (FR-010 / FR-015).
+    _ = @import("unit/forgetting_netexistence.zig");
     _ = @import("unit/hnsw.zig");
     // The CLI argument parser. Zero tests previously, across 223 lines of
     // hand-rolled flag handling; three real parser bugs were found the day
@@ -33,6 +35,7 @@ comptime {
     _ = @import("integration/store_persistence_e2e.zig");
     _ = @import("integration/http_server_e2e.zig");
     _ = @import("integration/consolidate_incremental_e2e.zig");
+    _ = @import("integration/supersede_e2e.zig");
     _ = @import("integration/daemon_lifecycle_e2e.zig");
 
     // Property-based tests — randomized round-trip coverage of the

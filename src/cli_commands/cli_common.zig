@@ -25,13 +25,15 @@ const platform_stdio = @import("../platform/stdio.zig");
 /// anything is indexed rather than halfway through.
 pub fn openStore(alloc: std.mem.Allocator, parsed: cli.Parsed) !*Store {
     const data_dir: ?[]const u8 = if (parsed.data_dir.len == 0) null else parsed.data_dir;
-    return Store.init(alloc, .{
+    const store = try Store.init(alloc, .{
         .data_dir = data_dir,
         .seed_default_goals = true,
         .embedder_cmd = parsed.embedder_cmd,
         .embedder_args = parsed.embedder_args.items,
         .wal_sync = parsed.wal_sync,
     });
+    if (hasSwitch(parsed, "--no-supersede")) store.setSupersedeOnConflict(false);
+    return store;
 }
 
 /// Print a complete line to stdout. Use this in place of
@@ -80,6 +82,21 @@ pub fn appendAll(buf: *std.ArrayList(u8), alloc: std.mem.Allocator, bytes: []con
 
 /// Append a formatted JSON value to `buf`. Used for assembling JSON
 /// documents incrementally without depending on `writer()`.
+/// A valueless switch such as `--include-superseded` or `--no-supersede`: present with no value,
+/// `=true`, or `=1`. `--flag=false` turns it off.
+pub fn hasSwitch(parsed: cli.Parsed, name: []const u8) bool {
+    var on = false;
+    for (parsed.args.items) |a| {
+        if (!std.mem.eql(u8, a.key, name)) continue;
+        const v = a.value orelse {
+            on = true;
+            continue;
+        };
+        on = std.mem.eql(u8, v, "true") or std.mem.eql(u8, v, "1");
+    }
+    return on;
+}
+
 pub fn appendFmt(buf: *std.ArrayList(u8), alloc: std.mem.Allocator, comptime fmt: []const u8, args: anytype) !void {
     var tmp: [4096]u8 = undefined;
     const formatted = std.fmt.bufPrint(&tmp, fmt, args) catch return;

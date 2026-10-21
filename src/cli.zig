@@ -219,6 +219,12 @@ pub fn parseSlice(alloc: Allocator, raw_args: []const []const u8) ParseError!Par
             p.forget_interval_sec = try parseIntStrict(u32, arg["--forget-interval=".len..]);
             continue;
         }
+        // Valueless switches. They must not take the next token as a value, or
+        // `mem3 query --include-superseded "text"` would eat the query.
+        if (std.mem.eql(u8, arg, "--include-superseded") or std.mem.eql(u8, arg, "--include-fuzzy")) {
+            try p.args.append(alloc, .{ .key = arg, .value = "true" });
+            continue;
+        }
         if (std.mem.eql(u8, arg, "--wal-sync")) {
             try p.args.append(alloc, .{ .key = "--wal-sync", .value = null });
             continue;
@@ -430,6 +436,14 @@ pub const HELP_TEXT =
     \\                          (`serve`: forgetting sweeps preview only)
     \\  --help, -h             Show this help
     \\  --version, -V          Show version
+    \\
+    \\SUBCOMMAND SWITCHES (no value):
+    \\  --include-superseded   `query`: also return cells a newer fact contradicts
+    \\                          (default: they are history, not answers)
+    \\  --include-fuzzy        `dump`: also list forgotten (fuzzy-store) cells
+    \\  --no-supersede         Do not mark a cell superseded when a newer one
+    \\                          contradicts it (`add`, `forget`, `serve`, `mcp`).
+    \\                          Use it if you store multi-valued predicates.
     \\
     \\A flag value may also be given as the next token: `--port 8080`.
     \\An unparseable value is an error, not a silent fallback to the

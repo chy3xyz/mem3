@@ -95,7 +95,14 @@ pub const Metadata = struct {
     /// Moved to the fuzzy store (read-only with respect to forgetting).
     is_fuzzy: bool = false,
     /// Superseded by another cell (PCR — never deleted, just marked).
+    /// Unix ms. Set by conflict resolution (`memory/conflict.zig`); a
+    /// superseded cell is excluded from default recall but stays in the
+    /// store, and stays readable by `inspect` / `dump`.
     superseded_at: ?i64 = null,
+    /// Id of the cell whose arrival superseded this one. Only ever set
+    /// together with `superseded_at`; `null` for a `superseded_at` that was
+    /// written by a build that did not record the superseder (snapshot v1/v2).
+    superseded_by: ?u64 = null,
     /// When this cell was moved to the fuzzy store.
     fuzzed_at: ?i64 = null,
 

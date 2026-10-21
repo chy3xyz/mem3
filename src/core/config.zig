@@ -88,6 +88,19 @@ pub const Config = struct {
     consolidation_threshold: f32 = 0.75,
     forgetting_threshold: f32 = 0.1,
     consolidation_min_cluster: usize = 3,
+    /// Near-duplicate floor for the forgetting sweep's redundancy term:
+    /// Jaccard similarity of two cells' exact token sets (episode + facts)
+    /// below this contributes nothing. See docs/adr/0005-existence-gain-forgetting.md.
+    redundancy_threshold: f32 = 0.7,
+    /// Write-time and sweep-time PCR conflict resolution: a cell whose every
+    /// (subject, predicate) fact is contradicted by a newer cell is marked
+    /// `superseded_at`. Never deletes anything. Off only for tests/ablation.
+    supersede_on_conflict: bool = true,
+    /// Most Jaccard evaluations the duplicate pass spends on one cell (see
+    /// `memory/redundancy.zig`). Bounds a sweep at O(n * this) on a corpus
+    /// where every pair is similar; costs only missed duplicates, never
+    /// wrongly forgotten cells.
+    redundancy_max_candidates: u32 = 256,
 
     // Decay rates — constitution asymmetry: λ_m > λ_f > λ_s
     decay_rate_matter: f32 = 0.05,

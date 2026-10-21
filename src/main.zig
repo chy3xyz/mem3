@@ -61,6 +61,8 @@ comptime {
     _ = @import("store/store.zig");
     _ = @import("memory/encoder.zig");
     _ = @import("memory/forgetter.zig");
+    _ = @import("memory/conflict.zig");
+    _ = @import("memory/redundancy.zig");
     _ = @import("memory/lifecycle.zig");
     _ = @import("storage/wal.zig");
     // `snapshot.zig` carries the durability round-trip test but was not

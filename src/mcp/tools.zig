@@ -72,7 +72,16 @@ pub const CATALOGUE = [_]Tool{
         \\(also 性 / spirit, stored durably). A cell with neither a goal binding
         \\nor a foresight is rejected.
         \\
-        \\Returns the assigned MemCell id.
+        \\If a fact "subject|predicate|object" contradicts an older cell's fact
+        \\(same subject and predicate, different object) and ALL of that older
+        \\cell's facts are contradicted by newer cells, the older cell is marked
+        \\superseded (never deleted). Subject, predicate and object must all be
+        \\non-empty for a fact to take part. Subject+predicate is a heuristic
+        \\key: a predicate that can legitimately have several objects
+        \\("likes") will supersede its earlier values.
+        \\
+        \\Returns the assigned MemCell id, and `superseded` (the ids of the
+        \\older cells this memory replaced) when there are any.
         ,
         .schema = "{\"type\":\"object\",\"properties\":{\"episode\":{\"type\":\"string\",\"description\":\"物 — the raw episode text\"},\"source\":{\"type\":\"string\",\"enum\":[\"matter\",\"form\",\"spirit\"],\"description\":\"ontological source tag (required)\"},\"facts\":{\"type\":\"array\",\"items\":{\"type\":\"string\"},\"description\":\"象 — subject|predicate|object triples\"},\"goal_ids\":{\"type\":\"array\",\"items\":{\"type\":\"integer\"},\"description\":\"性 — goal bindings\"},\"relevances\":{\"type\":\"array\",\"items\":{\"type\":\"number\"},\"description\":\"per-goal relevance in [0,1]\"},\"foresight\":{\"type\":\"array\",\"items\":{\"type\":\"string\"},\"description\":\"spirit — predicted claims as desc|valid_from_ms|valid_until_ms|confidence; durable\"}},\"required\":[\"episode\",\"source\"]}",
     },
@@ -83,9 +92,11 @@ pub const CATALOGUE = [_]Tool{
         \\reranking. Results are ordered by final_score, which folds in the goal
         \\the memory serves, not by vector similarity alone.
         \\
-        \\`topk` defaults to 10 and is capped at 100.
+        \\`topk` defaults to 10 and is capped at 100. Superseded cells (an old
+        \\fact a newer one contradicts) are history, not answers, and are left
+        \\out unless `include_superseded` is true.
         ,
-        .schema = "{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\",\"description\":\"natural-language query\"},\"topk\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":100,\"description\":\"hits to return (default 10)\"},\"goal_ids\":{\"type\":\"array\",\"items\":{\"type\":\"integer\"},\"description\":\"extra goal scope for the reranker\"}},\"required\":[\"query\"]}",
+        .schema = "{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\",\"description\":\"natural-language query\"},\"topk\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":100,\"description\":\"hits to return (default 10)\"},\"goal_ids\":{\"type\":\"array\",\"items\":{\"type\":\"integer\"},\"description\":\"extra goal scope for the reranker\"},\"include_superseded\":{\"type\":\"boolean\",\"description\":\"also return cells a newer fact supersedes (default false)\"}},\"required\":[\"query\"]}",
     },
     .{
         .name = "goal_list",
@@ -99,9 +110,13 @@ pub const CATALOGUE = [_]Tool{
     .{
         .name = "memory_forget",
         .description =
-        \\Run the existence-gain-driven forgetting sweep: cells whose
-        \\net_existence = importance - redundancy - conflict has gone negative
-        \\move to the fuzzy store (never deleted — PCR).
+        \\Run the existence-gain-driven forgetting sweep. A cell moves to the
+        \\fuzzy store (never deleted — PCR) when it has decayed
+        \\(importance * exp(-decay*age) < threshold), or when
+        \\net_existence = importance - redundancy - conflict_score is negative:
+        \\`redundancy` is how much a more important near-duplicate already
+        \\carries, `conflict_score` is the importance of the newer cell that
+        \\superseded it. The result reports the count per reason.
         \\
         \\Defaults to dry_run=true. Forgetting is irreversible in practice, so
         \\a caller must pass dry_run:false to actually let go of anything.
@@ -336,13 +351,15 @@ fn toolMemoryAdd(
     const source_text = (try argString(arguments, "source")) orelse return error.ToolFailed;
     const source = core.MemorySource.fromString(source_text) catch return error.ToolFailed;
 
-    const id = cli_add.addMemory(store, alloc, .{
+    var superseded: std.ArrayList(u64) = .empty;
+    defer superseded.deinit(alloc);
+    const id = cli_add.addMemoryReporting(store, alloc, .{
         .source = source,
         .episode = episode,
         .facts = facts.items,
         .foresight = foresight.items,
         .goal_associations = goals.items,
-    }) catch |err| return switch (err) {
+    }, &superseded) catch |err| return switch (err) {
         // Constitution I rejects an untagged or spiritless cell here.
         // The caller turns this into a tool error, not a crash.
         error.OutOfMemory => error.OutOfMemory,
@@ -355,6 +372,16 @@ fn toolMemoryAdd(
     try out.string(body, alloc, source.label());
     try body.appendSlice(alloc, ",\"cells\":");
     try out.uint(body, alloc, store.cellCount());
+    // Additive: present only when this memory replaced an older fact. The
+    // old cells are marked, not deleted; `mem3 inspect <id>` shows them.
+    if (superseded.items.len > 0) {
+        try body.appendSlice(alloc, ",\"superseded\":[");
+        for (superseded.items, 0..) |sid, i| {
+            if (i > 0) try body.append(alloc, ',');
+            try out.uint(body, alloc, sid);
+        }
+        try body.append(alloc, ']');
+    }
     try body.append(alloc, '}');
 }
 
@@ -401,9 +428,11 @@ fn toolMemoryQuery(
 
     const text = (try argString(arguments, "query")) orelse return error.ToolFailed;
 
+    const include_superseded = try argBool(arguments, "include_superseded", false);
     const hits = store.query(alloc, text, .{
         .topk = topk,
         .goal_ids = goal_ids.items,
+        .include_superseded = include_superseded,
     }) catch |err| return switch (err) {
         error.OutOfMemory => error.OutOfMemory,
         else => error.ToolFailed,
@@ -488,6 +517,15 @@ fn toolMemoryForget(
     try out.uint(body, alloc, store.cellCount());
     try body.appendSlice(alloc, ",\"fuzzy\":");
     try out.uint(body, alloc, store.lc.fuzzy.count());
+    // Additive: why cells left, and how many were newly marked superseded.
+    try body.appendSlice(alloc, ",\"reasons\":{\"decayed\":");
+    try out.uint(body, alloc, sweep.decayed);
+    try body.appendSlice(alloc, ",\"redundant\":");
+    try out.uint(body, alloc, sweep.redundant);
+    try body.appendSlice(alloc, ",\"conflicted\":");
+    try out.uint(body, alloc, sweep.conflicted);
+    try body.appendSlice(alloc, "},\"superseded\":");
+    try out.uint(body, alloc, sweep.superseded);
     try body.append(alloc, '}');
 }
 
@@ -648,6 +686,53 @@ test "tools: memory_add persists a tri-source cell and returns its id" {
     try testing.expectEqualStrings("the tag was pushed", cell.episode);
     try testing.expectEqual(@as(usize, 1), cell.atomic_facts.len);
     try testing.expectEqualStrings("neo", cell.atomic_facts[0].subject);
+}
+
+test "tools: memory_add reports the older cells a contradicting fact superseded" {
+    const alloc = testing.allocator;
+    var store = try testStore(alloc);
+    defer store.deinit();
+
+    var first = try callWith(alloc, store, "memory_add",
+        \\{"episode":"the user lives in Paris","source":"matter","facts":["user|lives_in|Paris"],"goal_ids":[1]}
+    );
+    defer first.deinit();
+    var d1 = try json.parse(alloc, first.text);
+    defer d1.deinit();
+    // Nothing to supersede yet: the key is absent, not an empty list.
+    try testing.expect(json.get(d1.root, "superseded") == null);
+    const old_id: u64 = @intFromFloat(json.get(d1.root, "id").?.asNumber().?);
+
+    var second = try callWith(alloc, store, "memory_add",
+        \\{"episode":"the user moved to Berlin","source":"matter","facts":["user|lives_in|Berlin"],"goal_ids":[1]}
+    );
+    defer second.deinit();
+    var d2 = try json.parse(alloc, second.text);
+    defer d2.deinit();
+    const sup = json.get(d2.root, "superseded").?.asArray().?;
+    try testing.expectEqual(@as(usize, 1), sup.len);
+    try testing.expectEqual(@as(f64, @floatFromInt(old_id)), sup[0].asNumber().?);
+
+    // Marked, not deleted.
+    const old = store.getCell(old_id).?;
+    try testing.expect(old.metadata.superseded_at != null);
+
+    // A default recall leaves it out; the opt-in brings it back.
+    var plain = try callWith(alloc, store, "memory_query",
+        \\{"query":"where does the user live"}
+    );
+    defer plain.deinit();
+    var dq = try json.parse(alloc, plain.text);
+    defer dq.deinit();
+    try testing.expectEqual(@as(f64, 1), json.get(dq.root, "count").?.asNumber().?);
+
+    var all = try callWith(alloc, store, "memory_query",
+        \\{"query":"where does the user live","include_superseded":true}
+    );
+    defer all.deinit();
+    var da = try json.parse(alloc, all.text);
+    defer da.deinit();
+    try testing.expectEqual(@as(f64, 2), json.get(da.root, "count").?.asNumber().?);
 }
 
 test "tools: memory_add refuses an untagged memory" {

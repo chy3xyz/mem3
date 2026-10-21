@@ -1,7 +1,15 @@
 //! CLI implementation for `mem3 forget`.
 //!
 //! Per spec: `mem3 forget [--dry-run]` runs the existence-gain-driven
-//! sweeping pass and reports how many cells were fuzzied vs kept.
+//! sweeping pass (`net_existence = importance - redundancy - conflict_score`)
+//! and reports how many cells were fuzzied vs kept, and *why*:
+//!
+//!   * `decayed`    - `importance * exp(-decay * age) < threshold`
+//!   * `redundant`  - a more important near-duplicate already says it
+//!   * `conflicted` - a newer cell contradicts every fact it holds and
+//!                    matters more (it is marked `superseded_at`, not deleted)
+//!   * `superseded` - cells the sweep newly marked superseded (they stay
+//!                    active unless they are also `conflicted`)
 //!
 //! In `--dry-run` mode no state is mutated; otherwise cells move from
 //! the active store to the FuzzyStore (PCR: never delete).
@@ -17,37 +25,34 @@ pub fn run(alloc: std.mem.Allocator, parsed: cli.Parsed) !void {
 
     const result = try store.forget(parsed.dry_run);
 
+    var buf = std.ArrayList(u8).empty;
+    defer buf.deinit(alloc);
+
     if (parsed.json) {
-        var buf: [256]u8 = undefined;
-        // SAFETY: four usize counters (each <= 20 digits) plus a bool
-        // ("true"/"false", <= 5 bytes) plus a 64-byte literal -> worst
-        // case 149 bytes into a 256-byte buffer.
-        const s = std.fmt.bufPrint(
+        // The first five keys are the original contract and keep their order
+        // and meaning; `reasons` / `superseded` are additive.
+        try cli_common.appendFmt(
             &buf,
-            "{{\"dry_run\":{},\"fuzzied\":{d},\"kept\":{d},\"active\":{d},\"fuzzy\":{d}}}",
-            .{ parsed.dry_run, result.fuzzied, result.kept, store.cellCount(), store.lc.fuzzy.count() },
-        ) catch unreachable;
-        cli_common.println(s);
-    } else {
-        var buf: [256]u8 = undefined;
-        // SAFETY: each line below interpolates exactly one usize counter
-        // (<= 20 digits) or a bool (<= 5 bytes) against a literal of at
-        // most 16 bytes, so the longest line is 36 bytes into a 256-byte
-        // buffer. The same `buf` is reused only after its previous
-        // contents have already been printed.
-        const w1 = std.fmt.bufPrint(&buf, "forget: dry_run={}", .{parsed.dry_run}) catch unreachable;
-        cli_common.println(w1);
-        // SAFETY: `  fuzzied: ` is 11 bytes + <= 20 digits = 31 bytes.
-        const w2 = std.fmt.bufPrint(&buf, "  fuzzied: {d}", .{result.fuzzied}) catch unreachable;
-        cli_common.println(w2);
-        // SAFETY: `  kept:    ` is 11 bytes + <= 20 digits = 31 bytes.
-        const w3 = std.fmt.bufPrint(&buf, "  kept:    {d}", .{result.kept}) catch unreachable;
-        cli_common.println(w3);
-        // SAFETY: `  active:  ` is 11 bytes + <= 20 digits = 31 bytes.
-        const w4 = std.fmt.bufPrint(&buf, "  active:  {d}", .{store.cellCount()}) catch unreachable;
-        cli_common.println(w4);
-        // SAFETY: `  fuzzy:   ` is 11 bytes + <= 20 digits = 31 bytes.
-        const w5 = std.fmt.bufPrint(&buf, "  fuzzy:   {d}", .{store.lc.fuzzy.count()}) catch unreachable;
-        cli_common.println(w5);
+            alloc,
+            "{{\"dry_run\":{},\"fuzzied\":{d},\"kept\":{d},\"active\":{d},\"fuzzy\":{d}," ++
+                "\"reasons\":{{\"decayed\":{d},\"redundant\":{d},\"conflicted\":{d}}},\"superseded\":{d}}}",
+            .{
+                parsed.dry_run,                result.fuzzied,   result.kept,       store.cellCount(), store.lc.fuzzy.count(),
+                result.decayed,                result.redundant, result.conflicted, result.superseded,
+            },
+        );
+        cli_common.println(buf.items);
+        return;
     }
+
+    try cli_common.appendFmt(&buf, alloc, "forget: dry_run={}\n", .{parsed.dry_run});
+    try cli_common.appendFmt(&buf, alloc, "  fuzzied:    {d}\n", .{result.fuzzied});
+    try cli_common.appendFmt(&buf, alloc, "    decayed:    {d}\n", .{result.decayed});
+    try cli_common.appendFmt(&buf, alloc, "    redundant:  {d}\n", .{result.redundant});
+    try cli_common.appendFmt(&buf, alloc, "    conflicted: {d}\n", .{result.conflicted});
+    try cli_common.appendFmt(&buf, alloc, "  superseded: {d} (newly marked, not deleted)\n", .{result.superseded});
+    try cli_common.appendFmt(&buf, alloc, "  kept:       {d}\n", .{result.kept});
+    try cli_common.appendFmt(&buf, alloc, "  active:     {d}\n", .{store.cellCount()});
+    try cli_common.appendFmt(&buf, alloc, "  fuzzy:      {d}", .{store.lc.fuzzy.count()});
+    cli_common.println(buf.items);
 }

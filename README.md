@@ -261,10 +261,14 @@ hyperedge added: id=8 type=causal nodes=2
 consolidate: abstracts_created=0
   cells: 3 -> 3
 forget: dry_run=false
-  fuzzied: 0
-  kept:    3
-  active:  3
-  fuzzy:   0
+  fuzzied:    0
+    decayed:    0
+    redundant:  0
+    conflicted: 0
+  superseded: 0 (newly marked, not deleted)
+  kept:       3
+  active:     3
+  fuzzy:      0
 ```
 
 Run the HTTP daemon:
@@ -338,8 +342,56 @@ HTTP `POST /api/memcells` body (`"foresight":[{"description":..,"valid_from":..,
 (`"foresight":["desc|from|until|conf"]`).
 
 `query` flags: `--topk` (`-k`, default 10), `--source-filter` (comma-separated
-sources), `--goal-ids` (comma-separated ids). With `--json` it prints
-`{"query":[ids...],"count":N}`.
+sources), `--goal-ids` (comma-separated ids), `--include-superseded` (see
+[Forgetting and supersession](#forgetting-and-supersession)). With `--json` it
+prints `{"query":[ids...],"count":N}`.
+
+### Forgetting and supersession
+
+`mem3 forget [--dry-run] [--json]` runs the sweep. A cell moves to the fuzzy
+store (never deleted) when it has **decayed** (`importance × exp(−decay × age)
+< 0.1`, the original rule) or when
+`net_existence = importance − redundancy − conflict_score < 0`:
+
+- **redundancy** — a more important cell of the same source, goals, facts and
+  foresight already says it: exact token-set Jaccard ≥ 0.7, scaled up to the
+  cell's own `importance + 0.1`. An exact duplicate is always forgotten; a
+  near-duplicate has its net existence lowered and is forgotten only above
+  roughly 0.96 similarity at typical importance. The first cell of a group is
+  never forgotten for redundancy.
+- **conflict** — a newer cell has the same subject and predicate with a
+  different object for *every* fact of the older cell. The older cell is marked
+  `superseded_at` / `superseded_by` (never deleted); it is forgotten only if the
+  superseder is more important.
+
+The output reports the count per reason (`decayed`, `redundant`, `conflicted`),
+`superseded` (cells newly marked by the sweep), `kept`, `active`, `fuzzy`;
+`--json` keeps `dry_run`, `fuzzied`, `kept`, `active`, `fuzzy` and adds
+`reasons{decayed,redundant,conflicted}` and `superseded`. Definitions,
+deviations from the spec, and measurements: [`docs/adr/0005-existence-gain-forgetting.md`](docs/adr/0005-existence-gain-forgetting.md).
+
+Supersession happens when a cell is **added**: `mem3 add` prints
+`added memory id=7 (superseded: 4)` (`{"id":7,"superseded":[4]}` with `--json`),
+and the same `superseded` list is in the HTTP `POST /api/memcells` response and
+the MCP `memory_add` result when there is one. A superseded cell is history,
+not an answer: it is left out of `query` unless you pass `--include-superseded`
+(HTTP body `"includeSuperseded":true`, MCP `include_superseded`).
+
+`mem3 inspect <id>` prints `is_fuzzy`, `superseded_at`, `superseded_by` and
+`supersedes` (the ids this cell replaced), and also finds cells that have been
+forgotten. `mem3 dump` carries `superseded_at` / `superseded_by` on every line;
+`mem3 dump --include-fuzzy` appends the forgotten cells too.
+`--include-superseded` and `--include-fuzzy` are valueless switches (they do not
+swallow the next argument).
+
+> **Known weak spot.** The subject+predicate key does not know which predicates
+> are single-valued. `user|likes|coffee` then `user|likes|tea` is treated as a
+> contradiction and the first cell is hidden from default recall (and forgotten
+> if the second is more important). In the synthetic evaluation 120 of 180
+> multi-valued cells were wrongly marked superseded. If you store multi-valued
+> predicates, turn the behaviour off with `supersede_on_conflict = false`
+> with `--no-supersede` (`add`, `forget`, `serve`, `mcp`; applies to that
+> process only, cells already marked stay marked).
 
 Global flags: `--json`, `--data-dir=<path>` (default `data`), `--log-format=human|jsonl|silent`,
 `--log-every=<seconds>`, `--wal-sync=always|group|interval:<ms>`,

@@ -9,6 +9,27 @@ Current version: **`0.1.0-alpha`**. Supported targets: **macOS and Linux**.
 
 ## Recently closed
 
+- **Forgetting implements `net_existence` and supersession** (branch
+  `p2/forget`; ADR [0005](adr/0005-existence-gain-forgetting.md)). The sweep was
+  `importance × decay < θ` only; `redundancy`, `conflict_score` and
+  `superseded_at` did not exist while the MCP text and the `forgetter.zig`
+  header described them. Now: redundancy by an exact prefix-filter duplicate
+  pass, conflict by a subject+predicate index, `superseded_at` / `superseded_by`
+  journaled (`memcell_update`) and in snapshot v3, per-reason counts in
+  `forget`, superseded cells hidden from default recall. Measured on the
+  synthetic `--mode=netex` corpus: exact-copy pairs 0/60 → 60/60 collapsed,
+  unique high-importance cells forgotten 0/400, contradiction-pair top-1 =
+  current value 53% → 100%. **Not a free win**: the heuristic key marks 120 of
+  180 multi-valued cells superseded (precision 33%) and near-duplicates are
+  lowered but not forgotten. Sweep time at 20k cells: 140 ms (realistic corpus,
+  near-linear), 1.1 s (dense templated worst case, capped at 256 candidates per
+  cell; 18.9 s uncapped). Also fixed: replaying a `.forget` WAL record freed the
+  cell instead of moving it to the fuzzy store, so a restart after a CLI
+  `mem3 forget` (which does not sync) lost forgotten cells outright.
+  Still open: functional-predicate schemas, `mem3 remember` (promote-back,
+  T084), profiling the superlinear tail on the dense corpus, a non-synthetic
+  evaluation corpus, no downgrade path from snapshot v3.
+
 - **Consolidation is incremental** (`Consolidator` + `src/memory/cluster_index.zig`).
   The pass used to compare every cell pair: 1.01e9 pairs at 45,000 cells. The
   union-find and a per-cell token signature (512 bits) now persist across passes

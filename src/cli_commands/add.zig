@@ -119,6 +119,17 @@ fn primaryAssociation(goals: []const GoalAssociation) GoalAssociation {
 /// would silently make `--source=matter --episode x --facts "a|b|c"` a
 /// legal add.
 pub fn addMemory(store: *Store, alloc: std.mem.Allocator, mem: Memory) !u64 {
+    return addMemoryReporting(store, alloc, mem, null);
+}
+
+/// `addMemory` that also reports, in `superseded_out`, the older cells the
+/// new one contradicted and so marked `superseded_at` (FR-015).
+pub fn addMemoryReporting(
+    store: *Store,
+    alloc: std.mem.Allocator,
+    mem: Memory,
+    superseded_out: ?*std.ArrayList(u64),
+) !u64 {
     if (mem.foresight.len == 0 and mem.goal_associations.len == 0) {
         return core.Error.SpiritDimMissing;
     }
@@ -139,7 +150,7 @@ pub fn addMemory(store: *Store, alloc: std.mem.Allocator, mem: Memory) !u64 {
         // `Store.encodeAcrossLayers` spells "nothing to traverse".
         GoalAssociation{ .goal_id = 0, .relevance = 0.5, .priority = 5 };
 
-    return store.addRawWithForesight(mem.source, mem.episode, facts_str, primary.goal_id, primary.relevance, mem.foresight);
+    return store.addRawReporting(mem.source, mem.episode, facts_str, primary.goal_id, primary.relevance, mem.foresight, superseded_out);
 }
 
 pub fn run(alloc: std.mem.Allocator, parsed: cli.Parsed) !void {
@@ -205,13 +216,15 @@ pub fn run(alloc: std.mem.Allocator, parsed: cli.Parsed) !void {
         }
     }
 
-    const id = addMemory(store, alloc, .{
+    var superseded: std.ArrayList(u64) = .empty;
+    defer superseded.deinit(alloc);
+    const id = addMemoryReporting(store, alloc, .{
         .source = source.?,
         .episode = episode.?,
         .facts = facts.items,
         .foresight = foresights.items,
         .goal_associations = goal_associations.items,
-    }) catch |err| {
+    }, &superseded) catch |err| {
         // Nothing has been committed to memory, so there is nothing to
         // roll back: `Store.addRaw` returns the reserved id to the pool
         // and leaves no cell behind. Report the failure and exit
@@ -219,21 +232,29 @@ pub fn run(alloc: std.mem.Allocator, parsed: cli.Parsed) !void {
         cli_common.fatal("error: add failed: {s}; nothing was persisted.\n", .{@errorName(err)});
     };
 
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
     if (parsed.json) {
-        var buf: [256]u8 = undefined;
-        // SAFETY: format is `{"id":<u64>}`; id is u64 (<= 20 digits) and
-        // the literal is 7 bytes, so the longest output is 27 bytes into a
-        // 256-byte buffer. No user-supplied text is interpolated.
-        const s = std.fmt.bufPrint(&buf, "{{\"id\":{d}}}", .{id}) catch unreachable;
-        cli_common.println(s);
+        try cli_common.appendFmt(&out, alloc, "{{\"id\":{d}", .{id});
+        // Additive: only present when this add replaced an older fact.
+        if (superseded.items.len > 0) {
+            try out.appendSlice(alloc, ",\"superseded\":[");
+            for (superseded.items, 0..) |sid, i| {
+                if (i > 0) try out.append(alloc, ',');
+                try cli_common.appendFmt(&out, alloc, "{d}", .{sid});
+            }
+            try out.append(alloc, ']');
+        }
+        try out.append(alloc, '}');
     } else {
-        var buf: [256]u8 = undefined;
-        // SAFETY: format is `added memory id=<u64>`; literal is 16 bytes
-        // and id is u64 (<= 20 digits), so the longest output is 36 bytes
-        // into a 256-byte buffer.
-        const s = std.fmt.bufPrint(&buf, "added memory id={d}", .{id}) catch unreachable;
-        cli_common.println(s);
+        try cli_common.appendFmt(&out, alloc, "added memory id={d}", .{id});
+        if (superseded.items.len > 0) {
+            try out.appendSlice(alloc, " (superseded:");
+            for (superseded.items) |sid| try cli_common.appendFmt(&out, alloc, " {d}", .{sid});
+            try out.append(alloc, ')');
+        }
     }
+    cli_common.println(out.items);
 }
 
 // Zero-copy parsers: produce slices that reference `s` directly. `s` must
