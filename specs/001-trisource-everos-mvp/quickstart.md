@@ -216,7 +216,7 @@ Output is JSON to `zig-out/bench/bench.json`. Compare against the targets in `co
 
 ## What's Next?
 
-- **Understand the architecture**: read `dev.md` for the engineering blueprint, `ghw_memory_system.agent.final.md` for the formal paper, `三源合恰论.docx` for the foundational ontology.
+- **Understand the architecture**: read `dev.md` for the engineering blueprint, `ghw_memory_system.agent.final.md` for the formal paper, the Tri-Source Coherence Theory manuscript for the foundational ontology.
 - **Try the example programs**: `examples/notebook.zig` is the US1 scenario from the spec, `examples/multi_project.zig` is US2, `examples/multihop_query.zig` is US3.
 - **Cross-compile to aarch64**: `zig build -Dtarget=aarch64-linux-gnu` produces an ARM binary for edge deployment.
 - **Contribute**: see `AGENTS.md` (root) for the agent onboarding document, including the constitution test workflow.

@@ -1,6 +1,6 @@
 //! Incremental single-linkage cluster index for consolidation.
 //!
-//! **GHW Layer**: Memory (三源合恰). Holds the state `Consolidator` keeps
+//! **GHW Layer**: Memory (tri-source coherence). Holds the state `Consolidator` keeps
 //! between passes so that a pass compares only what changed.
 //!
 //! ## What it maintains

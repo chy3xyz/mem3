@@ -6,11 +6,11 @@
 
 **Status**: Draft (post-clarification ready for planning)
 
-**Input**: User description: "TriSource-EverOS: 三源合恰 + GHW 范式驱动的零依赖记忆 OS (Zig 0.17) — MVP 阶段"
+**Input**: User description: "TriSource-EverOS: a zero-dependency memory OS (Zig 0.17) driven by Tri-Source Coherence and the GHW paradigm, MVP stage"
 
 **Theoretical Foundation**:
-- 三源合恰论 (Tri-Source Con-appropriation Theory): 物(M) / 象(F) / 性(S) three-source ontology.
-- GHW 范式: Goal-Harness-World three-layer memory architecture.
+- Tri-Source Coherence Theory: matter (M) / form (F) / spirit (S) three-source ontology.
+- GHW paradigm: Goal-Harness-World three-layer memory architecture.
 - Engineering blueprint: `dev.md` (Zig 0.17 idioms, 12-week roadmap, type sketches).
 - Formal paper: `ghw_memory_system.agent.final.md` (TS-MemCell proof, category-theoretic semantics).
 
@@ -98,7 +98,7 @@ A future scenario: the user wants to deploy `mem3` to a Raspberry Pi 5 as a pers
 
 ### Functional Requirements
 
-- **FR-001**: System MUST implement `TS-MemCell` as a 7-tuple struct with the exact fields and types from `dev.md` §三 (id, source_tag, episode, atomic_facts, foresight, goal_associations, metadata).
+- **FR-001**: System MUST implement `TS-MemCell` as a 7-tuple struct with the exact fields and types from `dev.md` §3 (id, source_tag, episode, atomic_facts, foresight, goal_associations, metadata).
 - **FR-002**: System MUST classify every MemCell with a `source_tag ∈ {M, F, S}` at encoding time. Reject untyped memories with a `MissingSourceTag` error.
 - **FR-003**: System MUST compute `importance_score` for every MemCell using the constitutional formula `α·source_coherence + β·goal_relevance + γ·existential_contribution` with `α=0.30, β=0.40, γ=0.30` defaults.
 - **FR-004**: System MUST implement the GHW three-layer architecture as separate modules: `ghw/goal_tree.zig`, `ghw/harness_registry.zig`, `ghw/world_model.zig`. Each MUST declare its GHW layer in file-level doc-comment.
@@ -109,7 +109,7 @@ A future scenario: the user wants to deploy `mem3` to a Raspberry Pi 5 as a pers
 - **FR-009**: System MUST implement multi-hop hypergraph traversal with configurable `max_hops` (default 3) and `edge_types` filter.
 - **FR-010**: System MUST implement existence-gain-driven forgetting: `net_existence = importance − redundancy − conflict_score`. Memories with `net_existence < 0` are candidates for forgetting; those with `spirit_coherence > 0.7` go to the fuzzy store, not deleted.
 - **FR-011**: System MUST implement a Goal Poset as a partially ordered set with priority values and parent-child relationships, supporting goal creation, deletion, priority update, and hierarchy query.
-- **FR-012**: System MUST implement bidirectional transduction: encoding path Goal→Harness→World (外拓之路) and retrieval path World→Harness→Goal (内求之路). Cross-layer shortcuts are forbidden by Constitution §II.
+- **FR-012**: System MUST implement bidirectional transduction: encoding path Goal→Harness→World (the outward path) and retrieval path World→Harness→Goal (the inward path). Cross-layer shortcuts are forbidden by Constitution §II.
 - **FR-013**: System MUST implement a tri-source coherence check: `C_tri = C_MF · C_FS · C_SM` where each `C_XY` is the cosine similarity of the source embeddings.
 - **FR-014**: System MUST implement `MemScene` as a consolidation-time cluster: `⟨center_M, structure_F, meaning_S, coherence_C⟩`. Created via hierarchical agglomerative clustering with `sim_threshold=0.75`.
 - **FR-015**: System MUST implement conflict detection and resolution via PCR: new fact + temporal validity markers, old fact marked `superseded_at = now`, never deleted.

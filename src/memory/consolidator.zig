@@ -1,6 +1,6 @@
 //! Hierarchical Agglomerative Clustering (HAC) for memory consolidation.
 //!
-//! **GHW Layer**: Memory (三源合恰). Implements the Consolidation stage
+//! **GHW Layer**: Memory (tri-source coherence). Implements the Consolidation stage
 //! of the four-stage lifecycle (per the paper §4.3.3).
 //!
 //! ## Algorithm
@@ -33,7 +33,7 @@
 //! and therefore does one full pass — the same work as before.
 //!
 //! **Constitution compliance**:
-//! - Principle III (存在增益驱动): consolidation is the
+//! - Principle III (existence-gain-driven lifecycle): consolidation is the
 //!   "comprehension" phase — abstract knowledge has higher
 //!   existence-gain than individual instances.
 //! - PCR: never delete originals. New abstract cell coexists.

@@ -1,6 +1,7 @@
 //! CLI implementation for `mem3 query`.
 //!
-//! Per the spec: `mem3 query "text" --topk 10 [--source-filter M,F,S]`
+//! Per the spec: `mem3 query "text" --topk 10 [--source-filter M,F,S]
+//! [--include-superseded]`
 //!
 //! ## Why this reads the Store
 //!
@@ -87,8 +88,14 @@ pub fn run(alloc: Allocator, p: cli.Parsed) !void {
     const qvec = try store.emb.embed(alloc, text);
     defer alloc.free(qvec);
 
+    // Superseded cells (an old fact a newer one contradicts) are history,
+    // not answers: dropped unless `--include-superseded`. Over-fetch by as
+    // many as exist so `topk` current hits can still come back.
+    const include_superseded = cli_common.hasSwitch(p, "--include-superseded");
+    const extra = if (include_superseded) 0 else @min(store.superseded_live, topk * 3);
+
     // Over-fetch: the dense stage only needs to supply candidates.
-    const dense = store.hnsw.search(alloc, qvec, topk * 3) catch &.{};
+    const dense = store.hnsw.search(alloc, qvec, topk * 3 + extra) catch &.{};
     defer {
         // `catch &.{}` hands back a static empty slice; freeing that is
         // not ours to do.
@@ -100,6 +107,7 @@ pub fn run(alloc: Allocator, p: cli.Parsed) !void {
     defer cands.deinit(alloc);
     for (dense) |r| {
         const cell = store.getCell(r.id) orelse continue;
+        if (!include_superseded and cell.metadata.superseded_at != null) continue;
         if (source_filter.items.len > 0 and !matchesSource(source_filter.items, cell.source)) continue;
         if (goal_ids.items.len > 0 and !matchesGoal(cell, goal_ids.items)) continue;
         try cands.append(alloc, .{ .id = r.id, .score = r.score, .cell = cell });

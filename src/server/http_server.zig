@@ -1248,7 +1248,9 @@ pub const Server = struct {
         };
         defer mem3_store.freeForesight(self.alloc, foresight);
 
-        const id = self.store.addRawWithForesight(source, episode, facts, goal_id, relevance, foresight) catch |err| {
+        var superseded: std.ArrayList(mem3_store.Supersession) = .empty;
+        defer mem3_store.freeSupersessions(self.alloc, &superseded);
+        const id = self.store.addRawReporting(source, episode, facts, goal_id, relevance, foresight, &superseded) catch |err| {
             // `jsonResponse` copies its body, so the formatted message is
             // ours to free. It was not, and every refused insert leaked it.
             const err_body = try std.fmt.allocPrint(self.alloc, "{{\"error\":\"{s}\"}}", .{@errorName(err)});
@@ -1257,8 +1259,16 @@ pub const Server = struct {
         };
         _ = self.metrics.inserts_total.fetchAdd(1, .monotonic);
 
-        const body_resp = try std.fmt.allocPrint(self.alloc, "{{\"id\":{d}}}", .{id});
-        return self.rawJson(201, body_resp);
+        var resp: std.ArrayList(u8) = .empty;
+        errdefer resp.deinit(self.alloc);
+        try resp.print(self.alloc, "{{\"id\":{d}", .{id});
+        // Additive: only present when this insert replaced an older fact.
+        if (superseded.items.len > 0) {
+            try resp.appendSlice(self.alloc, ",\"superseded\":");
+            try mem3_store.appendSupersededJson(self.alloc, &resp, superseded.items);
+        }
+        try resp.append(self.alloc, '}');
+        return self.rawJson(201, try resp.toOwnedSlice(self.alloc));
     }
 
     /// `GET /api/goals` — the real goals from the in-memory poset.
@@ -1335,7 +1345,11 @@ pub const Server = struct {
         const qvec = try self.store.emb.embed(self.alloc, text);
         defer self.alloc.free(qvec);
 
-        const dense = self.store.hnsw.search(self.alloc, qvec, topk * 3) catch &.{};
+        // Superseded cells are history, not answers: dropped unless the body
+        // says `"includeSuperseded":true`, with the over-fetch to match.
+        const include_superseded = extractJsonBool(body, "includeSuperseded") orelse false;
+        const extra = if (include_superseded) 0 else @min(self.store.superseded_live, topk * 3);
+        const dense = self.store.hnsw.search(self.alloc, qvec, topk * 3 + extra) catch &.{};
         defer self.alloc.free(dense);
 
         var cands = std.ArrayList(RerankContext.Pair).empty;
@@ -1352,6 +1366,7 @@ pub const Server = struct {
         var it = self.store.cell_index.iterator();
         while (it.next()) |entry| {
             const cell = entry.value_ptr.*;
+            if (!include_superseded and cell.metadata.superseded_at != null) continue;
             var score: f32 = 0.0;
             var found = false;
             for (dense) |r| {
@@ -1406,6 +1421,7 @@ pub const Server = struct {
                 }
                 if (dup) continue;
                 const cell = self.store.getCell(g.id) orelse continue;
+                if (!include_superseded and cell.metadata.superseded_at != null) continue;
                 try cands.append(self.alloc, .{ .id = g.id, .score = g.score, .cell = cell });
                 added += 1;
             }

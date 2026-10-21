@@ -94,7 +94,10 @@ class Server:
         with self._lock:
             return len(self.lines)
 
-    def wait_for(self, marker_id, timeout=3.0):
+    def wait_for(self, marker_id, timeout=15.0):
+        # 15 s, not 3: a positive wait only costs time when it fails. On a host
+        # under heavy load (load average >100) a 3 s budget is within reach of a
+        # slow scheduler, and a missed deadline reads as a protocol failure.
         deadline = time.time() + timeout
         while time.time() < deadline:
             for item in self.all():
@@ -271,7 +274,7 @@ def run(binary):
                 modern_res.get("resultType") == "complete")
         c.check("a modern result echoes serverInfo",
                 isinstance(modern_res.get("_meta", {}).get(META_PREFIX + "serverInfo"), dict))
-        c.check("both eras list the same five tools",
+        c.check("both eras list the same tools",
                 [t["name"] for t in legacy_res.get("tools", [])]
                 == [t["name"] for t in modern_res.get("tools", [])])
 
@@ -426,7 +429,7 @@ def run(binary):
                 "params": {"name": "memory_query",
                            "arguments": {"query": big},
                            "_meta": modern_meta()}})
-        r = s.wait_for(70, timeout=5.0)
+        r = s.wait_for(70, timeout=15.0)
         c.check("a very large but legal request is answered, not refused",
                 r is not None and ("result" in r or "error" in r), repr(r)[:140])
 

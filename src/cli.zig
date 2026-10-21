@@ -18,6 +18,7 @@ pub const Subcommand = enum {
     inspect,
     consolidate,
     forget,
+    unsupersede,
     serve,
     bench,
     mcp,
@@ -219,6 +220,12 @@ pub fn parseSlice(alloc: Allocator, raw_args: []const []const u8) ParseError!Par
             p.forget_interval_sec = try parseIntStrict(u32, arg["--forget-interval=".len..]);
             continue;
         }
+        // Valueless switches. They must not take the next token as a value, or
+        // `mem3 query --include-superseded "text"` would eat the query.
+        if (std.mem.eql(u8, arg, "--include-superseded") or std.mem.eql(u8, arg, "--include-fuzzy")) {
+            try p.args.append(alloc, .{ .key = arg, .value = "true" });
+            continue;
+        }
         if (std.mem.eql(u8, arg, "--wal-sync")) {
             try p.args.append(alloc, .{ .key = "--wal-sync", .value = null });
             continue;
@@ -349,6 +356,7 @@ pub fn subcommandFromName(name: []const u8) ParseError!Subcommand {
     if (std.mem.eql(u8, name, "inspect")) return .inspect;
     if (std.mem.eql(u8, name, "consolidate")) return .consolidate;
     if (std.mem.eql(u8, name, "forget")) return .forget;
+    if (std.mem.eql(u8, name, "unsupersede")) return .unsupersede;
     if (std.mem.eql(u8, name, "serve")) return .serve;
     if (std.mem.eql(u8, name, "bench")) return .bench;
     if (std.mem.eql(u8, name, "mcp")) return .mcp;
@@ -394,6 +402,7 @@ pub const HELP_TEXT =
     \\  inspect       Show a MemCell + its hypergraph neighborhood
     \\  consolidate   Run the consolidation pipeline
     \\  forget        Run the existence-gain-driven forgetting sweep
+    \\  unsupersede   Restore a cell a newer fact wrongly superseded (`unsupersede <id>`)
     \\  serve         Start the HTTP daemon (default port 7777)
     \\  mcp           Serve the Model Context Protocol over stdio
     \\  bench         Run the in-process smoke benchmark suite
@@ -426,10 +435,26 @@ pub const HELP_TEXT =
     \\                          zero-dependency hashed lexer.
     \\  --embedder-arg=<arg>   One argument for --embedder-cmd; repeatable.
     \\                          No shell is involved.
+    \\  --supersede=<mode>     Which predicates may mark an older cell superseded
+    \\                          (`add`, `forget`, `serve`, `mcp`):
+    \\                          functional (default) - only single-valued predicates
+    \\                          (lives_in, works_at, status, current_*, ...);
+    \\                          all - every subject+predicate (hides "likes tea"
+    \\                          behind "likes coffee"); off - never.
+    \\  --functional-predicates=<a,b,c>
+    \\                          Replace the single-valued list (`+a,b` extends it;
+    \\                          a trailing `*` is a prefix). Only used by
+    \\                          --supersede=functional.
     \\  --dry-run              Show what would be done, don't write
     \\                          (`serve`: forgetting sweeps preview only)
     \\  --help, -h             Show this help
     \\  --version, -V          Show version
+    \\
+    \\SUBCOMMAND SWITCHES (no value):
+    \\  --include-superseded   `query`: also return cells a newer fact contradicts
+    \\                          (default: they are history, not answers)
+    \\  --include-fuzzy        `dump`: also list forgotten (fuzzy-store) cells
+    \\  --no-supersede         Same as --supersede=off.
     \\
     \\A flag value may also be given as the next token: `--port 8080`.
     \\An unparseable value is an error, not a silent fallback to the

@@ -261,10 +261,14 @@ hyperedge added: id=8 type=causal nodes=2
 consolidate: abstracts_created=0
   cells: 3 -> 3
 forget: dry_run=false
-  fuzzied: 0
-  kept:    3
-  active:  3
-  fuzzy:   0
+  fuzzied:    0
+    decayed:    0
+    redundant:  0
+    conflicted: 0
+  superseded: 0 (newly marked, not deleted)
+  kept:       3
+  active:     3
+  fuzzy:      0
 ```
 
 Run the HTTP daemon:
@@ -338,8 +342,80 @@ HTTP `POST /api/memcells` body (`"foresight":[{"description":..,"valid_from":..,
 (`"foresight":["desc|from|until|conf"]`).
 
 `query` flags: `--topk` (`-k`, default 10), `--source-filter` (comma-separated
-sources), `--goal-ids` (comma-separated ids). With `--json` it prints
-`{"query":[ids...],"count":N}`.
+sources), `--goal-ids` (comma-separated ids), `--include-superseded` (see
+[Forgetting and supersession](#forgetting-and-supersession)). With `--json` it
+prints `{"query":[ids...],"count":N}`.
+
+### Forgetting and supersession
+
+`mem3 forget [--dry-run] [--json]` runs the sweep. A cell moves to the fuzzy
+store (never deleted) when it has **decayed** (`importance × exp(−decay × age)
+< 0.1`, the original rule) or when
+`net_existence = importance − redundancy − conflict_score < 0`:
+
+- **redundancy** — a more important cell of the same source, goals, facts and
+  foresight already says it: exact token-set Jaccard ≥ 0.7, scaled up to the
+  cell's own `importance + 0.1`. An exact duplicate is always forgotten; a
+  near-duplicate has its net existence lowered and is forgotten only above
+  roughly 0.96 similarity at typical importance. The first cell of a group is
+  never forgotten for redundancy.
+- **conflict** — a newer cell has the same subject and a *single-valued*
+  predicate with a different object, for *every* fact of the older cell (see
+  below for which predicates). The older cell is marked `superseded_at` /
+  `superseded_by` (never deleted); it is forgotten only if the superseder is
+  more important.
+
+The output reports the count per reason (`decayed`, `redundant`, `conflicted`),
+`superseded` (cells newly marked by the sweep), `kept`, `active`, `fuzzy`;
+`--json` keeps `dry_run`, `fuzzied`, `kept`, `active`, `fuzzy` and adds
+`reasons{decayed,redundant,conflicted}` and `superseded`. Definitions,
+deviations from the spec, and measurements: [`docs/adr/0005-existence-gain-forgetting.md`](docs/adr/0005-existence-gain-forgetting.md).
+
+Supersession happens when a cell is **added**, and it is reported: `mem3 add`
+prints `added memory id=7 (superseded: 4 [lives_in]; undo with mem3 unsupersede
+<id>)`, and with `--json` (also the HTTP `POST /api/memcells` response and the
+MCP `memory_add` result) `{"id":7,"superseded":[{"id":4,"subject":"user",
+"predicate":"lives_in"}]}`: which cells, on which predicate. A superseded cell is
+history, not an answer: it is left out of `query` unless you pass
+`--include-superseded` (HTTP body `"includeSuperseded":true`, MCP
+`include_superseded`).
+
+**Which predicates supersede.** By default only a short list of single-valued
+predicates: `lives_in`, `resides_in`, `located_in`, `works_at`, `employed_by`,
+`has_status`, `status`, `version`, `name`, `email`, `owner`, `born_in`,
+`birthday` and `current_*`. Everything else (`likes`, `knows`, `uses`, `is`,
+...) is treated as multi-valued: a second value never hides the first. A cell
+that also asserts a multi-valued fact is never hidden. Choose with
+`--supersede=functional|all|off` (default `functional`; `--no-supersede` is
+`off`; `all` treats *every* predicate as single-valued and hides "likes tea"
+behind "likes coffee") and replace the list with
+`--functional-predicates=a,b,c` (`+a,b` extends it, a trailing `*` is a prefix).
+Both apply to `add`, `forget`, `serve` and `mcp` for that process. The cost: a
+genuinely single-valued predicate that is *not* on the list (`shoe_size`) is no
+longer superseded automatically; both values stay visible.
+
+`mem3 unsupersede <id>` (MCP `memory_unsupersede`) undoes a wrong supersession:
+the cell is current again and pinned so a later write or sweep does not
+supersede it a second time. It is journaled first, and works on a cell that was
+already forgotten into the fuzzy store. An unknown id or a cell that is not
+superseded exits non-zero.
+
+`mem3 inspect <id>` prints `is_fuzzy`, `superseded_at`, `superseded_by`,
+`supersede_pinned` and `supersedes` (the ids this cell replaced), and also finds
+cells that have been forgotten. `mem3 dump` carries `superseded_at` /
+`superseded_by` / `supersede_pinned` on every line;
+`mem3 dump --include-fuzzy` appends the forgotten cells too.
+`--include-superseded` and `--include-fuzzy` are valueless switches (they do not
+swallow the next argument).
+
+> **Known weak spots.** (1) A *listed* predicate that is multi-valued in your
+> data (two jobs under `works_at`, several `email`s) will still hide an earlier
+> value; the add reports it and `unsupersede` undoes it, or drop the predicate
+> with `--functional-predicates`. (2) Single-valued predicates not on the list
+> are not superseded (row (c) of the evaluation in the ADR: the old value ranked
+> first in 39 of 60 queries). The first cut, which treated every predicate as
+> single-valued, wrongly superseded 120 of 180 multi-valued cells in the
+> synthetic evaluation and is now `--supersede=all`.
 
 Global flags: `--json`, `--data-dir=<path>` (default `data`), `--log-format=human|jsonl|silent`,
 `--log-every=<seconds>`, `--wal-sync=always|group|interval:<ms>`,
@@ -365,8 +441,8 @@ seconds; `--log-format=silent` also suppresses the startup banner.
 `serve` flags: `--port=<n>` (default 7777), `--bind=<addr>` (default 127.0.0.1).
 
 `mcp` speaks JSON-RPC 2.0 over stdin/stdout, one message per line, and exposes
-five tools: `memory_add`, `memory_query`, `goal_list`, `memory_forget`,
-`memory_stats`. `memory_forget` defaults to `dry_run: true`. It is hand-written
+six tools: `memory_add`, `memory_query`, `goal_list`, `memory_forget`,
+`memory_stats`, `memory_unsupersede`. `memory_forget` defaults to `dry_run: true`. It is hand-written
 against the std library — the zero-dependency rule is not relaxed here. Point an
 MCP client at it with:
 
@@ -781,6 +857,113 @@ These are enforced conventions, not style preferences. Do not regress them:
    confirm `zig build test` exits non-zero — a green gate that cannot go red is
    worse than no gate.
 
+### Continuous integration
+
+`.github/workflows/ci.yml` defines three jobs. **No GitHub runner has executed it
+yet; nothing here says CI is green.** The table separates what was run on a
+developer machine (macOS arm64 host, 2026-10-21) from what is only written.
+
+| Job | What it does |
+|---|---|
+| `build-and-test` (matrix: `ubuntu-latest` x86_64, `ubuntu-24.04-arm` aarch64, `macos-latest` arm64) | pinned-toolchain check, `zig build`, `scripts/check_linked_libs.sh` (Linux `ldd` / macOS `otool -L` allow-list, Constitution IV) on every installed executable, `zig build test`, `zig build check-constitution`, `zig build test -Doptimize=ReleaseFast` (**continue-on-error**: the `platform.clock.Timer` defect under "Known misses"; failures are annotated, not hidden), `zig build bench` smoke (never a gate), clean-working-tree check, and the "gate can go red" guard |
+| `cross-compile` (matrix: `x86_64-linux-gnu`, `aarch64-linux-gnu`, `x86_64-macos`, `aarch64-macos`) | whole project in Debug and ReleaseFast, artifact-format check with `file`, and `zig test --test-no-exec` of all three test roots. Compile-only |
+| `unsupported-targets` | `-Dtarget=x86_64-windows`, `wasm32-wasi`, `wasm32-freestanding` must fail **and** print the documented refusal (`mem3 supports macOS and Linux only`) |
+
+**Validated locally** (the shell of each step was extracted from the YAML and run
+by a small harness; Linux runs used Ubuntu 24.04 containers under OrbStack with
+the official Zig 0.17.0 tarball, sha256-checked):
+
+- YAML parses; `actionlint` 1.7.12 with `shellcheck` 0.11.0 reports nothing for
+  `ci.yml`; `shellcheck` is clean on `scripts/check_linked_libs.sh`.
+- `scripts/check_linked_libs.sh --self-test`: 23 cases (good and bad `ldd` and
+  `otool` output, prefix traps such as `libcrypto` vs `libc`, `not found`,
+  tool exiting non-zero, empty output, missing binary). Breaking the allow-list
+  turns it red (5 and 4 failing cases for the Linux and macOS mutations). Real
+  `otool -L` on macOS, and real `ldd` from aarch64 and x86_64 Ubuntu 24.04, accept
+  all 8 installed executables; x86_64 also lists `libm`/`libpthread`, both allowed.
+- `build-and-test` steps, in order, on macOS arm64 (fresh clone) and on Linux
+  aarch64 (container): everything passed except the two expected items — the
+  ReleaseFast test step (macOS: 550/551, only `Timer measures a non-zero,
+  monotonic duration`, every time; **Linux aarch64: intermittent** — 3 full runs,
+  Timer passed twice and failed once; alone, 186/300 ReleaseFast runs fail, 0/300
+  Debug) and
+  the Linux `zig build test` race below. The gate-can-go-red guard went red on
+  both. `python3 scripts/mcp_conformance.py` passes on macOS and, on Linux, passed
+56/56 (aarch64, first run), 56/56 (x86_64 cross-build under Rosetta) and 5/5 reruns;
+under a host load average of 130–195 (other jobs on the same Mac) both platforms
+also produced 55/56, the failing check on macOS being `a very large but legal request
+is answered, not refused` — a fixed 5 s wait in the script for a 200 KB query, which
+is a timing artefact of the loaded host rather than evidence about the server (the
+next run was 56/56). On Linux the failing check of that one 55/56 run was not captured.
+- `cross-compile` commands: all four targets built in Debug and ReleaseFast;
+  `file` output matched the expected format for all eight artifacts under
+  macOS `file` and Ubuntu's `file` 5.45; the test roots compiled for all four.
+- `unsupported-targets`: all three targets fail with the documented message;
+  substituting a bogus target makes the step go red.
+- x86_64 Linux was **executed** only through a cross-build (Debug mem3 and the three
+  test roots built on the Mac) run under Rosetta in an `amd64` container, because
+  Zig itself does not start under Rosetta (`bss_size overflow`). Results: 120/120 and
+  12/12 on `tests/main.zig` and the constitution root after the fix below;
+  `src/main.zig` 428 passed / 3 skipped (the pinned HNSW fingerprint tests skip by
+  design) with the embedder race failing intermittently.
+
+The Linux runs, reproducibly (aarch64; swap `arm64`/`aarch64` for x86_64 only
+for the cross-built variant, since Zig itself cannot start under Rosetta):
+
+```bash
+# Zig 0.17.0 tarball from https://ziglang.org/download/index.json, sha256-checked, unpacked to $ZIG_DIR
+git clone . /tmp/ci-clone
+docker run --rm --platform linux/arm64 -v $ZIG_DIR:/zig:ro -v /tmp/ci-clone:/repo ubuntu:24.04 bash -c '
+  export PATH=/zig:$PATH; git clone -q /repo /src && cd /src
+  zig build && ./scripts/check_linked_libs.sh --self-test && ./scripts/check_linked_libs.sh zig-out/bin/mem3
+  zig build test; zig build check-constitution; zig build test -Doptimize=ReleaseFast'
+# x86_64: cross-build on the host, run under Rosetta
+zig build -Dtarget=x86_64-linux-gnu --prefix work/zig-out
+zig test -target x86_64-linux-gnu --test-no-exec -femit-bin=work/t --dep mem3 -Mroot=src/main.zig -lc -Mmem3=src/lib.zig -lc
+docker run --rm --platform linux/amd64 -v $PWD/work:/work ubuntu:24.04 /work/t
+```
+
+Final run on the merged tree (2026-10-22): Linux aarch64 `zig build` ok, linked-libs
+ok, `zig build test` 550/551 (embedder race), `check-constitution` 12/12,
+ReleaseFast 549/551 (Timer + embedder race), bench ok, tree clean, red guard
+works, `mcp_conformance` 56/56.
+
+**Written but not run anywhere:** the GitHub-hosted runners themselves
+(`ubuntu-24.04-arm`, `macos-latest`), `mlugg/setup-zig@v2` and its cache, the
+`concurrency` block, `$GITHUB_STEP_SUMMARY` rendering and `::warning`
+annotations, and the `x86_64-macos` binary (compile-only; no Intel runner and no
+Intel Mac). No qemu was installed or used; the only emulation was Rosetta.
+
+**What the first Linux runs found** (the suite had only ever been cross-compiled
+for Linux before):
+
+1. `src/storage/wal.zig` test called `std.c.fstat`; `std.c.Stat` is `void` on Linux,
+   so the whole `src/main.zig` test binary did not compile there. Fixed (the test
+   now reads through `platform/fs`).
+2. `tests/unit/cli.zig` used `expectEqual` on two string slices (pointer
+   comparison); it failed on x86_64 Debug builds. Fixed (`expectEqualStrings`).
+3. **Fixed afterwards:** `ExternalEmbedder: a backend that dies mid-request is
+   BackendExited` was a race in `src/retrieval/embedder.zig`. When the backend
+   exits between the liveness check and the pipe write, `embed` sees `EPIPE`,
+   re-checks `waitpid(WNOHANG)`, and the child — its pipes already closed but not yet
+   reapable — still looks alive, so it returned `WriteFailed` instead of
+   `BackendExited`. Measured over 200 runs of that test alone, before the fix:
+   Linux aarch64 111/200 (Debug) and 120/200 (ReleaseFast) failed, Linux x86_64
+   76/200, macOS arm64 4/200. The fix makes `embed` wait up to 250 ms for the
+   child to become reapable after `EPIPE` (it returns as soon as the child can be
+   collected). Re-measured in the same Linux arm64 container, interleaved, 200
+   runs each: **101/200 failed before, 0/200 after**; macOS 1/200 before, 0/400
+   after. Linux x86_64 and ReleaseFast were not re-measured after the fix.
+
+4. Timing-sensitive, not investigated: `GoalPoset: bindMemcell is O(1)
+   amortised, not O(k) per insert` (`large < small * 3`, a wall-clock ratio)
+   failed once on Linux aarch64 in a final run made while the host's load average
+   was above 100. Expect it to flake on a busy runner.
+
+The `scripts/verify.sh` "Linux runtime behaviour" caveat still holds for that
+script itself (it only cross-compiles); the container runs above are a one-off,
+recorded here, not something `verify.sh` reproduces.
+
 ## Status and limitations
 
 Known and measured, not discovered after the fact:
@@ -955,9 +1138,12 @@ What remains is an architecture-specific non-foldable counter — `rdtsc` on
 x86_64, `cntvct_el0` on aarch64 — read through inline `asm volatile` with an
 output operand, which LLVM cannot fold by construction. That is a real change to
 the platform layer that every benchmark depends on, and **it has not been
-written**: it cannot be validated on Linux from this machine (no qemu, no
-container, no Linux host), and shipping an unverified timing primitive would be
-worse than the bug, because it would fail silently in the same way.
+written**. A Linux container turned out to be available (see "Continuous
+integration"), and in it the fold also shows up on Linux aarch64, but only
+intermittently (the Timer test alone fails 186/300 runs in ReleaseFast and 0/300
+in Debug; macOS arm64 fails every time). Linux x86_64 was measured only under
+Rosetta (0/300), which is not a native result. Shipping an unverified timing primitive would still
+be worse than the bug, because it would fail silently in the same way.
 
 **Write throughput meets its amended target; the old 10,000 figure did not.**
 The release target is now 1,750 cells/sec sustained, judged on the

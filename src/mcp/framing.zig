@@ -1,6 +1,6 @@
 //! Line framing for the newline-delimited JSON-RPC stream.
 //!
-//! **GHW layer**: Harness 层 (象源). Framing is regulatory: it decides
+//! **GHW layer**: Harness layer (form source). Framing is regulatory: it decides
 //! which bytes are a *message* before any of them are allowed to mean
 //! anything to the memory system.
 //!

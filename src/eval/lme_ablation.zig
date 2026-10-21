@@ -1,6 +1,6 @@
 //! Ablation switches for the LongMemEval retrieval harness.
 //!
-//! **GHW layer**: Harness 层 (象源). Evaluation protocol only. Every switch
+//! **GHW layer**: Harness layer (form source). Evaluation protocol only. Every switch
 //! here acts on the *harness side* of the product's public surface — the
 //! arguments of `addRaw` / `createGoal` / `addHyperedge`, the config copies
 //! the `Store` exposes (`store.lc.cfg`, `store.hybrid.cfg`) and the ranking
@@ -19,7 +19,7 @@ const stats = @import("paired_stats.zig");
 const store_mod = @import("../store/store.zig");
 
 pub const TagMode = enum {
-    /// Every cell 物. This is what the harness has always done.
+    /// Every cell matter. This is what the harness has always done.
     matter,
     form,
     spirit,
@@ -73,7 +73,7 @@ pub const Variant = struct {
     session_edges: bool = false,
     /// Set `created_at` from the dataset's dates so recency is real.
     simulate_age: bool = false,
-    /// Cells the heuristic calls 性 carry an unexpired foresight entry.
+    /// Cells the heuristic calls spirit carry an unexpired foresight entry.
     foresight_on_spirit: bool = false,
     router: RouterMode = .none,
     router_boost: f32 = 1.25,
@@ -447,9 +447,9 @@ const SYNTH_TOPICS = [_][]const u8{
 };
 
 /// SYNTHETIC source-routed task. Ten topics, each stored as three cells with
-/// identical text and different tags (物/象/性). The query repeats the topic
-/// and ends with "how to", which the §3.1 router reads as 象; the target is
-/// the 象 cell. The store has no source argument, so routing is the
+/// identical text and different tags (matter/form/spirit). The query repeats the topic
+/// and ends with "how to", which the §3.1 router reads as form; the target is
+/// the form cell. The store has no source argument, so routing is the
 /// harness-side `routeOrder` over the ranking `Store.query` returned. Chance
 /// is 1/3 (the product's own tie-break, which prefers slow-decay sources by
 /// float rounding, is not chance, which is why the target is the *middle*

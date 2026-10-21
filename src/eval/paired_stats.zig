@@ -1,6 +1,6 @@
 //! Paired-difference statistics for the ablation harness.
 //!
-//! **GHW layer**: Harness 层 (象源). Evaluation arithmetic only; nothing here
+//! **GHW layer**: Harness layer (form source). Evaluation arithmetic only; nothing here
 //! is on a product code path and nothing here touches a `Store`.
 //!
 //! One job: given per-question *paired* deltas (variant minus baseline on the

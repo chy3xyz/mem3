@@ -1,7 +1,7 @@
 //! Retrieval evaluation against the OFFICIAL LongMemEval dataset
 //! (Wu et al., `xiaowu0162/longmemeval-cleaned`).
 //!
-//! **GHW layer**: Harness 层 (象源). This is evaluation protocol: it turns an
+//! **GHW layer**: Harness layer (form source). This is evaluation protocol: it turns an
 //! external dataset into a store, a query and a score. It adds no memory
 //! semantics of its own and never changes a product default.
 //!
@@ -592,7 +592,7 @@ fn createSessionGoals(
 ///
 /// `opts.variant` selects an ablation (pre-registered in
 /// `docs/benchmarks/ablation-tri-source.md`). With the default variant every
-/// call below is the call the harness always made: source 物, goal 1,
+/// call below is the call the harness always made: source matter, goal 1,
 /// relevance 0.5, product weights.
 pub fn rank(alloc: Allocator, q: Question, opts: Options) !Ranked {
     const v = opts.variant;
@@ -615,7 +615,7 @@ pub fn rank(alloc: Allocator, q: Question, opts: Options) !Ranked {
     var diag = Diag{};
 
     // Per-document tag, goal and cell id. All three are trivial under the
-    // default variant (every doc 物, goal 1, no extra bookkeeping).
+    // default variant (every doc matter, goal 1, no extra bookkeeping).
     const tags = try alloc.alloc(core.MemorySource, docs.len);
     defer alloc.free(tags);
     {
@@ -651,7 +651,7 @@ pub fn rank(alloc: Allocator, q: Question, opts: Options) !Ranked {
             empty_text += 1;
             continue;
         }
-        // Default: source 物 (a dialogue turn is a raw trace of what
+        // Default: source matter (a dialogue turn is a raw trace of what
         // happened), goal 1, relevance 0.5 -- the call this harness always made.
         const added = if (v.foresight_on_spirit and tags[i] == .spirit)
             store.addRawWithForesight(tags[i], d.text, "", goal_ids[i], relevance, &intent_foresight)
@@ -1293,7 +1293,7 @@ test "variant: diagnostics report what was actually done" {
     try std.testing.expectEqual(@as(u32, 3), r.diag.goals_created);
     try std.testing.expectEqual(@as(u32, 0), r.diag.edges_created);
     // "I bought a refractor telescope..." / "Which sourdough..." / "Planning a trip..."
-    // -> none of the pre-registered phrases ("planning to" needs "to") -> all 物.
+    // -> none of the pre-registered phrases ("planning to" needs "to") -> all matter.
     try std.testing.expectEqual(@as(u32, 3), r.diag.tag_counts[0] + r.diag.tag_counts[1] + r.diag.tag_counts[2]);
 }
 
