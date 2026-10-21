@@ -30,6 +30,11 @@
 //!   --scale-only     skip report 1
 //!   --scale-off      skip report 2
 //!   --build-only     build only: print build time, skip the recall scan
+//!   --int8           store vectors as int8 (hnsw_vector_storage = .int8)
+//!   --adaptive D     budget = max(ef, live_count / D) (hnsw_ef_search_divisor).
+//!                    Default 0 = off here, so an --ef sweep is a fixed budget
+//!                    (the library default is 64)
+//!   --latency        also time the searches (mean / worst batch of 10, ms/query)
 
 const std = @import("std");
 const mem3 = @import("mem3");
@@ -55,6 +60,9 @@ const Options = struct {
     scale_only: bool = false,
     scale_off: bool = false,
     build_only: bool = false,
+    int8: bool = false,
+    adaptive: u16 = 0,
+    latency: bool = false,
 };
 
 fn parseU16(s: []const u8) u16 {
@@ -69,6 +77,8 @@ fn applyOverrides(cfg: *mem3.Config, o: Options) void {
     if (o.m) |v| cfg.hnsw_m = v;
     if (o.m_max0) |v| cfg.hnsw_m_max0 = v;
     if (o.efc) |v| cfg.hnsw_ef_construction = v;
+    if (o.int8) cfg.hnsw_vector_storage = .int8;
+    cfg.hnsw_ef_search_divisor = o.adaptive;
 }
 
 /// One corpus at one width: build, sweep `efs`, report recall, the layer-0
@@ -82,6 +92,7 @@ fn report(
     label: []const u8,
     measure_time: bool,
     build_only: bool,
+    latency: bool,
 ) !void {
     var cfg = base_cfg;
     var it = efs;
@@ -128,6 +139,7 @@ fn report(
         hnsw.cfg.hnsw_ef_search = ef;
         const r = try hnsw_mod.recallAgainst(&hnsw, alloc, corpus, spec);
         out("  {d:>3}   {d:.4}\n", .{ ef, r });
+        if (latency) try timeSearches(&hnsw, alloc, corpus, spec);
     }
     if (measure_time and build_ns != 0) {
         out("  mean insert {d:.1} us/op over {d} nodes\n", .{
@@ -135,6 +147,42 @@ fn report(
             spec.n,
         });
     }
+}
+
+/// Search latency at the current budget: 10 batches of 10 queries, each
+/// batch timed as a whole (sub-region timings fold to 0 under ReleaseFast,
+/// see `timeBuild`). Prints the mean and the slowest batch, ms/query. A
+/// per-query p95 is not measured; the slowest batch bounds it from above
+/// only loosely, so it is reported as what it is.
+fn timeSearches(hnsw: *hnsw_mod.HNSW, alloc: std.mem.Allocator, corpus: []const f32, spec: hnsw_mod.OracleSpec) !void {
+    const dim: usize = spec.dim;
+    const qv = try alloc.alloc(f32, dim);
+    defer alloc.free(qv);
+    const noise = try alloc.alloc(f32, dim);
+    defer alloc.free(noise);
+    var total: i128 = 0;
+    var worst: i128 = 0;
+    var sink: u64 = 0;
+    var b: usize = 0;
+    while (b < 10) : (b += 1) {
+        var batch_ns: i128 = 0;
+        var i: usize = 0;
+        while (i < 10) : (i += 1) {
+            hnsw_mod.oracleQueryN(qv, noise, corpus, b * 10 + i, spec.n, dim);
+            const t0 = mem3.platform.clock.monotonicNs();
+            const got = try hnsw.search(alloc, qv, spec.k);
+            sink +%= if (got.len > 0) got[0].id else 0;
+            alloc.free(got);
+            batch_ns += mem3.platform.clock.monotonicNs() - t0;
+        }
+        total += batch_ns;
+        if (batch_ns > worst) worst = batch_ns;
+    }
+    out("        latency mean {d:.2} ms/query  slowest batch {d:.2} ms/query  (sink {d})\n", .{
+        @as(f64, @floatFromInt(total)) / 100.0 / 1e6,
+        @as(f64, @floatFromInt(worst)) / 10.0 / 1e6,
+        sink,
+    });
 }
 
 /// Average per-insert nanoseconds, timed over a whole build whose result is
@@ -172,7 +220,7 @@ fn report1(alloc: std.mem.Allocator, cfg: mem3.Config, o: Options) !void {
         .queries = hnsw_mod.oracle_queries,
         .k = hnsw_mod.oracle_k,
     };
-    try report(alloc, cfg, spec, &EFS, "ef sweep", true, o.build_only);
+    try report(alloc, cfg, spec, &EFS, "ef sweep", true, o.build_only, o.latency);
 
     out("\nGraph shape:\n", .{});
     var g = cfg;
@@ -226,7 +274,7 @@ fn report2(alloc: std.mem.Allocator, cfg: mem3.Config, o: Options) !void {
             if (e != 0) try efs.append(alloc, e);
         }
 
-        try report(alloc, cfg, spec, efs.items, "scale", true, o.build_only);
+        try report(alloc, cfg, spec, efs.items, "scale", true, o.build_only, o.latency);
     }
 }
 
@@ -260,6 +308,12 @@ pub fn main(init: std.process.Init.Minimal) !void {
             o.scale_only = true;
         } else if (std.mem.eql(u8, a, "--scale-off")) {
             o.scale_off = true;
+        } else if (std.mem.eql(u8, a, "--adaptive")) {
+            o.adaptive = parseU16(args.next() orelse "0");
+        } else if (std.mem.eql(u8, a, "--latency")) {
+            o.latency = true;
+        } else if (std.mem.eql(u8, a, "--int8")) {
+            o.int8 = true;
         } else if (std.mem.eql(u8, a, "--build-only")) {
             o.build_only = true;
         }

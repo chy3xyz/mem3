@@ -107,6 +107,74 @@ fn normOf(v: []const f32) f32 {
     return @sqrt(s);
 }
 
+/// Integer dot product of two int8 vectors whose components are in
+/// [-127, 127].
+///
+/// Exact, so identical on every target: a product is at most 127^2 = 16,129,
+/// the sum of two is at most 32,258 and still fits an i16, which lets the
+/// pairwise add happen at 16 bits before widening to the i32 accumulators.
+/// (-128 would break that bound; `quantizeInto` never produces it.)
+fn dotI8(a: []const i8, b: []const i8) i32 {
+    const n = @min(a.len, b.len);
+    const V = @Vector(16, i8);
+    const P = @Vector(16, i16);
+    const H = @Vector(8, i16);
+    const W = @Vector(8, i32);
+    var acc0: W = @splat(0);
+    var acc1: W = @splat(0);
+    const even = [8]i32{ 0, 2, 4, 6, 8, 10, 12, 14 };
+    const odd = [8]i32{ 1, 3, 5, 7, 9, 11, 13, 15 };
+
+    var i: usize = 0;
+    while (i + 32 <= n) : (i += 32) {
+        const a0: *align(1) const V = @ptrCast(a.ptr + i);
+        const b0: *align(1) const V = @ptrCast(b.ptr + i);
+        const a1: *align(1) const V = @ptrCast(a.ptr + i + 16);
+        const b1: *align(1) const V = @ptrCast(b.ptr + i + 16);
+        const p0: P = @as(P, a0.*) * @as(P, b0.*);
+        const p1: P = @as(P, a1.*) * @as(P, b1.*);
+        const s0: H = @shuffle(i16, p0, undefined, even) + @shuffle(i16, p0, undefined, odd);
+        const s1: H = @shuffle(i16, p1, undefined, even) + @shuffle(i16, p1, undefined, odd);
+        acc0 += @as(W, s0);
+        acc1 += @as(W, s1);
+    }
+    while (i + 16 <= n) : (i += 16) {
+        const a0: *align(1) const V = @ptrCast(a.ptr + i);
+        const b0: *align(1) const V = @ptrCast(b.ptr + i);
+        const p0: P = @as(P, a0.*) * @as(P, b0.*);
+        const s0: H = @shuffle(i16, p0, undefined, even) + @shuffle(i16, p0, undefined, odd);
+        acc0 += @as(W, s0);
+    }
+    var tail: i32 = 0;
+    while (i < n) : (i += 1) tail += @as(i32, a[i]) * @as(i32, b[i]);
+    return @reduce(.Add, acc0 + acc1) + tail;
+}
+
+/// Quantise `v` into `out` (same length): scale so the largest finite
+/// magnitude maps to 127, round half away from zero. Non-finite components
+/// become 0 — `@intFromFloat` of a NaN is illegal behaviour — and an
+/// all-zero input stays all zero. Returns the integer norm
+/// sqrt(sum out[i]^2), the only norm cosine needs because the scale cancels.
+fn quantizeInto(out: []i8, v: []const f32) f32 {
+    var m: f32 = 0.0;
+    for (v) |x| {
+        if (std.math.isFinite(x)) m = @max(m, @abs(x));
+    }
+    if (m == 0.0) {
+        @memset(out, 0);
+        return 0.0;
+    }
+    const s = 127.0 / m;
+    var sumsq: i64 = 0;
+    for (out, v) |*o, x| {
+        const y: f32 = if (std.math.isFinite(x)) x * s else 0.0;
+        const r: i32 = @intFromFloat(std.math.clamp(@round(y), -127.0, 127.0));
+        o.* = @intCast(r);
+        sumsq += @as(i64, r) * r;
+    }
+    return @floatCast(@sqrt(@as(f64, @floatFromInt(sumsq))));
+}
+
 /// A query vector paired with its precomputed norm.
 ///
 /// The norm used to be recomputed from scratch inside every cosine call,
@@ -116,6 +184,10 @@ fn normOf(v: []const f32) f32 {
 pub const Query = struct {
     vec: []const f32,
     norm: f32,
+    /// Set only when the index stores int8 vectors: the quantised query and
+    /// its integer norm. `vec`/`norm` stay the exact float form.
+    q8: []const i8 = &.{},
+    q8_norm: f32 = 0.0,
 
     pub fn of(v: []const f32) Query {
         return .{ .vec = v, .norm = normOf(v) };
@@ -256,8 +328,14 @@ pub const HNSW = struct {
     /// `Node.vector` slice into one stays valid and growing the index never
     /// copies existing vectors (a single growing buffer would double peak
     /// RSS at every doubling).
-    vec_chunks: std.ArrayList([]align(64) f32) = .empty,
+    vec_chunks: std.ArrayList([]align(64) u8) = .empty,
     chunk_shift: u5 = 0,
+    /// Bytes per stored vector: `4 * dim` for f32, `dim` for int8.
+    vec_stride: usize = 0,
+    /// `cfg.hnsw_vector_storage == .int8`, fixed at `init`.
+    int8: bool = false,
+    /// The quantised form of the vector being inserted or searched.
+    scratch_q8: std.ArrayList(i8) = .empty,
 
     /// Neighbours to score for the node currently being expanded: collected
     /// first so their vectors can be prefetched while the earlier ones are
@@ -277,13 +355,16 @@ pub const HNSW = struct {
     pub fn init(alloc: Allocator, cfg: Config, dim: u16) HNSW {
         // About 1 MiB per chunk, at least one vector, a power of two so the
         // index-to-chunk split is a shift and a mask.
-        const bytes_per_vec: usize = @as(usize, @max(dim, 1)) * @sizeOf(f32);
+        const is_int8 = cfg.hnsw_vector_storage == .int8;
+        const bytes_per_vec: usize = @as(usize, @max(dim, 1)) * (if (is_int8) @as(usize, 1) else @sizeOf(f32));
         const per_chunk: usize = @max(chunk_target_bytes / bytes_per_vec, 1);
         return .{
             .alloc = alloc,
             .cfg = cfg,
             .dim = dim,
             .chunk_shift = @intCast(std.math.log2_int(usize, per_chunk)),
+            .vec_stride = bytes_per_vec,
+            .int8 = is_int8,
             .nodes = std.AutoHashMap(u64, *Node).init(alloc),
             .entry_point = null,
             .max_level = 0,
@@ -304,6 +385,7 @@ pub const HNSW = struct {
         self.norms.deinit(self.alloc);
         self.scratch_pending.deinit(self.alloc);
         self.scratch_cands.deinit(self.alloc);
+        self.scratch_q8.deinit(self.alloc);
         self.scratch_kept.deinit(self.alloc);
         self.visit_stamp.deinit(self.alloc);
         self.dense.deinit(self.alloc);
@@ -337,32 +419,64 @@ pub const HNSW = struct {
         return self.by_idx.items[idx];
     }
 
-    /// The `dim` floats of node `idx`, inside the arena.
-    fn vectorAt(self: *const HNSW, idx: u32) []f32 {
-        return self.vectorSlot(idx);
-    }
-
-    fn vectorSlot(self: *const HNSW, idx: u32) []f32 {
+    /// The raw bytes of node `idx`'s vector, inside the arena.
+    fn vectorBytes(self: *const HNSW, idx: u32) []u8 {
         const chunk = self.vec_chunks.items[idx >> self.chunk_shift];
         const mask: usize = (@as(usize, 1) << self.chunk_shift) - 1;
-        const off = (@as(usize, idx) & mask) * self.dim;
-        return chunk[off..][0..self.dim];
+        const off = (@as(usize, idx) & mask) * self.vec_stride;
+        return chunk[off..][0..self.vec_stride];
+    }
+
+    /// The `dim` floats of node `idx`. f32 storage only.
+    fn vectorAt(self: *const HNSW, idx: u32) []f32 {
+        return @alignCast(std.mem.bytesAsSlice(f32, self.vectorBytes(idx)));
+    }
+
+    /// The `dim` quantised components of node `idx`. int8 storage only.
+    fn vector8At(self: *const HNSW, idx: u32) []i8 {
+        return std.mem.bytesAsSlice(i8, self.vectorBytes(idx));
+    }
+
+    /// Prepare `v` for scoring against this index: its norm, and in int8
+    /// mode its quantised form (held in `scratch_q8`, valid until the next
+    /// `prepare`).
+    fn prepare(self: *HNSW, v: []const f32) !Query {
+        var q = Query.of(v);
+        if (self.int8) {
+            try self.scratch_q8.resize(self.alloc, v.len);
+            q.q8_norm = quantizeInto(self.scratch_q8.items, v);
+            q.q8 = self.scratch_q8.items;
+        }
+        return q;
     }
 
     /// Cosine of a prepared query against node `idx`, read from the arrays
-    /// rather than through the node. Same arithmetic as `score`.
+    /// rather than through the node.
     fn scoreIdx(self: *const HNSW, q: Query, idx: u32) f32 {
+        if (self.int8) {
+            const denom = q.q8_norm * self.norms.items[idx];
+            if (denom == 0.0) return 0.0;
+            return @as(f32, @floatFromInt(dotI8(q.q8, self.vector8At(idx)))) / denom;
+        }
         const denom = q.norm * self.norms.items[idx];
         if (denom == 0.0) return 0.0;
         return dotProduct(q.vec, self.vectorAt(idx)) / denom;
+    }
+
+    /// Cosine between two indexed nodes, both norms cached. Used by the
+    /// diversity rule in `shrinkConnections`.
+    fn simIdx(self: *const HNSW, a: u32, b: u32) f32 {
+        const denom = self.norms.items[a] * self.norms.items[b];
+        if (denom == 0.0) return 0.0;
+        if (self.int8) return @as(f32, @floatFromInt(dotI8(self.vector8At(a), self.vector8At(b)))) / denom;
+        return dotProduct(self.vectorAt(a), self.vectorAt(b)) / denom;
     }
 
     /// Ask the cache for a vector before it is scored. One hint per line:
     /// the hardware prefetcher would pick up a sequential stream after a
     /// couple of misses, but those misses are the cost being avoided.
     fn prefetchVector(self: *const HNSW, idx: u32) void {
-        const v = self.vectorAt(idx);
-        const bytes = std.mem.sliceAsBytes(v);
+        const bytes = self.vectorBytes(idx);
         var off: usize = 0;
         while (off < bytes.len) : (off += 64) {
             @prefetch(bytes.ptr + off, .{ .rw = .read, .locality = 3, .cache = .data });
@@ -469,7 +583,7 @@ pub const HNSW = struct {
         // Before any allocation: a rejected insert has nothing to free.
         if (id <= self.max_id and self.nodes.contains(id)) return errors.DuplicateId;
 
-        const q = Query.of(vector);
+        const q = try self.prepare(vector);
         const level = self.randomLevel();
         // The errdefers below are scoped to this block on purpose. Once the
         // node is committed, `nodes` owns it: an error from the linking
@@ -487,7 +601,7 @@ pub const HNSW = struct {
             if ((idx >> self.chunk_shift) == self.vec_chunks.items.len) {
                 const per_chunk: usize = @as(usize, 1) << self.chunk_shift;
                 try self.vec_chunks.ensureUnusedCapacity(self.alloc, 1);
-                const chunk = try self.alloc.alignedAlloc(f32, .@"64", per_chunk * self.dim);
+                const chunk = try self.alloc.alignedAlloc(u8, .@"64", per_chunk * self.vec_stride);
                 self.vec_chunks.appendAssumeCapacity(chunk);
             }
             const neighbors = try self.alloc.alloc(std.ArrayList(u64), level + 1);
@@ -505,12 +619,21 @@ pub const HNSW = struct {
             try self.nodes.ensureUnusedCapacity(1);
             try self.trackDense(id, idx);
 
-            const vec_copy = self.vectorSlot(idx);
-            @memcpy(vec_copy, vector);
+            // int8 storage keeps no float copy: `Node.vector` is empty and the
+            // quantised bytes live only in the arena.
+            var vec_copy: []f32 = &.{};
+            var norm: f32 = undefined;
+            if (self.int8) {
+                norm = quantizeInto(self.vector8At(idx), vector);
+            } else {
+                vec_copy = self.vectorAt(idx);
+                @memcpy(vec_copy, vector);
+                norm = normOf(vec_copy);
+            }
             n.* = .{
                 .id = id,
                 .vector = vec_copy,
-                .norm = normOf(vec_copy),
+                .norm = norm,
                 .dense_idx = idx,
                 .level = level,
                 .neighbors = neighbors,
@@ -619,7 +742,7 @@ pub const HNSW = struct {
         const node = self.nodes.get(id) orelse return false;
         if (node.deleted) return false;
         node.deleted = true;
-        @memset(node.vector, 0.0);
+        @memset(self.vectorBytes(node.dense_idx), 0);
         // Its outgoing edges are not followed for results any more, and
         // leaving them would let a tombstone pin memory through the
         // neighbour lists that still name it.
@@ -632,12 +755,16 @@ pub const HNSW = struct {
     pub fn search(self: *HNSW, alloc: Allocator, query: []const f32, k: usize) errors![]SearchResult {
         if (query.len != self.dim) return errors.InvalidQuery;
         if (self.entry_point == null) return &.{};
-        const q = Query.of(query);
+        const q = try self.prepare(query);
         // Over-fetch, because tombstoned candidates are dropped below and
         // a swept store would otherwise come back short. Three times is
         // arbitrary but bounded; returning fewer than `k` live hits is not
         // a correctness failure, just a smaller result set.
-        const want = @max(k, @as(usize, self.cfg.hnsw_ef_search));
+        var ef: usize = self.cfg.hnsw_ef_search;
+        if (self.cfg.hnsw_ef_search_divisor != 0) {
+            ef = @max(ef, self.count / self.cfg.hnsw_ef_search_divisor);
+        }
+        const want = @max(k, ef);
         const fetch = @min(self.count, want + want / 2);
         const cands = try self.searchInternal(q, fetch, 0);
 
@@ -647,7 +774,7 @@ pub const HNSW = struct {
             if (out.items.len == k) break;
             const node = self.nodeFor(id) orelse continue;
             if (node.deleted) continue;
-            try out.append(alloc, .{ .id = id, .score = score(q, node) });
+            try out.append(alloc, .{ .id = id, .score = self.scoreIdx(q, node.dense_idx) });
         }
         return out.toOwnedSlice(alloc);
     }
@@ -1012,12 +1139,12 @@ pub const HNSW = struct {
             if (kept.items.len >= limit) break;
             if (containsId(kept.items, c.id)) continue;
 
-            const cn = self.nodeFor(c.id).?;
+            const cn = self.idxFor(c.id).?;
             var evict: ?usize = null;
             if (kept.items.len > 0) {
                 for (kept.items, 0..) |kid, ki| {
-                    const kn = self.nodeFor(kid) orelse continue;
-                    if (nodeSim(cn, kn) >= c.score) {
+                    const kn = self.idxFor(kid) orelse continue;
+                    if (self.simIdx(cn, kn) >= c.score) {
                         evict = ki;
                         break;
                     }
@@ -1190,24 +1317,6 @@ pub const HNSW = struct {
         return dotProduct(a, b) / denom;
     }
 };
-
-/// Cosine of a prepared query against an indexed node.
-///
-/// Both norms are cached, so this is one vectorised pass over 384 bytes
-/// instead of three passes over 1,152.
-fn score(q: Query, n: *const Node) f32 {
-    const denom = q.norm * n.norm;
-    if (denom == 0.0) return 0.0;
-    return dotProduct(q.vec, n.vector) / denom;
-}
-
-/// Cosine between two indexed nodes, both norms cached. Used by
-/// `shrinkConnections` rule (b).
-fn nodeSim(a: *const Node, b: *const Node) f32 {
-    const denom = a.norm * b.norm;
-    if (denom == 0.0) return 0.0;
-    return dotProduct(a.vector, b.vector) / denom;
-}
 
 // =============================================================================
 // Tests
@@ -2338,4 +2447,124 @@ test "HNSW: a failed insert leaves the per-node arrays in lockstep and leaks not
         try std.testing.expectEqual(hnsw.count, hnsw.nodes.count());
         try std.testing.expectEqual(hnsw.count, hnsw.by_idx.items.len);
     }
+}
+
+// =============================================================================
+// int8 vector storage
+// =============================================================================
+
+fn refDotI8(a: []const i8, b: []const i8) i32 {
+    var s: i32 = 0;
+    for (a, b) |x, y| s += @as(i32, x) * @as(i32, y);
+    return s;
+}
+
+test "HNSW: dotI8 equals the scalar reference at every width, extremes included" {
+    var prng = std.Random.DefaultPrng.init(0xD07);
+    const r = prng.random();
+    var a: [700]i8 = undefined;
+    var b: [700]i8 = undefined;
+    for ([_]usize{ 0, 1, 3, 15, 16, 17, 31, 32, 33, 100, 384, 700 }) |n| {
+        for (0..20) |_| {
+            for (a[0..n], b[0..n]) |*x, *y| {
+                x.* = r.intRangeAtMost(i8, -127, 127);
+                y.* = r.intRangeAtMost(i8, -127, 127);
+            }
+            try std.testing.expectEqual(refDotI8(a[0..n], b[0..n]), dotI8(a[0..n], b[0..n]));
+        }
+        // The overflow bound the i16 pairwise add relies on.
+        @memset(a[0..n], 127);
+        @memset(b[0..n], 127);
+        try std.testing.expectEqual(refDotI8(a[0..n], b[0..n]), dotI8(a[0..n], b[0..n]));
+        @memset(b[0..n], -127);
+        try std.testing.expectEqual(refDotI8(a[0..n], b[0..n]), dotI8(a[0..n], b[0..n]));
+    }
+}
+
+test "HNSW: quantizeInto scales to 127, never emits -128, tolerates zero and non-finite" {
+    var out: [6]i8 = undefined;
+    const norm = quantizeInto(&out, &.{ 0.5, -1.0, 0.25, 0.0, 1.0, -0.5 });
+    try std.testing.expectEqualSlices(i8, &.{ 64, -127, 32, 0, 127, -64 }, &out);
+    try std.testing.expectApproxEqAbs(@sqrt(@as(f32, 64 * 64 + 127 * 127 + 32 * 32 + 127 * 127 + 64 * 64)), norm, 1e-3);
+
+    try std.testing.expectEqual(@as(f32, 0.0), quantizeInto(&out, &.{ 0, 0, 0, 0, 0, 0 }));
+    try std.testing.expectEqualSlices(i8, &.{ 0, 0, 0, 0, 0, 0 }, &out);
+
+    _ = quantizeInto(&out, &.{ std.math.nan(f32), std.math.inf(f32), 2.0, -2.0, 0, 1.0 });
+    try std.testing.expectEqualSlices(i8, &.{ 0, 0, 127, -127, 0, 64 }, &out);
+    for (out) |x| try std.testing.expect(x != -128);
+}
+
+test "HNSW: int8 storage finds the same neighbours, keeps no float copy, and survives delete" {
+    const alloc = std.testing.allocator;
+    const dim: u16 = 48;
+    const n: usize = 400;
+    const corpus = try oracleCorpusN(alloc, n, dim);
+    defer alloc.free(corpus);
+
+    var cfg = Config{};
+    cfg.hnsw_vector_storage = .int8;
+    var idx = HNSW.init(alloc, cfg, dim);
+    defer idx.deinit();
+    idx.chunk_shift = 3; // cross chunk boundaries
+    try oracleFillN(&idx, corpus, n, dim);
+
+    // 1 byte per dimension, no per-node float copy.
+    try std.testing.expectEqual(@as(usize, dim), idx.vec_stride);
+    try std.testing.expectEqual(@as(usize, 0), idx.nodes.get(1).?.vector.len);
+    // Reachability is a property of the graph; compare with the exact index
+    // on the same corpus rather than assuming 100%.
+    var exact = HNSW.init(alloc, .{}, dim);
+    defer exact.deinit();
+    try oracleFillN(&exact, corpus, n, dim);
+    const reach8 = try idx.level0Reachable(alloc);
+    const reach32 = try exact.level0Reachable(alloc);
+    try std.testing.expect(reach8 + 2 >= reach32);
+
+    // Every corpus member is its own nearest neighbour, with cosine ~ 1.
+    var hits: usize = 0;
+    for (0..n) |i| {
+        const res = try idx.search(alloc, corpus[i * dim ..][0..dim], 1);
+        defer alloc.free(res);
+        if (res.len == 1 and res[0].id == i + 1) {
+            hits += 1;
+            try std.testing.expect(res[0].score > 0.999);
+        }
+    }
+    try std.testing.expect(hits >= n * 99 / 100);
+
+    // Recall against the exact scan stays close to the f32 index.
+    const spec = OracleSpec{ .n = n, .dim = dim, .queries = 50, .k = 10 };
+    const r8 = try recallAgainst(&idx, alloc, corpus, spec);
+    try std.testing.expect(r8 >= 0.95);
+
+    // Tombstoning zeroes the quantised bytes and the result drops out.
+    try std.testing.expect(idx.markDeleted(5));
+    for (idx.vectorBytes(idx.nodes.get(5).?.dense_idx)) |b| try std.testing.expectEqual(@as(u8, 0), b);
+    const res = try idx.search(alloc, corpus[4 * dim ..][0..dim], 10);
+    defer alloc.free(res);
+    for (res) |x| try std.testing.expect(x.id != 5);
+}
+
+test "HNSW: adaptive ef_search buys recall at a small budget, and is inert when off or too coarse" {
+    const alloc = std.testing.allocator;
+    const spec = OracleSpec{ .n = 3000, .dim = 64, .queries = 30, .k = 10 };
+
+    var cfg = Config{};
+    cfg.hnsw_ef_search = 20;
+    cfg.hnsw_ef_search_divisor = 0; // the default is adaptive; this is the control
+    const fixed = try oracleRecallAt(alloc, spec, cfg, 20);
+
+    // Divisor larger than the corpus: count / divisor == 0, so the budget
+    // stays at hnsw_ef_search and the result must be bit-identical.
+    cfg.hnsw_ef_search_divisor = 60_000;
+    const coarse = try oracleRecallAt(alloc, spec, cfg, 20);
+    try std.testing.expectEqual(fixed, coarse);
+
+    // 3000 / 10 = 300 effective budget against a fixed 20.
+    cfg.hnsw_ef_search_divisor = 10;
+    const adaptive = try oracleRecallAt(alloc, spec, cfg, 20);
+    // Measured 0.96 fixed, 1.00 adaptive.
+    try std.testing.expect(adaptive > fixed);
+    try std.testing.expect(adaptive >= 0.99);
 }

@@ -196,8 +196,12 @@ pub const HybridRetriever = struct {
             // A hit with no vector in the index cannot be scored by
             // cosine. Dereferencing it anyway was a panic on a path the
             // store now runs for every query.
-            const node = self.hnsw.nodes.get(r.id) orelse continue;
-            const score = self.hnsw.cosineSim(qvec, node.vector);
+            _ = self.hnsw.nodes.get(r.id) orelse continue;
+            // `r.score` is the index's own cosine for this hit, the same
+            // arithmetic `cosineSim(qvec, node.vector)` performed — and the
+            // only one available when the index stores int8 vectors, which
+            // have no float copy to re-score against.
+            const score = r.score;
             const entry = cand_map.getPtr(r.id) orelse blk: {
                 const c = Candidate{ .cell_id = r.id };
                 try cand_map.put(r.id, c);

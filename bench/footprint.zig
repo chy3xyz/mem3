@@ -104,6 +104,7 @@ fn measure(
     sample_every: usize,
     scratch: harness.Scratch,
     durable: bool,
+    int8: bool,
 ) !Footprint {
     var samples: std.ArrayList(Sample) = .empty;
     errdefer samples.deinit(alloc);
@@ -114,6 +115,7 @@ fn measure(
     const store = try mem3.Store.init(alloc, .{
         .data_dir = if (durable) scratch.path else null,
         .seed_default_goals = true,
+        .vector_storage = if (int8) .int8 else .f32,
     });
     defer store.deinit();
 
@@ -189,11 +191,16 @@ pub fn run(alloc: Allocator, init: std.process.Init.Minimal) !void {
     var cells: ?usize = null;
     var sample_every: ?usize = null;
     var durable = false;
+    var int8 = false;
 
     var it = harness.argIterator(init);
     while (it.next()) |arg| {
         if (std.mem.eql(u8, arg, "--durable")) {
             durable = true;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--int8")) {
+            int8 = true;
             continue;
         }
         if (try harness.parseCommon(arg, &common)) continue;
@@ -207,6 +214,7 @@ pub fn run(alloc: Allocator, init: std.process.Init.Minimal) !void {
                 \\
                 \\  --cells=N         cells to insert (default {d})
                 \\  --sample-every=N  RSS sample interval in cells (default cells/10)
+                \\  --int8            store HNSW vectors as int8 (1 B/dim instead of 4)
                 \\  --durable         keep the WAL, and account for its bytes
                 \\  --data-dir=P      scratch dir (default: a fresh /tmp dir)
                 \\  --scale=F         multiply the defaults; --quick is 0.1
@@ -226,7 +234,7 @@ pub fn run(alloc: Allocator, init: std.process.Init.Minimal) !void {
     defer scratch.deinit(alloc);
 
     harness.progress("footprint: inserting {d} cells (durable={})...\n", .{ n_cells, durable });
-    var fp = try measure(alloc, n_cells, n_sample, scratch, durable);
+    var fp = try measure(alloc, n_cells, n_sample, scratch, durable, int8);
     defer fp.deinit(alloc);
 
     const mb = @as(f64, @floatFromInt(fp.final_kb)) / 1024.0;
@@ -264,6 +272,8 @@ pub fn run(alloc: Allocator, init: std.process.Init.Minimal) !void {
     try j.int(@as(u64, @intCast(fp.write_errors)));
     try j.key("embed_dim");
     try j.int(DIM);
+    try j.key("vector_storage");
+    try j.str(if (int8) "int8 (1 byte/dim)" else "f32 (4 bytes/dim)");
 
     // An RSS number without its conditions is not a measurement, it is a
     // rumour. Everything a reader needs in order to decide whether this
@@ -461,7 +471,7 @@ test "footprint: RSS grows monotonically and the growth table records it" {
     const scratch = try harness.Scratch.init(alloc, null, "footprint-test");
     defer scratch.deinit(alloc);
 
-    const fp = try measure(alloc, 300, 100, scratch, false);
+    const fp = try measure(alloc, 300, 100, scratch, false, false);
     defer fp.deinit(alloc);
 
     try std.testing.expectEqual(@as(usize, 300), fp.cells);
@@ -478,7 +488,7 @@ test "footprint: vector bytes are exactly count * dim * 4" {
     const scratch = try harness.Scratch.init(alloc, null, "footprint-accounting");
     defer scratch.deinit(alloc);
 
-    const fp = try measure(alloc, 64, 0, scratch, false);
+    const fp = try measure(alloc, 64, 0, scratch, false, false);
     defer fp.deinit(alloc);
 
     try std.testing.expectEqual(@as(f64, 64.0 * @as(f64, DIM) * 4.0), fp.vectorBytes());
