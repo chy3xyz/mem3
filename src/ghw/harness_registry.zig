@@ -1,11 +1,11 @@
 //! Harness Registry — execution primitives registered by the agent.
 //!
-//! **GHW Layer**: Harness (象源). Sits between Goal and World; the
+//! **GHW Layer**: Harness (form source). Sits between Goal and World; the
 //! "regulatory memory" of the system. In v0.1.0-alpha the registry is
 //! in-memory only — harnesses are lost on restart.
 //!
 //! ## Constitution compliance
-//! - Principle II (GHW 三层耦合): this is the Harness layer.
+//! - Principle II (GHW three-layer coupling): this is the Harness layer.
 //! - Principle V (comptime): stats fields are updated in-place, no reflection.
 
 const std = @import("std");

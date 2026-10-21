@@ -105,7 +105,7 @@ fn primaryAssociation(goals: []const GoalAssociation) GoalAssociation {
 ///   2. build cell       — encoder validation + importance scoring
 ///   3. WAL append       — Constitution VII: journal BEFORE observable
 ///   4. commit           — manager + cell_index + embed + HNSW
-///   5. 外拓              — Goal → Harness → World + CrossLayerLog
+///   5. outward path      — Goal → Harness → World + CrossLayerLog
 ///
 /// Steps 1-3 mutate nothing `mem3 query` / `mem3 dump` can see, so a
 /// failure at step 3 leaves nothing behind to roll back. The old

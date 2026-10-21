@@ -1,11 +1,11 @@
 //! World Model — entities, attributes, predictions, and surprising-event updates.
 //!
-//! **GHW Layer**: World (物源). Sits at the bottom of the GHW three-layer
+//! **GHW Layer**: World (matter source). Sits at the bottom of the GHW three-layer
 //! architecture; the fastest-adapting layer for current observations.
 //!
 //! ## Constitution compliance
-//! - Principle II (GHW 三层耦合): this is the World layer.
-//! - Principle III (惊讶驱动更新): WorldModel.updateEntity takes a surprise
+//! - Principle II (GHW three-layer coupling): this is the World layer.
+//! - Principle III (surprise-driven update): WorldModel.updateEntity takes a surprise
 //!   signal and adjusts the entity's prediction confidence.
 
 const std = @import("std");

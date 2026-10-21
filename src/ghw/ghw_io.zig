@@ -2,7 +2,7 @@
 //!
 //! **Constitution Principle II**: cross-layer shortcuts are forbidden. All
 //! inter-layer access MUST go through this interface. Each call records
-//! the direction (外拓 = encoding Goal→Harness→World, 内求 = retrieval
+//! the direction (outward = encoding Goal→Harness→World, inward = retrieval
 //! World→Harness→Goal) and validates it against the allowed directions.
 //!
 //! ## Why this file exists at all
@@ -73,14 +73,14 @@ pub const GHW = struct {
         };
     }
 
-    /// 外拓 — encode one memory across all three layers.
+    /// Outward path: encode one memory across all three layers.
     ///
     /// Hop 1 (Goal → Harness): the goal is bound to the memory and its
-    /// goal-bound harness (象源, the regulatory/procedural record) is
+    /// goal-bound harness (form source, the regulatory/procedural record) is
     /// materialised or reused, then credited with the execution.
     ///
     /// Hop 2 (Harness → World): the harness's situation is registered in
-    /// the world model (物源) as a situated entity, which records which
+    /// the world model (matter source) as a situated entity, which records which
     /// harness realises it — that back-reference is what retrieval reads
     /// to make the world→harness hop real.
     ///
@@ -140,7 +140,7 @@ pub const GHW = struct {
         });
     }
 
-    /// 内求 — retrieval across all three layers.
+    /// Inward path: retrieval across all three layers.
     ///
     /// Hop 1 (World → Harness): the world model picks the situated
     /// entity that best matches the query text and hands control to the
@@ -306,10 +306,10 @@ pub const CrossLayerLog = struct {
 /// traversals in `GHW` check every hop against it before performing it.
 pub fn isValidDirection(d: Direction, from: CrossLayerLog.Layer, to: CrossLayerLog.Layer) bool {
     return switch (d) {
-        // 外拓: goal → harness → world
+        // Outward: goal → harness → world
         .outward => (from == .goal and to == .harness) or
             (from == .harness and to == .world),
-        // 内求: world → harness → goal
+        // Inward: world → harness → goal
         .inward => (from == .world and to == .harness) or
             (from == .harness and to == .goal),
     };

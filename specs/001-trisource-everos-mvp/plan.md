@@ -6,7 +6,7 @@
 
 ## Summary
 
-Build the **MVP slice** of TriSource-EverOS: a zero-dependency Zig 0.17 memory operating system that stores every memory as a `TS-MemCell` 7-tuple tagged with one of three ontological sources (物/象/性), organized in a hypergraph (`HyMem`), indexed via a from-scratch HNSW + KV + graph three-way recall, scored with GHW-prioritized ranking, and driven by existence-gain-dynamics for consolidation and forgetting. Ships as a single ~10MB binary with a CLI and an HTTP daemon, all four lifecycle stages end-to-end, all three constitution invariants testable, and the full project skeleton (per `dev.md` §三) compilable on Zig 0.17-dev.
+Build the **MVP slice** of TriSource-EverOS: a zero-dependency Zig 0.17 memory operating system that stores every memory as a `TS-MemCell` 7-tuple tagged with one of three ontological sources (matter/form/spirit), organized in a hypergraph (`HyMem`), indexed via a from-scratch HNSW + KV + graph three-way recall, scored with GHW-prioritized ranking, and driven by existence-gain-dynamics for consolidation and forgetting. Ships as a single ~10MB binary with a CLI and an HTTP daemon, all four lifecycle stages end-to-end, all three constitution invariants testable, and the full project skeleton (per `dev.md` §3) compilable on Zig 0.17-dev.
 
 The technical approach is locked to:
 - **Zig 0.17 (dev branch ≥ 0.17.0-dev.3000)** with `std.Io` async, `comptime` metaprogramming, explicit allocator injection.
@@ -63,13 +63,13 @@ The technical approach is locked to:
 
 | Principle | Compliance Plan |
 |---|---|
-| I. 三源完整性 | TS-MemCell struct has all 7 fields; source_tag enforced at type level; constitution test in `tests/constitution/source_tag.zig` |
-| II. GHW 三层耦合 | Three top-level directories `src/ghw/`, `src/memory/`, `src/hypermem/` map to Goal/Harness/World; file-level doc-comments declare layer |
-| III. 存在增益驱动 | `src/memory/lifecycle.zig` implements the four stages with existence-gain scoring; fuzzy store in `src/memory/fuzzy.zig` |
-| IV. 零依赖 + Zig 0.17 | `build.zig` has zero `linkSystemLibrary` calls (except libc/compiler-rt which Zig pulls in by default and `ldd`-clean); CI step runs `ldd` and fails on new deps |
-| V. 零拷贝 + 编译时零开销 | `src/utils/serializer.zig` uses `comptime` codegen; all public types have `pub comptime serialized_size: usize` |
-| VI. 测试优先 | Tests in `tests/` for every module; `tests/constitution/` for the three invariants; CI runs `zig build test` + `zig build bench` |
-| VII. 可观测性 | `src/utils/logger.zig` provides `std.log.scoped` wrappers with JSONL mode; `--log-every N` flag; `/metrics` endpoint in HTTP mode |
+| I. Tri-Source Integrity | TS-MemCell struct has all 7 fields; source_tag enforced at type level; constitution test in `tests/constitution/source_tag.zig` |
+| II. GHW Three-Layer Coupling | Three top-level directories `src/ghw/`, `src/memory/`, `src/hypermem/` map to Goal/Harness/World; file-level doc-comments declare layer |
+| III. Existence-Gain-Driven Lifecycle | `src/memory/lifecycle.zig` implements the four stages with existence-gain scoring; fuzzy store in `src/memory/fuzzy.zig` |
+| IV. Zero-Dependency Zig 0.17 Native | `build.zig` has zero `linkSystemLibrary` calls (except libc/compiler-rt which Zig pulls in by default and `ldd`-clean); CI step runs `ldd` and fails on new deps |
+| V. Zero-Copy + Comptime Zero-Overhead | `src/utils/serializer.zig` uses `comptime` codegen; all public types have `pub comptime serialized_size: usize` |
+| VI. Test-First + Formal Guarantees | Tests in `tests/` for every module; `tests/constitution/` for the three invariants; CI runs `zig build test` + `zig build bench` |
+| VII. Observability + Single-Binary Debugging | `src/utils/logger.zig` provides `std.log.scoped` wrappers with JSONL mode; `--log-every N` flag; `/metrics` endpoint in HTTP mode |
 
 All 7 principles are addressable in code. **No violations require justification.**
 
@@ -90,7 +90,7 @@ specs/001-trisource-everos-mvp/
 
 ### Source Code (repository root)
 
-The structure follows `dev.md` §三 with adaptations for spec-kit:
+The structure follows `dev.md` §3 with adaptations for spec-kit:
 
 ```text
 mem3/
@@ -122,7 +122,7 @@ mem3/
 │   │   ├── serve.zig            # mem3 serve --port N
 │   │   ├── consolidate.zig      # mem3 consolidate
 │   │   └── forget.zig           # mem3 forget --threshold
-│   ├── core/                    # GHW L1 基础层
+│   ├── core/                    # GHW L1 foundation layer
 │   │   ├── memcell.zig          # TS-MemCell struct + source_tag
 │   │   ├── fact.zig             # Fact struct (subject, predicate, object)
 │   │   ├── foresight.zig        # Foresight struct (with valid_from/until)
@@ -130,12 +130,12 @@ mem3/
 │   │   ├── metadata.zig         # Metadata struct
 │   │   ├── types.zig            # Common enums (EdgeType, GoalStatus)
 │   │   └── errors.zig           # Tagged error unions
-│   ├── ghw/                     # GHW L2 - GHW 三层
+│   ├── ghw/                     # GHW L2 - three-layer GHW
 │   │   ├── goal_tree.zig        # Goal Poset (G = (Obj, ≤_goal, ⊥, ⊤))
 │   │   ├── harness_registry.zig # Harness registry
 │   │   ├── world_model.zig      # World entity model
 │   │   └── ghw_io.zig           # Layer I/O interface
-│   ├── memory/                  # GHW L3 - 三源合恰
+│   ├── memory/                  # GHW L3 - tri-source coherence
 │   │   ├── tri_source_manager.zig  # Tri-Source Memory Manager
 │   │   ├── lifecycle.zig           # 4 stages: Encode/Consolidate/Recall/Forget
 │   │   ├── encoder.zig             # Encoding pipeline
@@ -143,14 +143,14 @@ mem3/
 │   │   ├── forgetter.zig           # Existence-gain-driven forgetting
 │   │   ├── fuzzy.zig               # Fuzzy memory store
 │   │   └── coherence.zig           # Tri-source coherence calculator
-│   ├── hypermem/                # GHW L4 - 超图引擎
+│   ├── hypermem/                # GHW L4 - hypergraph engine
 │   │   ├── engine.zig              # HyMem core
 │   │   ├── hyperedge.zig           # HyperEdge struct
 │   │   ├── node.zig                # MemCell node wrapper
 │   │   ├── multi_hop.zig           # Multi-hop traversal
 │   │   ├── msg_passing.zig         # Embedding propagation
 │   │   └── graph_index.zig         # Adjacency list + neighbor query
-│   ├── retrieval/               # GHW L4 - 检索
+│   ├── retrieval/               # GHW L4 - retrieval
 │   │   ├── hnsw.zig                # HNSW index (from scratch, ~400 LOC)
 │   │   ├── hnsw_node.zig           # HNSW node + layer
 │   │   ├── hnsw_search.zig         # Search with ef parameter
@@ -159,7 +159,7 @@ mem3/
 │   │   ├── hybrid_retriever.zig    # Three-way recall fusion
 │   │   ├── reranker.zig            # GHW-prioritized rerank
 │   │   └── embedder.zig            # Stub deterministic embedder (v0.1)
-│   ├── storage/                 # GHW L4 - 存储
+│   ├── storage/                 # GHW L4 - storage
 │   │   ├── lsm_store.zig           # Log-structured memtable
 │   │   ├── sstable.zig             # Sorted-string-table on disk
 │   │   ├── wal.zig                 # Write-ahead log
@@ -248,7 +248,7 @@ mem3/
 
 ## Phase 0: Research Outcomes
 
-Research is folded into this plan since the foundation papers (三源合恰论.docx, dev.md, ghw_memory_system.agent.final.md) are already in-tree. No additional web research needed for the MVP.
+Research is folded into this plan since the foundation papers (the Tri-Source Coherence Theory manuscript, dev.md, ghw_memory_system.agent.final.md) are already in-tree. No additional web research needed for the MVP.
 
 Key research conclusions that shaped the plan:
 

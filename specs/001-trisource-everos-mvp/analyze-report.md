@@ -44,13 +44,13 @@
 
 | Principle | Spec Coverage | Plan Coverage | Tasks |
 |---|---|---|---|
-| I. 三源完整性 | FR-001, FR-002, FR-027, Key Entity "TS-MemCell" | data-model.md §TS-MemCell; ADR-0001 resolves naming | T012, T026, T036, T037 |
-| II. GHW 三层耦合 | FR-004, FR-012 | plan.md §Project Structure; ADR-0002 | T054, T063, T066, T090 |
-| III. 存在增益驱动 | FR-003, FR-010, FR-014, FR-015 | data-model.md §Metadata.importance_score; §WALRecord.forget; §MemScene | T037, T044, T078-T087 |
-| IV. 零依赖 + Zig 0.17 | FR-023, FR-024, §Out-of-Scope Dependencies | plan.md §Complexity Tracking; ADR-0003, ADR-0004 | T002, T003, T073-T077 |
-| V. 零拷贝 + 编译时零开销 | FR-019, FR-020, FR-021 | plan.md §Technical Context "Performance Goals" | T013, T029, T040, T041 |
-| VI. 测试优先 | FR-022, FR-026, FR-027 | plan.md §Testing; tasks.md Phase 2 T026-T028 (constitution tests) | T026, T027, T028, T029-T032, T033-T035, T053, T062, T072 |
-| VII. 可观测性 | FR-016, FR-017, FR-025 | plan.md §Contracts (HTTP /metrics) | T017, T089, T093, T095, T101, T102 |
+| I. Tri-Source Integrity | FR-001, FR-002, FR-027, Key Entity "TS-MemCell" | data-model.md §TS-MemCell; ADR-0001 resolves naming | T012, T026, T036, T037 |
+| II. GHW Three-Layer Coupling | FR-004, FR-012 | plan.md §Project Structure; ADR-0002 | T054, T063, T066, T090 |
+| III. Existence-Gain-Driven Lifecycle | FR-003, FR-010, FR-014, FR-015 | data-model.md §Metadata.importance_score; §WALRecord.forget; §MemScene | T037, T044, T078-T087 |
+| IV. Zero-Dependency Zig 0.17 Native | FR-023, FR-024, §Out-of-Scope Dependencies | plan.md §Complexity Tracking; ADR-0003, ADR-0004 | T002, T003, T073-T077 |
+| V. Zero-Copy + Comptime Zero-Overhead | FR-019, FR-020, FR-021 | plan.md §Technical Context "Performance Goals" | T013, T029, T040, T041 |
+| VI. Test-First + Formal Guarantees | FR-022, FR-026, FR-027 | plan.md §Testing; tasks.md Phase 2 T026-T028 (constitution tests) | T026, T027, T028, T029-T032, T033-T035, T053, T062, T072 |
+| VII. Observability + Single-Binary Debugging | FR-016, FR-017, FR-025 | plan.md §Contracts (HTTP /metrics) | T017, T089, T093, T095, T101, T102 |
 
 **Result**: All 7 principles are addressed by at least one FR + one task. No orphan principles. ✓
 
@@ -184,7 +184,7 @@ Searching for over-specified items (i.e., spec.md dictating implementation detai
 Searching for content that has drifted between documents:
 
 - **Performance targets**: spec.md SC-002, plan.md §Performance Goals, constitution.md §Performance Standards, AGENTS.md §Performance Gates — all consistent (P95 < 50ms MVP / 10ms release, throughput 1K/10K, binary < 10MB).
-- **Time scales**: constitution.md Principle II ("Goal 周至年级, Harness 毫秒至天, World 分钟至月"), plan.md §Technical Context (no explicit restatement), data-model.md §Goal Poset (no explicit restatement). **Minor**: plan.md could re-state the time scales for emphasis; not blocking.
+- **Time scales**: constitution.md Principle II ("Goal weeks to years, Harness ms to days, World minutes to months"), plan.md §Technical Context (no explicit restatement), data-model.md §Goal Poset (no explicit restatement). **Minor**: plan.md could re-state the time scales for emphasis; not blocking.
 - **Constitution version**: All references to constitution are to v1.0.0 (ratified 2026-06-07). ✓
 - **User story numbering**: spec.md US1-US4, tasks.md Phase 3-6 + Phase 7. ✓
 - **Phase numbering**: tasks.md Phase 1-8, plan.md §Phase 0 + §Phase 1. **Note**: tasks.md has 8 phases; plan.md has Phase 0 (research) and Phase 1 (design). These are different phase axes (tasks.md is implementation phases; plan.md is spec-kit plan phases). Slight confusion possible; recommend a note in AGENTS.md to clarify. Adding to next amendment.

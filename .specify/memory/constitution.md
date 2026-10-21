@@ -1,46 +1,46 @@
 # TriSource-EverOS Constitution
-<!-- Project: mem3 = TriSource-EverOS, the memory OS based on 三源合恰论 + GHW 范式 -->
+<!-- Project: mem3 = TriSource-EverOS, the memory OS based on Tri-Source Coherence Theory + the GHW paradigm -->
 
 ## Core Principles
 
-### I. 三源完整性 (Tri-Source Integrity, NON-NEGOTIABLE)
+### I. Tri-Source Integrity (NON-NEGOTIABLE)
 
-Every memory unit MUST carry the three ontological sources — **物 (Matter, M)**, **象 (Form, F)**, **性 (Spirit, S)** — in some form. The atomic memory primitive `TS-MemCell` is a 7-tuple ⟨id, source_tag, episode, atomic_facts, foresight, goal_associations, metadata⟩ where:
+Every memory unit MUST carry the three ontological sources — **Matter (M)**, **Form (F)**, **Spirit (S)** — in some form. The atomic memory primitive `TS-MemCell` is a 7-tuple ⟨id, source_tag, episode, atomic_facts, foresight, goal_associations, metadata⟩ where:
 
-- `episode` carries the **物 (matter)** substrate — the raw, causally efficacious trace.
-- `atomic_facts` carries the **象 (form)** structure — extractable, computable information.
-- `foresight` and `goal_associations` carry the **性 (spirit)** direction — meaning, purpose, value-bearance.
+- `episode` carries the **matter** substrate — the raw, causally efficacious trace.
+- `atomic_facts` carries the **form** structure — extractable, computable information.
+- `foresight` and `goal_associations` carry the **spirit** direction — meaning, purpose, value-bearance.
 - `source_tag ∈ {M, F, S}` is a hard guarantee that no memory can be tagged as "untyped": a memory is always traceable to its primary ontological source. Mixed-source memories are explicitly typed with a dominant tag + a coherence vector.
 - `metadata.importance_score = α·source_coherence + β·goal_relevance + γ·existential_contribution` (default α=0.30, β=0.40, γ=0.30). A memory whose three sources cannot be reconstructed MUST be rejected at encoding time.
 
-**Rationale**: 三源合恰论 (Tri-Source Con-appropriation Theory) defines 物/象/性 as irreducible — collapsing any source into another creates an *existential collapse* (存在坍缩). The system is not a "memory store"; it is an existential event in time.
+**Rationale**: Tri-Source Coherence Theory defines matter/form/spirit as irreducible — collapsing any source into another creates an *existential collapse*. The system is not a "memory store"; it is an existential event in time.
 
-### II. GHW 三层耦合 (Goal-Harness-World, NON-NEGOTIABLE)
+### II. GHW Three-Layer Coupling (Goal-Harness-World, NON-NEGOTIABLE)
 
 All memory operations MUST be addressable within the three-layer GHW architecture:
 
-- **Goal 层 (性源)**: target memory, value-direction, meta-goal evaluation. Time-scale: weeks to years. Slowest, most stable.
-- **Harness 层 (象源)**: regulatory memory, procedural learning, meta-cognition. Time-scale: ms to days. Fastest, most adaptive.
-- **World 层 (物源)**: world model, situated memory, physical causality. Time-scale: minutes to months. Mid-range.
+- **Goal layer (spirit source)**: target memory, value-direction, meta-goal evaluation. Time-scale: weeks to years. Slowest, most stable.
+- **Harness layer (form source)**: regulatory memory, procedural learning, meta-cognition. Time-scale: ms to days. Fastest, most adaptive.
+- **World layer (matter source)**: world model, situated memory, physical causality. Time-scale: minutes to months. Mid-range.
 
-The three layers communicate via **双向通演 (Bi-Directional Transduction)**:
-- **外拓之路 (encoding)**: Goal → Harness → World — what is worth remembering is decided at the Goal layer, formatted at the Harness layer, written into physical substrate at the World layer.
-- **内求之路 (retrieval)**: World → Harness → Goal — physical traces activate, information is reconstructed, meaning is bestowed in the present.
+The three layers communicate via **Bi-Directional Transduction**:
+- **Outward path (encoding)**: Goal → Harness → World — what is worth remembering is decided at the Goal layer, formatted at the Harness layer, written into physical substrate at the World layer.
+- **Inward path (retrieval)**: World → Harness → Goal — physical traces activate, information is reconstructed, meaning is bestowed in the present.
 
 A module MUST declare which GHW layer it belongs to in its file-level doc-comment. Cross-layer access bypasses the natural transduction and is a constitutional violation requiring a written justification.
 
-### III. 存在增益驱动 (Existence-Gain-Driven Lifecycle, NON-NEGOTIABLE)
+### III. Existence-Gain-Driven Lifecycle (NON-NEGOTIABLE)
 
-The four memory operations — **编码 (Encoding)**, **巩固 (Consolidation)**, **回忆 (Recollection)**, **遗忘 (Forgetting)** — MUST be driven by the **存在增益 (Ontological Enhancement)** metric, not by capacity or TTL:
+The four memory operations — **Encoding**, **Consolidation**, **Recollection**, **Forgetting** — MUST be driven by the **existence-gain** (ontological enhancement) metric, not by capacity or TTL:
 
 - **PMOE (Principle of Maximal Ontological Enhancement)**: prioritize consolidation of memories that maximize three-source coherence, create new con-appropriation possibilities, or promote others' con-appropriation.
 - **PCR (Principle of Con-appropriation Respect)**: conflicts are resolved by adding temporal-validity markers, NEVER by deletion. Old facts stay, marked as superseded.
-- **Decay asymmetry**: λ_matter > λ_form > λ_spirit > 0. Matter fades fastest (episodic detail blur), form decays mid-rate (organizational loosening), spirit lasts longest (meaning persistence). This mirrors the cognitive asymmetry "情节细节遗忘快、意义框架遗忘慢".
-- **Forgetting threshold**: a memory is forgotten when its net_existence = importance − redundancy − conflict_score < 0, or when importance < θ_e and age > AGE_THRESHOLD. Memories with spirit_coherence > 0.7 are archived to the "fuzzy store" (模糊记忆区) rather than deleted.
+- **Decay asymmetry**: λ_matter > λ_form > λ_spirit > 0. Matter fades fastest (episodic detail blur), form decays mid-rate (organizational loosening), spirit lasts longest (meaning persistence). This mirrors the cognitive asymmetry: episodic detail is forgotten quickly, meaning frameworks slowly.
+- **Forgetting threshold**: a memory is forgotten when its net_existence = importance − redundancy − conflict_score < 0, or when importance < θ_e and age > AGE_THRESHOLD. Memories with spirit_coherence > 0.7 are archived to the "fuzzy store" rather than deleted.
 
-**Rationale**: Forgetting is not failure, it is 合恰 maintenance. A system that retains everything is a system that has lost its grip on what matters.
+**Rationale**: Forgetting is not failure, it is coherence maintenance. A system that retains everything is a system that has lost its grip on what matters.
 
-### IV. 零依赖 + Zig 0.17 原生 (Zero-Dependency Zig 0.17 Native)
+### IV. Zero-Dependency Zig 0.17 Native
 
 The system MUST be a **single binary, zero external runtime dependency** implementation:
 
@@ -55,7 +55,7 @@ The system MUST be a **single binary, zero external runtime dependency** impleme
 
 **Rationale**: The existential structure of memory is unified; splitting it across multiple services breaks the three-source coherence. Single-binary deployment also makes the system embedded-friendly and edge-deployable.
 
-### V. 零拷贝 + 编译时零开销 (Zero-Copy + Comptime Zero-Overhead)
+### V. Zero-Copy + Comptime Zero-Overhead
 
 Performance is a constitutional requirement, not an optimization:
 
@@ -67,7 +67,7 @@ Performance is a constitutional requirement, not an optimization:
 
 Benchmarks: P95 retrieval latency < 10ms for 100K memories; 5–10× faster than equivalent Go/Python implementations. These are release-blocking.
 
-### VI. 测试优先 + 形式化保证 (Test-First + Formal Guarantees)
+### VI. Test-First + Formal Guarantees
 
 Every non-trivial module MUST have tests written BEFORE implementation:
 
@@ -79,7 +79,7 @@ Every non-trivial module MUST have tests written BEFORE implementation:
 
 Code coverage target ≥ 80% for core modules, ≥ 60% for utilities. **Critical-path modules** (HyperMem, TriSourceManager, HybridRetriever) MUST have 100% line coverage.
 
-### VII. 可观测性 + 单二进制调试 (Observability + Single-Binary Debugging)
+### VII. Observability + Single-Binary Debugging
 
 The system is embedded-friendly, so observability is constitutional, not optional:
 
@@ -166,7 +166,7 @@ All public APIs MUST follow these contracts:
 - **Reference docs**:
   - `dev.md` — full engineering blueprint (Zig 0.17 idioms, type sketches, 12-week roadmap).
   - `ghw_memory_system.agent.final.md` — formal theoretical paper (TS-MemCell proof, GHW mapping theorem, category-theoretic semantics, existence-gain dynamics).
-  - `三源合恰论.docx` — foundational ontology (物/象/性 definition, 互根律, 双向通演法, 合恰 dynamics).
+  - The Tri-Source Coherence Theory manuscript (a `.docx` kept outside this repo; see `docs/glossary.md`) — foundational ontology (definition of matter/form/spirit, the law of mutual rooting, the method of Bi-Directional Transduction, coherence dynamics).
   - `.specify/memory/constitution.md` — this file.
   - `AGENTS.md` (root) — agent onboarding.
 
@@ -184,3 +184,4 @@ All public APIs MUST follow these contracts:
      a document that declares itself supreme must not carry unmet claims.
      Rationale and sync-impact: docs/constitution-amendments/2026-10-14-platform-scope.md -->
 <!-- v1.0.0: initial ratification. No prior version. -->
+<!-- 2026-10-21: Chinese terms replaced with English; no change to any rule. See docs/glossary.md. -->

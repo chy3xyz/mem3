@@ -63,14 +63,14 @@ pub const CATALOGUE = [_]Tool{
     .{
         .name = "memory_add",
         .description =
-        \\Persist one TS-MemCell (物/象/性 tagged) into the memory store.
+        \\Persist one TS-MemCell (matter/form/spirit tagged) into the memory store.
         \\
-        \\`episode` is the 物 (matter) trace and is required. `source` must be
+        \\`episode` is the matter trace and is required. `source` must be
         \\matter, form or spirit — a memory cannot be untagged (Constitution I).
-        \\`facts` are "subject|predicate|object" triples (象 / form), and
-        \\`goal_ids` binds the cell to goals (性 / spirit), and `foresight` lists
+        \\`facts` are "subject|predicate|object" triples (form), and
+        \\`goal_ids` binds the cell to goals (spirit), and `foresight` lists
         \\predicted claims as "description|valid_from_ms|valid_until_ms|confidence"
-        \\(also 性 / spirit, stored durably). A cell with neither a goal binding
+        \\(also spirit, stored durably). A cell with neither a goal binding
         \\nor a foresight is rejected.
         \\
         \\If a fact "subject|predicate|object" contradicts an older cell's fact
@@ -88,7 +88,7 @@ pub const CATALOGUE = [_]Tool{
         \\older cell and the predicate that justified it. A wrong replacement
         \\is undone with `memory_unsupersede`.
         ,
-        .schema = "{\"type\":\"object\",\"properties\":{\"episode\":{\"type\":\"string\",\"description\":\"物 — the raw episode text\"},\"source\":{\"type\":\"string\",\"enum\":[\"matter\",\"form\",\"spirit\"],\"description\":\"ontological source tag (required)\"},\"facts\":{\"type\":\"array\",\"items\":{\"type\":\"string\"},\"description\":\"象 — subject|predicate|object triples\"},\"goal_ids\":{\"type\":\"array\",\"items\":{\"type\":\"integer\"},\"description\":\"性 — goal bindings\"},\"relevances\":{\"type\":\"array\",\"items\":{\"type\":\"number\"},\"description\":\"per-goal relevance in [0,1]\"},\"foresight\":{\"type\":\"array\",\"items\":{\"type\":\"string\"},\"description\":\"spirit — predicted claims as desc|valid_from_ms|valid_until_ms|confidence; durable\"}},\"required\":[\"episode\",\"source\"]}",
+        .schema = "{\"type\":\"object\",\"properties\":{\"episode\":{\"type\":\"string\",\"description\":\"matter: the raw episode text\"},\"source\":{\"type\":\"string\",\"enum\":[\"matter\",\"form\",\"spirit\"],\"description\":\"ontological source tag (required)\"},\"facts\":{\"type\":\"array\",\"items\":{\"type\":\"string\"},\"description\":\"form: subject|predicate|object triples\"},\"goal_ids\":{\"type\":\"array\",\"items\":{\"type\":\"integer\"},\"description\":\"spirit: goal bindings\"},\"relevances\":{\"type\":\"array\",\"items\":{\"type\":\"number\"},\"description\":\"per-goal relevance in [0,1]\"},\"foresight\":{\"type\":\"array\",\"items\":{\"type\":\"string\"},\"description\":\"spirit — predicted claims as desc|valid_from_ms|valid_until_ms|confidence; durable\"}},\"required\":[\"episode\",\"source\"]}",
     },
     .{
         .name = "memory_query",
@@ -108,7 +108,7 @@ pub const CATALOGUE = [_]Tool{
         .description =
         \\The live Goal Poset: every non-synthetic goal with its status,
         \\priority, parent and how many memories are bound to it. This is the
-        \\性 (spirit) layer as it currently stands.
+        \\spirit layer as it currently stands.
         ,
         .schema = "{\"type\":\"object\",\"properties\":{},\"required\":[]}",
     },

@@ -12,11 +12,11 @@
 //!     the WAL never grows unbounded.
 //!
 //! **Constitution compliance**:
-//! - Principle IV (零依赖): pure Zig, no external snapshot libs.
-//! - Principle V (零拷贝 + comptime): no runtime reflection; we
+//! - Principle IV (zero dependency): pure Zig, no external snapshot libs.
+//! - Principle V (zero-copy + comptime): no runtime reflection; we
 //!   emit each known type field-by-field with a comptime-derived
 //!   layout.
-//! - Principle VII (可观测性): dump/inspect commands work the
+//! - Principle VII (observability): dump/inspect commands work the
 //!   same way for snapshots and live state.
 //!
 //! ## Atomicity

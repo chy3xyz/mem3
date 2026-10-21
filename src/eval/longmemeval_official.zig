@@ -1,7 +1,7 @@
 //! Retrieval evaluation against the OFFICIAL LongMemEval dataset
 //! (Wu et al., `xiaowu0162/longmemeval-cleaned`).
 //!
-//! **GHW layer**: Harness 层 (象源). This is evaluation protocol: it turns an
+//! **GHW layer**: Harness layer (form source). This is evaluation protocol: it turns an
 //! external dataset into a store, a query and a score. It adds no memory
 //! semantics of its own and never changes a product default.
 //!
@@ -537,7 +537,7 @@ pub fn rank(alloc: Allocator, q: Question, opts: Options) !Ranked {
             empty_text += 1;
             continue;
         }
-        // Source 物: a dialogue turn is a raw trace of what happened.
+        // Source matter: a dialogue turn is a raw trace of what happened.
         const cell_id = store.addRaw(core.MemorySource.matter, d.text, "", 1, 0.5) catch |err| {
             failures += 1;
             if (first_err == null) first_err = @errorName(err);

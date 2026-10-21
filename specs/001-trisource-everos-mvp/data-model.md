@@ -22,13 +22,15 @@ The atomic memory unit. Maps directly to FR-001 and Constitution Principle I.
 
 ```zig
 pub const MemorySource = enum(u8) {
-    matter = 0,    // 物: 感官输入、环境观测、工具返回的原始数据
-    form   = 1,    // 象: 推理过程、反思结论、抽象知识
-    spirit = 2,    // 性: 工具调用、执行结果、行为轨迹 (性源在论文里 = 目标/意义定向,
-                   //      但在 dev.md §2.2.1 里 action 源 = 行为轨迹. 我们用
-                   //      论文的 source_tag = 物/象/性 三源本体, 而 dev.md 的
-                   //      sensory/cognitive/action 是 GHW 层的具体活动类型.
-                   //      详见 AD-0001 调和说明)
+    matter = 0,    // raw data: sensory input, environment observations, tool returns
+    form   = 1,    // reasoning traces, reflection conclusions, abstract knowledge
+    spirit = 2,    // tool calls, execution results, behaviour traces. (In the paper the
+                   //      spirit source means goal/meaning orientation, but in dev.md
+                   //      §2.2.1 the action source means behaviour traces. We use the
+                   //      paper's matter/form/spirit three-source ontology for
+                   //      source_tag, and treat dev.md's sensory/cognitive/action as
+                   //      concrete activity types of the GHW layers.
+                   //      See ADR-0001 for the reconciliation.)
 };
 
 pub const Fact = struct {
@@ -36,7 +38,7 @@ pub const Fact = struct {
     predicate: []const u8,
     object: []const u8,
     confidence: f32,         // [0, 1]
-    source: []const u8,      // 抽取来源 (e.g., "user_input", "tool_output")
+    source: []const u8,      // extraction source (e.g., "user_input", "tool_output")
 
     pub comptime serialized_size: usize = serializer.calculateSize(@This());
 };
@@ -77,17 +79,17 @@ pub const Metadata = struct {
 pub const MemCell = struct {
     id: u64,
     source: MemorySource,                 // CONSTITUTIONAL: must be set
-    episode: []const u8,                  // 物: 原始 episode 序列化
-    atomic_facts: []const Fact,           // 象: 抽取的原子事实
-    foresight: []const Foresight,         // 性: 预测性记忆
-    goal_associations: []const GoalAssociation, // 性: 目标绑定
+    episode: []const u8,                  // matter: raw episode, serialized
+    atomic_facts: []const Fact,           // form: extracted atomic facts
+    foresight: []const Foresight,         // spirit: predictive memory
+    goal_associations: []const GoalAssociation, // spirit: goal binding
     metadata: Metadata,
 
     pub comptime serialized_size: usize = serializer.calculateSize(@This());
 };
 ```
 
-**Note on source_tag nomenclature**: The `ghw_memory_system.agent.final.md` paper uses `M`/`F`/`S` (物/象/性, ontological) as the source taxonomy, while `dev.md` §2.2.1 uses `sensory`/`cognitive`/`action` (functional, GHW-layer). We unify on the paper's three-source taxonomy as the **canonical** `source_tag` and use `dev.md`'s naming as a *secondary classification* (a `dev.md` "sensory" memory is a `matter` source with a sensory activity subtype stored in `metadata.subtype`). This is documented in `docs/adr/0001-three-source-ontology.md`.
+**Note on source_tag nomenclature**: The `ghw_memory_system.agent.final.md` paper uses `M`/`F`/`S` (matter/form/spirit, ontological) as the source taxonomy, while `dev.md` §2.2.1 uses `sensory`/`cognitive`/`action` (functional, GHW-layer). We unify on the paper's three-source taxonomy as the **canonical** `source_tag` and use `dev.md`'s naming as a *secondary classification* (a `dev.md` "sensory" memory is a `matter` source with a sensory activity subtype stored in `metadata.subtype`). This is documented in `docs/adr/0001-three-source-ontology.md`.
 
 ### Valid State Invariants (Constitution Tests)
 
@@ -117,10 +119,10 @@ A typed relation connecting 2+ MemCells. Maps to FR-006.
 
 ```zig
 pub const EdgeType = enum(u8) {
-    causal     = 0,  // 因果: "A caused B"
-    temporal   = 1,  // 时序: "A before B"
-    associative = 2, // 关联: "A semantically related to B"
-    goal       = 3,  // 目标: "A serves goal G"
+    causal     = 0,  // "A caused B"
+    temporal   = 1,  // "A before B"
+    associative = 2, // "A semantically related to B"
+    goal       = 3,  // "A serves goal G"
 };
 
 pub const HyperEdge = struct {
@@ -168,8 +170,8 @@ pub const GoalStatus = enum(u8) {
     in_progress = 1,
     completed  = 2,
     failed     = 3,
-    unrealized = 4,    // Constitution III.C: 标记无关联记忆的目标
-    tombstoned = 5,    // 软删除
+    unrealized = 4,    // Constitution III.C: marks goals with no associated memories
+    tombstoned = 5,    // soft delete
 };
 
 pub const GoalNode = struct {
@@ -182,7 +184,7 @@ pub const GoalNode = struct {
     deadline: ?i64,            // Unix ms
     created_at: i64,
     updated_at: i64,
-    associated_memcell_ids: []const u64,  // 反向索引
+    associated_memcell_ids: []const u64,  // reverse index
     unrealized_at: ?i64 = null, // when marked unrealized
 
     pub comptime serialized_size: usize = serializer.calculateSize(@This());
@@ -395,12 +397,12 @@ All thresholds have defensible defaults from `dev.md` / `ghw_memory_system.agent
 
 | Entity | Constitution Principle | FR | Test File |
 |---|---|---|---|
-| `MemCell.source` | I — 三源完整性 | FR-002, FR-027 | `tests/constitution/source_tag.zig` |
+| `MemCell.source` | I — Tri-Source Integrity | FR-002, FR-027 | `tests/constitution/source_tag.zig` |
 | `MemCell.foresight + goal_associations` | I — spirit dim | FR-027 | `tests/constitution/spirit_dim.zig` |
 | `Metadata.importance_score` formula | III — existence-gain | FR-003 | `tests/unit/importance.zig` |
 | `HyperEdge.source_weights` | I — three-source extension | FR-006 | `tests/property/hypergraph_props.zig` |
 | `HyperMem` layer | II — GHW World layer | FR-006 | `tests/unit/hypermem.zig` |
-| `GoalNode.status = unrealized` | III — 合恰 maintenance | FR-027 | `tests/constitution/goal_coverage.zig` |
+| `GoalNode.status = unrealized` | III — coherence maintenance | FR-027 | `tests/constitution/goal_coverage.zig` |
 | `WALRecord` | IV — persistence | FR-022 | `tests/unit/wal.zig` |
 | All `serialized_size` comptime fields | V — comptime zero-overhead | FR-020 | `tests/unit/serializer.zig` |
 | `Config` defaults | III — decay asymmetry | FR-003 | `tests/unit/config_defaults.zig` |

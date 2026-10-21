@@ -8,11 +8,11 @@ const serializer = @import("../utils/serializer.zig");
 
 /// Three-source ontology tag. The constitutional source of truth.
 pub const MemorySource = enum(u8) {
-    /// 物 (Matter) — sensory input, environmental observation, raw tool return.
+    /// Matter — sensory input, environmental observation, raw tool return.
     matter = 0,
-    /// 象 (Form) — reasoning, reflection, abstract knowledge.
+    /// Form — reasoning, reflection, abstract knowledge.
     form = 1,
-    /// 性 (Spirit) — meaning, value-direction, goal binding. In dev.md's
+    /// Spirit — meaning, value-direction, goal binding. In dev.md's
     /// vocabulary this also covers "action / behavior" — see ADR-0001.
     spirit = 2,
 

@@ -1,6 +1,6 @@
 //! Existence-gain-driven forgetting.
 //!
-//! **GHW Layer**: Memory (三源合恰). Implements the Forgetting stage of
+//! **GHW Layer**: Memory (tri-source coherence). Implements the Forgetting stage of
 //! the four-stage lifecycle (per the paper §4.3.4).
 //!
 //! ## What a sweep decides
@@ -40,7 +40,7 @@
 //! supersession), `redundant` (`net_existence < 0` because of a duplicate).
 //!
 //! ## Constitution compliance
-//! - Principle III (存在增益驱动): forgetting is driven by `net_existence`,
+//! - Principle III (existence-gain-driven lifecycle): forgetting is driven by `net_existence`,
 //!   not by capacity or TTL.
 //! - PCR: **nothing is ever deleted.** Every forgotten cell goes to the fuzzy
 //!   store (`is_fuzzy = true`, `fuzzed_at` stamped) and can be promoted back.
@@ -57,7 +57,9 @@
 //!
 //! ## What is not done
 //! Partial contradictions (some of a cell's facts contradicted, some not) do
-//! not supersede it. `Fact.confidence` is not used (every ingest path writes
+//! not supersede it, and neither does a cell that asserts any multi-valued or
+//! unknown-predicate fact: only the single-valued predicate list
+//! (`conflict.default_functional`, `--supersede`) can supersede at all. `Fact.confidence` is not used (every ingest path writes
 //! 1.0). Redundancy compares the exact token sets of episode + facts (not
 //! embeddings, not the consolidator's 512-bit signature). `mem3 remember` (promote-back CLI) does not exist.
 
