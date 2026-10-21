@@ -30,6 +30,12 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const hashing = @import("../utils/hashing.zig");
 const config = @import("../core/config.zig");
+const clock = @import("../platform/clock.zig");
+
+/// How long to wait for a backend that just broke the request pipe to become
+/// reapable. It is a ceiling, not a typical cost: the loop returns as soon as
+/// the child can be collected, and it only runs on a failure path.
+const exit_grace_ms: u32 = 250;
 
 // =============================================================================
 // StubEmbedder (legacy — kept working; other modules and tests depend on it)
@@ -824,6 +830,26 @@ const Backend = struct {
         }
         return true;
     }
+
+    /// Like `childAlive`, but gives a child that is already exiting time to
+    /// become reapable. EPIPE on the request pipe means every read end is
+    /// closed, and a dying process closes its descriptors before it turns into
+    /// a zombie that `waitpid` can collect. A single non-blocking check in
+    /// that window answers "alive" for a process that is gone, and the caller
+    /// then reports `WriteFailed` instead of `BackendExited`.
+    ///
+    /// The wait is bounded: a backend that closed its stdin on purpose but is
+    /// still running must not hang the caller, so after `budget_ms` it is
+    /// treated as alive and the original error stands.
+    fn childGoneWithin(be: *Backend, budget_ms: u32) bool {
+        var waited: u32 = 0;
+        while (true) {
+            if (!be.childAlive()) return true;
+            if (waited >= budget_ms) return false;
+            clock.sleepMs(1);
+            waited += 1;
+        }
+    }
 };
 
 fn pipePair() ExternalError![2]fd_t {
@@ -944,7 +970,7 @@ pub const ExternalEmbedder = struct {
             // names, and an operator should not have to learn two error
             // names for one failure.
             error.WriteFailed => {
-                if (!be.childAlive()) return error.BackendExited;
+                if (be.childGoneWithin(exit_grace_ms)) return error.BackendExited;
                 return err;
             },
             else => return err,

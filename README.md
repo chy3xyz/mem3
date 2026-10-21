@@ -859,16 +859,18 @@ for Linux before):
    now reads through `platform/fs`).
 2. `tests/unit/cli.zig` used `expectEqual` on two string slices (pointer
    comparison); it failed on x86_64 Debug builds. Fixed (`expectEqualStrings`).
-3. **Not fixed:** `ExternalEmbedder: a backend that dies mid-request is
-   BackendExited` is a race in `src/retrieval/embedder.zig`. When the backend
+3. **Fixed afterwards:** `ExternalEmbedder: a backend that dies mid-request is
+   BackendExited` was a race in `src/retrieval/embedder.zig`. When the backend
    exits between the liveness check and the pipe write, `embed` sees `EPIPE`,
    re-checks `waitpid(WNOHANG)`, and the child — its pipes already closed but not yet
-   reapable — still looks alive, so it returns `WriteFailed` instead of
-   `BackendExited`. Measured over 200 runs of that test alone: Linux aarch64
-   111/200 (Debug) and 120/200 (ReleaseFast) failed, Linux x86_64 76/200, macOS
-   arm64 4/200. A Linux `zig build test` will therefore fail on most runs until
-   `embed` waits a bounded time for the child after `EPIPE`. This is a `src/`
-   behaviour change, outside what this CI work was allowed to touch.
+   reapable — still looks alive, so it returned `WriteFailed` instead of
+   `BackendExited`. Measured over 200 runs of that test alone, before the fix:
+   Linux aarch64 111/200 (Debug) and 120/200 (ReleaseFast) failed, Linux x86_64
+   76/200, macOS arm64 4/200. The fix makes `embed` wait up to 250 ms for the
+   child to become reapable after `EPIPE` (it returns as soon as the child can be
+   collected). Re-measured in the same Linux arm64 container, interleaved, 200
+   runs each: **101/200 failed before, 0/200 after**; macOS 1/200 before, 0/400
+   after. Linux x86_64 and ReleaseFast were not re-measured after the fix.
 
 4. Timing-sensitive, not investigated: `GoalPoset: bindMemcell is O(1)
    amortised, not O(k) per insert` (`large < small * 3`, a wall-clock ratio)

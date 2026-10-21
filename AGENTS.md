@@ -191,7 +191,7 @@ tests/
      - Inject a failing test and assert `zig build test` goes non-zero — the permanent guard against a gate that cannot fail
    - `cross-compile`: whole project (Debug + ReleaseFast) and the three test roots (`zig test --test-no-exec`) for `x86_64-linux-gnu`, `aarch64-linux-gnu`, `x86_64-macos`, `aarch64-macos`. Compile-only.
    - `unsupported-targets`: `x86_64-windows`, `wasm32-wasi`, `wasm32-freestanding` must fail with the documented refusal message.
-   - Known: a Linux `zig build test` is expected to be **red or flaky** until `ExternalEmbedder: a backend that dies mid-request is BackendExited` is fixed (a race in `src/retrieval/embedder.zig`; ~40–55% failure on Linux, ~2% on macOS). Details: README "Continuous integration".
+   - Known: the `ExternalEmbedder ... BackendExited` race (Linux aarch64: 101/200 failures) is fixed (bounded wait for the child after `EPIPE`; 0/200 after in the same container). A Linux `zig build test` can still be red because of the ReleaseFast Timer folding and load-sensitive tests. Details: README "Continuous integration".
 
 ## Common Pitfalls (from project history)
 
