@@ -835,6 +835,23 @@ Not verified:
   the HTTP/MCP surfaces, `oracle`/`M` data, or Linux.
 * Reproducibility of wall times (host load was 50–140).
 
+### 5.9a Addendum: `main` moved after the inventory (§1) was written
+
+§1 was written against `d823358`. `main` has since merged write-time
+**supersession** (`Config.supersede_mode`, default `.functional`,
+`src/core/config.zig:107`): a new cell with the same subject+predicate as an
+older live cell marks the older one `superseded_at`, and `Store.query` skips
+such cells unless `include_superseded` is set (`src/store/store.zig:1555`,
+`:1582`, `:1593`). That is a lifecycle mechanism **on the query path** that §1
+does not list. It was **not ablated**: it keys on `atomic_facts` triples, and
+the LongMemEval harness ingests every turn with empty facts, so no cell is ever
+superseded (`superseded_live` stays 0) and it cannot move a ranking there. What
+was re-checked on the merged tree: build, the three test roots, and the default
+session ranking dump, which is byte-identical to the `main` export's. The 79
+ablation runs themselves were produced by the pre-merge branch binary; the
+merge changed neither the harness path nor (per the parity table in §5.2) its
+rankings.
+
 ### 5.10 How to reproduce
 
 ```sh
