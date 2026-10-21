@@ -124,6 +124,9 @@ pub const Query = struct {
 
 pub const Node = struct {
     id: u64,
+    /// A view into the index's vector arena (`HNSW.vec_chunks`), not an
+    /// allocation of its own: the node does not free it, and the slice is
+    /// valid for the life of the index because chunks are never moved.
     vector: []f32,
     /// `normOf(vector)`, computed once at insert. Derived state: nothing
     /// serialises a `Node`, and no caller outside this file constructs
@@ -149,7 +152,6 @@ pub const Node = struct {
     deleted: bool = false,
 
     pub fn deinit(self: *Node, alloc: Allocator) void {
-        alloc.free(self.vector);
         for (self.neighbors) |*n| n.deinit(alloc);
         alloc.free(self.neighbors);
     }
@@ -229,9 +231,38 @@ pub const HNSW = struct {
     /// id space rather than a run with gaps. After that every lookup falls
     /// back to the map, so the worst case is one bounds check. `nodeFor`
     /// is the only function that reads it.
-    dense: std.ArrayList(?*Node) = .empty,
+    dense: std.ArrayList(u32) = .empty,
     dense_base: u64 = 0,
     dense_ok: bool = true,
+
+    /// `by_idx[i]` is the node whose `dense_idx` is `i`; `norms[i]` is its
+    /// cached norm. Both are indexed by insertion order and, like
+    /// `visit_stamp`, only ever grow. The beam loop works entirely in these
+    /// indices: a neighbour id becomes an index through `dense`, and from
+    /// there its stamp, norm and vector are array reads at computed
+    /// addresses — no `*Node` is dereferenced to score a neighbour, which
+    /// is what lets the vector be prefetched before it is needed.
+    by_idx: std.ArrayList(*Node) = .empty,
+    norms: std.ArrayList(f32) = .empty,
+
+    /// Vector arena: node `i`'s `dim` floats live in chunk `i >> chunk_shift`
+    /// at offset `(i & chunk_mask) * dim`.
+    ///
+    /// Each vector used to be its own `alloc(f32, dim)`: 1,536 bytes that the
+    /// general-purpose allocator rounds up to a 2,048-byte size class (a
+    /// quarter of every vector wasted), scattered wherever the allocator
+    /// found room, with a `*Node` between the graph and the data. Chunks
+    /// are cache-line aligned, about 1 MiB each, and never reallocated, so a
+    /// `Node.vector` slice into one stays valid and growing the index never
+    /// copies existing vectors (a single growing buffer would double peak
+    /// RSS at every doubling).
+    vec_chunks: std.ArrayList([]align(64) f32) = .empty,
+    chunk_shift: u5 = 0,
+
+    /// Neighbours to score for the node currently being expanded: collected
+    /// first so their vectors can be prefetched while the earlier ones are
+    /// being scored.
+    scratch_pending: std.ArrayList(Pending) = .empty,
 
     /// Reusable beam containers. `searchLayer` runs four times per insert
     /// and each call used to allocate and free its frontier, its result
@@ -241,10 +272,15 @@ pub const HNSW = struct {
     scratch_out: std.ArrayList(u64) = .empty,
 
     pub fn init(alloc: Allocator, cfg: Config, dim: u16) HNSW {
+        // About 1 MiB per chunk, at least one vector, a power of two so the
+        // index-to-chunk split is a shift and a mask.
+        const bytes_per_vec: usize = @as(usize, @max(dim, 1)) * @sizeOf(f32);
+        const per_chunk: usize = @max(chunk_target_bytes / bytes_per_vec, 1);
         return .{
             .alloc = alloc,
             .cfg = cfg,
             .dim = dim,
+            .chunk_shift = @intCast(std.math.log2_int(usize, per_chunk)),
             .nodes = std.AutoHashMap(u64, *Node).init(alloc),
             .entry_point = null,
             .max_level = 0,
@@ -259,6 +295,11 @@ pub const HNSW = struct {
             self.alloc.destroy(entry.value_ptr.*);
         }
         self.nodes.deinit();
+        for (self.vec_chunks.items) |chunk| self.alloc.free(chunk);
+        self.vec_chunks.deinit(self.alloc);
+        self.by_idx.deinit(self.alloc);
+        self.norms.deinit(self.alloc);
+        self.scratch_pending.deinit(self.alloc);
         self.visit_stamp.deinit(self.alloc);
         self.dense.deinit(self.alloc);
         self.scratch_frontier.deinit(self.alloc);
@@ -266,29 +307,77 @@ pub const HNSW = struct {
         self.scratch_out.deinit(self.alloc);
     }
 
-    /// Resolve an id to its node: array index when the contiguous-id
-    /// table covers it, `nodes` otherwise.
+    /// Resolve an id to its dense index: an array read when the
+    /// contiguous-id table covers it, `nodes` otherwise.
     ///
-    /// The two must never disagree — a `nodeFor` that returned a
-    /// different node than `nodes.get` would walk the graph to nodes that
-    /// are not in the index, and every effect of that would be a silently
-    /// wrong neighbour rather than a crash.
-    fn nodeFor(self: *HNSW, id: u64) ?*Node {
+    /// The two must never disagree — an index that named a different node
+    /// than `nodes.get` would walk the graph to nodes that are not in the
+    /// index, and every effect of that would be a silently wrong neighbour
+    /// rather than a crash.
+    fn idxFor(self: *const HNSW, id: u64) ?u32 {
         if (self.dense_ok and id >= self.dense_base) {
             const off = id - self.dense_base;
-            if (off < self.dense.items.len) return self.dense.items[@intCast(off)];
+            if (off < self.dense.items.len) {
+                const v = self.dense.items[@intCast(off)];
+                return if (v == no_slot) null else v;
+            }
         }
-        return self.nodes.get(id);
+        const n = self.nodes.get(id) orelse return null;
+        return n.dense_idx;
     }
 
+    /// Resolve an id to its node.
+    fn nodeFor(self: *HNSW, id: u64) ?*Node {
+        const idx = self.idxFor(id) orelse return null;
+        return self.by_idx.items[idx];
+    }
+
+    /// The `dim` floats of node `idx`, inside the arena.
+    fn vectorAt(self: *const HNSW, idx: u32) []f32 {
+        return self.vectorSlot(idx);
+    }
+
+    fn vectorSlot(self: *const HNSW, idx: u32) []f32 {
+        const chunk = self.vec_chunks.items[idx >> self.chunk_shift];
+        const mask: usize = (@as(usize, 1) << self.chunk_shift) - 1;
+        const off = (@as(usize, idx) & mask) * self.dim;
+        return chunk[off..][0..self.dim];
+    }
+
+    /// Cosine of a prepared query against node `idx`, read from the arrays
+    /// rather than through the node. Same arithmetic as `score`.
+    fn scoreIdx(self: *const HNSW, q: Query, idx: u32) f32 {
+        const denom = q.norm * self.norms.items[idx];
+        if (denom == 0.0) return 0.0;
+        return dotProduct(q.vec, self.vectorAt(idx)) / denom;
+    }
+
+    /// Ask the cache for a vector before it is scored. One hint per line:
+    /// the hardware prefetcher would pick up a sequential stream after a
+    /// couple of misses, but those misses are the cost being avoided.
+    fn prefetchVector(self: *const HNSW, idx: u32) void {
+        const v = self.vectorAt(idx);
+        const bytes = std.mem.sliceAsBytes(v);
+        var off: usize = 0;
+        while (off < bytes.len) : (off += 64) {
+            @prefetch(bytes.ptr + off, .{ .rw = .read, .locality = 3, .cache = .data });
+        }
+    }
+
+    const no_slot: u32 = std.math.maxInt(u32);
+    const chunk_target_bytes: usize = 1 << 20;
+
+    /// A neighbour that passed the visited check and is waiting to be scored.
+    const Pending = struct { id: u64, idx: u32 };
+
     /// Widest hole worth stepping over before deciding the id space is
-    /// sparse. 1024 slots is 8 KB, once, before the table gives up.
+    /// sparse. 1024 slots is 4 KB, once, before the table gives up.
     const max_dense_hole: usize = 1024;
     /// Slots the table may occupy before its density is judged too poor
     /// to be worth keeping alongside the index.
     const dense_floor: usize = 4096;
 
-    /// Record `id` in the fast-path table, or give up on it for good.
+    /// Record `id` -> `idx` in the fast-path table, or give up on it for good.
     ///
     /// `insert` rejects a duplicate id before it gets here, so this only
     /// ever sees a slot that is empty or already the same node — the two
@@ -298,11 +387,11 @@ pub const HNSW = struct {
     /// at the same fresh node while the node they replaced was orphaned
     /// and `count` drifted. Consistency between two wrong answers is not
     /// a property worth preserving.
-    fn trackDense(self: *HNSW, id: u64, n: *Node) !void {
+    fn trackDense(self: *HNSW, id: u64, idx: u32) !void {
         if (!self.dense_ok) return;
         if (self.dense.items.len == 0) {
             self.dense_base = id;
-            try self.dense.append(self.alloc, n);
+            try self.dense.append(self.alloc, idx);
             return;
         }
         if (id < self.dense_base) {
@@ -311,7 +400,7 @@ pub const HNSW = struct {
         }
         const off = id - self.dense_base;
         if (off < self.dense.items.len) {
-            self.dense.items[@intCast(off)] = n;
+            self.dense.items[@intCast(off)] = idx;
             return;
         }
         const hole = off - self.dense.items.len;
@@ -321,8 +410,8 @@ pub const HNSW = struct {
             self.dense_ok = false;
             return;
         }
-        try self.dense.appendNTimes(self.alloc, null, hole + 1);
-        self.dense.items[@intCast(off)] = n;
+        try self.dense.appendNTimes(self.alloc, no_slot, hole + 1);
+        self.dense.items[@intCast(off)] = idx;
     }
 
     /// Open a fresh "seen" generation for one beam search.
@@ -377,30 +466,60 @@ pub const HNSW = struct {
 
         const q = Query.of(vector);
         const level = self.randomLevel();
-        const n = try self.alloc.create(Node);
-        errdefer self.alloc.destroy(n);
-        const vec_copy = try self.alloc.alloc(f32, vector.len);
-        @memcpy(vec_copy, vector);
-        n.* = .{
-            .id = id,
-            .vector = vec_copy,
-            .norm = normOf(vec_copy),
-            .dense_idx = @intCast(self.visit_stamp.items.len),
-            .level = level,
-            .neighbors = try self.alloc.alloc(std.ArrayList(u64), level + 1),
+        // The errdefers below are scoped to this block on purpose. Once the
+        // node is committed, `nodes` owns it: an error from the linking
+        // work further down must not free a node the index can still reach.
+        // (They used to live in the function scope, so a failed `searchLayer`
+        // destroyed a node that was already in the map, and `deinit` then
+        // walked a dangling pointer.)
+        _ = blk: {
+            const n = try self.alloc.create(Node);
+            errdefer self.alloc.destroy(n);
+
+            const idx: u32 = @intCast(self.visit_stamp.items.len);
+            // A fresh chunk is kept even if a later step fails: the next insert
+            // takes the same `idx` and finds it already there.
+            if ((idx >> self.chunk_shift) == self.vec_chunks.items.len) {
+                const per_chunk: usize = @as(usize, 1) << self.chunk_shift;
+                try self.vec_chunks.ensureUnusedCapacity(self.alloc, 1);
+                const chunk = try self.alloc.alignedAlloc(f32, .@"64", per_chunk * self.dim);
+                self.vec_chunks.appendAssumeCapacity(chunk);
+            }
+            const neighbors = try self.alloc.alloc(std.ArrayList(u64), level + 1);
+            errdefer self.alloc.free(neighbors);
+            for (neighbors) |*list| list.* = .empty;
+
+            // Every fallible step that mutates shared state happens before the
+            // first mutation: capacity for the per-node arrays and the map is
+            // reserved up front and the commit below cannot fail, so an
+            // allocation failure leaves the index exactly as it was and
+            // `visit_stamp`, `by_idx` and `norms` stay in lockstep.
+            try self.visit_stamp.ensureUnusedCapacity(self.alloc, 1);
+            try self.by_idx.ensureUnusedCapacity(self.alloc, 1);
+            try self.norms.ensureUnusedCapacity(self.alloc, 1);
+            try self.nodes.ensureUnusedCapacity(1);
+            try self.trackDense(id, idx);
+
+            const vec_copy = self.vectorSlot(idx);
+            @memcpy(vec_copy, vector);
+            n.* = .{
+                .id = id,
+                .vector = vec_copy,
+                .norm = normOf(vec_copy),
+                .dense_idx = idx,
+                .level = level,
+                .neighbors = neighbors,
+            };
+            // A stamp slot per node, in lockstep with `dense_idx`. No node is
+            // ever removed from this index, so the arrays only grow.
+            self.visit_stamp.appendAssumeCapacity(0);
+            self.by_idx.appendAssumeCapacity(n);
+            self.norms.appendAssumeCapacity(n.norm);
+            self.nodes.putAssumeCapacity(id, n);
+            self.count += 1;
+            if (id > self.max_id) self.max_id = id;
+            break :blk n;
         };
-        for (0..level + 1) |i| {
-            n.neighbors[i] = .empty;
-        }
-        // A stamp slot per node, in lockstep with `dense_idx`. No node is
-        // ever removed from this index, so the array only grows. Done
-        // before `nodes.put` so an allocation failure leaves the index
-        // exactly as it was.
-        try self.visit_stamp.append(self.alloc, 0);
-        try self.trackDense(id, n);
-        try self.nodes.put(id, n);
-        self.count += 1;
-        if (id > self.max_id) self.max_id = id;
 
         if (self.entry_point == null) {
             self.entry_point = id;
@@ -588,9 +707,9 @@ pub const HNSW = struct {
         try frontier.ensureTotalCapacity(self.alloc, budget);
         try results.ensureTotalCapacity(self.alloc, budget);
 
-        const start_node = self.nodeFor(start).?;
-        const start_score = score(q, start_node);
-        stamps[start_node.dense_idx] = gen;
+        const start_idx = self.idxFor(start).?;
+        const start_score = self.scoreIdx(q, start_idx);
+        stamps[start_idx] = gen;
         try frontier.append(self.alloc, .{ .id = start, .score = start_score });
         try results.append(self.alloc, .{ .id = start, .score = start_score });
 
@@ -605,11 +724,26 @@ pub const HNSW = struct {
             const node = self.nodeFor(c.id) orelse continue;
             if (level >= node.neighbors.len) continue;
 
-            for (node.neighbors[level].items) |nid| {
-                const n = self.nodeFor(nid) orelse continue;
-                if (stamps[n.dense_idx] == gen) continue;
-                stamps[n.dense_idx] = gen;
-                const s = score(q, n);
+            // Pass 1: resolve and mark every unseen neighbour, and ask the
+            // cache for its vector. Pass 2 scores them in the same order a
+            // single pass would have, so the walk is unchanged — only the
+            // memory latency of the later vectors now overlaps the
+            // arithmetic on the earlier ones.
+            const nbrs = node.neighbors[level].items;
+            var pending = &self.scratch_pending;
+            pending.clearRetainingCapacity();
+            try pending.ensureTotalCapacity(self.alloc, nbrs.len);
+            for (nbrs) |nid| {
+                const nidx = self.idxFor(nid) orelse continue;
+                if (stamps[nidx] == gen) continue;
+                stamps[nidx] = gen;
+                self.prefetchVector(nidx);
+                pending.appendAssumeCapacity(.{ .id = nid, .idx = nidx });
+            }
+
+            for (pending.items) |pn| {
+                const nid = pn.id;
+                const s = self.scoreIdx(q, pn.idx);
 
                 if (results.items.len < budget) {
                     try results.append(self.alloc, .{ .id = nid, .score = s });
@@ -2105,5 +2239,66 @@ test "HNSW: candidate heaps pop in total order, ties broken by id" {
         heap.items.len -= 1;
         if (prev_w) |p| try std.testing.expect(HNSW.candWorse(p, c));
         prev_w = c;
+    }
+}
+
+// =============================================================================
+// Vector arena
+// =============================================================================
+
+test "HNSW: vectors survive chunk boundaries and the graph does not depend on chunk size" {
+    const alloc = std.testing.allocator;
+    const dim: u16 = 12;
+    const n: usize = 300;
+    const corpus = try oracleCorpusN(alloc, n, dim);
+    defer alloc.free(corpus);
+
+    var wide = HNSW.init(alloc, .{}, dim);
+    defer wide.deinit();
+    // 4 vectors per chunk: 300 inserts cross 75 chunk boundaries.
+    var tiny = HNSW.init(alloc, .{}, dim);
+    defer tiny.deinit();
+    tiny.chunk_shift = 2;
+
+    try oracleFillN(&wide, corpus, n, dim);
+    try oracleFillN(&tiny, corpus, n, dim);
+    try std.testing.expectEqual(@as(usize, 75), tiny.vec_chunks.items.len);
+
+    for (0..n) |i| {
+        const id: u64 = @intCast(i + 1);
+        const want = corpus[i * dim ..][0..dim];
+        const node = tiny.nodes.get(id).?;
+        try std.testing.expectEqualSlices(f32, want, node.vector);
+        try std.testing.expectEqualSlices(f32, want, tiny.vectorAt(node.dense_idx));
+        try std.testing.expectEqual(node.norm, tiny.norms.items[node.dense_idx]);
+        try std.testing.expect(tiny.by_idx.items[node.dense_idx] == node);
+    }
+    try std.testing.expectEqual(
+        try wide.graphFingerprint(alloc),
+        try tiny.graphFingerprint(alloc),
+    );
+}
+
+test "HNSW: a failed insert leaves the per-node arrays in lockstep and leaks nothing" {
+    const dim: u16 = 8;
+    const corpus = try oracleCorpusN(std.testing.allocator, 40, dim);
+    defer std.testing.allocator.free(corpus);
+
+    // Fail the k-th allocation for every k an insert can reach; whatever
+    // happens, the index must stay consistent and free everything.
+    var k: usize = 0;
+    while (k < 60) : (k += 1) {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = k });
+        const alloc = failing.allocator();
+        var hnsw = HNSW.init(alloc, .{}, dim);
+        defer hnsw.deinit();
+        hnsw.chunk_shift = 1;
+        for (0..40) |i| {
+            hnsw.insert(@intCast(i + 1), corpus[i * dim ..][0..dim]) catch continue;
+        }
+        try std.testing.expectEqual(hnsw.visit_stamp.items.len, hnsw.by_idx.items.len);
+        try std.testing.expectEqual(hnsw.visit_stamp.items.len, hnsw.norms.items.len);
+        try std.testing.expectEqual(hnsw.count, hnsw.nodes.count());
+        try std.testing.expectEqual(hnsw.count, hnsw.by_idx.items.len);
     }
 }
