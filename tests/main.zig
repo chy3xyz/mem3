@@ -32,6 +32,7 @@ comptime {
     // HTTP server. Slow but high signal.
     _ = @import("integration/store_persistence_e2e.zig");
     _ = @import("integration/http_server_e2e.zig");
+    _ = @import("integration/consolidate_incremental_e2e.zig");
 
     // Property-based tests — randomized round-trip coverage of the
     // comptime serializer.

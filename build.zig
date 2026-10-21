@@ -160,6 +160,32 @@ pub fn build(b: *std.Build) void {
     longrun_step.dependOn(&run_longrun.step);
 
     // =========================================================================
+    // Example: `zig build example-consolidate-bench`
+    //
+    // Per-pass cost of `Consolidator.consolidate` (wall + CPU time, pair
+    // comparisons, the consolidator's own heap) over the long run's corpus
+    // shape, without the ingest cost the long run pays to reach that size.
+    //   ./zig-out/bin/mem3-consolidate-bench --mode=jump --cells=45000
+    // =========================================================================
+    const consolidate_bench_module = b.createModule(.{
+        .link_libc = true,
+        .root_source_file = b.path("examples/consolidate_bench.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+        .imports = &.{
+            .{ .name = "mem3", .module = libmem3_module },
+        },
+    });
+    const consolidate_bench_exe = b.addExecutable(.{
+        .name = "mem3-consolidate-bench",
+        .root_module = consolidate_bench_module,
+    });
+    b.installArtifact(consolidate_bench_exe);
+    const run_consolidate_bench = b.addRunArtifact(consolidate_bench_exe);
+    const consolidate_bench_step = b.step("example-consolidate-bench", "Measure per-pass consolidation cost (pairs, ms, heap)");
+    consolidate_bench_step.dependOn(&run_consolidate_bench.step);
+
+    // =========================================================================
     // Example: `zig build example-hnsw-recall`
     //
     // Recall@10 of the index against an exhaustive scan, swept over the
