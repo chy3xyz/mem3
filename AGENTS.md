@@ -143,6 +143,7 @@ tests/
 4. **Tests must not write inside the repo.** All scratch paths live under `/tmp`.
 5. **Verify the gate actually fails.** Inject a deliberately failing test and confirm `zig build test` exits non-zero — a green gate that cannot go red is worse than no gate.
 6. **A new test root must be reachable from `src/main.zig` or `tests/main.zig`.** `src/utils/serializer.zig` sat outside the gate for a long time: its tests had never run, and a `sizeOf` defect that silently dropped every `?[]const u8` payload survived because of it. A test that is not imported by a root is not a test.
+7. **`zig build` never compiles the test roots, so a cross-compile can be green while the tests do not build on that target.** `std.c.Stat` is `void` on Linux (a test calling `std.c.fstat` broke the whole `src/main.zig` test binary there), and `testing.expectEqual` on two string slices compares *pointers* (fails on x86_64 Debug, whose self-hosted backend does not fold equal literals — use `expectEqualStrings`). Check any target with `zig test -target <t> --test-no-exec -femit-bin=/tmp/x --dep mem3 -Mroot=<root> -lc -Mmem3=src/lib.zig -lc`; CI's `cross-compile` job does this for all three roots.
 
 **Known limitations tracked for v0.2.1:**
 - Foresight is durable (WAL + snapshot, CLI/HTTP/MCP) but not searchable: it is
@@ -177,12 +178,20 @@ tests/
    - `fix(serializer): correct nested slice handling for HyperEdge.source_weights`
    - `test(constitution): add spirit-dim invariant test`
 6. **Run `zig build bench`** if your change touches the hot path (HNSW, HybridRetriever, LSMStore, HTTP server). Compare against the Constitution §Performance Standards.
-7. **Open a PR**. CI (`.github/workflows/ci.yml`, `ubuntu-latest`) will:
-   - Run `zig build`, `zig build test`, `zig build check-constitution` (must be green)
-   - Run `zig build bench` as a **smoke step only** — machine-dependent, `continue-on-error`, never a gate
-   - Assert the working tree is clean after tests (catches tests writing into the repo)
-   - Inject a failing test and assert `zig build test` goes non-zero — the permanent guard against a gate that cannot fail
-   - Check `ldd zig-out/bin/mem3` on Linux / `otool -L` on macOS for new shared library deps (Constitution IV violation = blocked)
+7. **Open a PR**. CI (`.github/workflows/ci.yml`) is *written to* do the
+   following. **It has never run on a GitHub runner**: it was linted with
+   `actionlint`/`shellcheck` and its shell steps were executed locally (macOS
+   directly; Linux aarch64 in a container). Do not describe CI as green.
+   - `build-and-test`, matrix `ubuntu-latest` (x86_64) / `ubuntu-24.04-arm` (aarch64) / `macos-latest` (arm64), `fail-fast: false`:
+     - `zig build`, `zig build test`, `zig build check-constitution` (must be green)
+     - `scripts/check_linked_libs.sh` — Linux `ldd` allow-list / macOS `otool -L` allow-list (Constitution IV), self-test first, every installed executable, plus a `linkSystemLibrary` grep on `build.zig`
+     - `zig build test -Doptimize=ReleaseFast` as a `continue-on-error` step: the known `platform.clock.Timer` fold (README "Known misses", `docs/roadmap.md`) fails it on macOS arm64 (always) and Linux aarch64 (intermittently); failures are surfaced as annotations and in the job summary, not hidden
+     - `zig build bench` as a **smoke step only** — machine-dependent, `continue-on-error`, never a gate
+     - Assert the working tree is clean after tests (catches tests writing into the repo)
+     - Inject a failing test and assert `zig build test` goes non-zero — the permanent guard against a gate that cannot fail
+   - `cross-compile`: whole project (Debug + ReleaseFast) and the three test roots (`zig test --test-no-exec`) for `x86_64-linux-gnu`, `aarch64-linux-gnu`, `x86_64-macos`, `aarch64-macos`. Compile-only.
+   - `unsupported-targets`: `x86_64-windows`, `wasm32-wasi`, `wasm32-freestanding` must fail with the documented refusal message.
+   - Known: a Linux `zig build test` is expected to be **red or flaky** until `ExternalEmbedder: a backend that dies mid-request is BackendExited` is fixed (a race in `src/retrieval/embedder.zig`; ~40–55% failure on Linux, ~2% on macOS). Details: README "Continuous integration".
 
 ## Common Pitfalls (from project history)
 

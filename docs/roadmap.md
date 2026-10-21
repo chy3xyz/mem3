@@ -513,9 +513,15 @@ raw text. See `scripts/embedder_adapter_example.py`.
   clobber, `@call(.never_inline)`, function-pointer indirection, and
   `mach_absolute_time` — and all four still fold. The remaining approach is a
   per-architecture non-foldable cycle counter through inline asm (`rdtsc` /
-  `cntvct_el0`), which is **not written** because it cannot be validated on
-  Linux from this machine. Until then, treat min/tail-percentile latencies as
-  unreliable and report p50.
+  `cntvct_el0`), which is **not written**. Update 2026-10-21: a Linux
+  container is available after all (OrbStack). The defect is not macOS-only:
+  on Linux aarch64 the Timer test alone fails 186/300 runs in ReleaseFast and
+  0/300 in Debug (so a full-suite ReleaseFast run there passes or fails at
+  random — it passed twice and failed once), and on macOS arm64 it fails every
+  time. Linux x86_64 was only measured under Rosetta (0/300), which is not a
+  native result. CI runs the ReleaseFast test step as `continue-on-error` for
+  this reason. Until then, treat min/tail-percentile latencies as unreliable and
+  report p50.
 - **Snapshot restore now rebuilds the vector index** (fixed 2026-10-15).
   `Store.loadSnapshot` restored `addCell` + `cell_index.put` but never
   `hnsw.insert`, and `sync` is snapshot-and-truncate: `takeSnapshot` unlinks
