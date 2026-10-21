@@ -27,6 +27,8 @@ const mem3 = @import("mem3");
 const harness = @import("harness.zig");
 
 const lme = mem3.eval.longmemeval_official;
+const abl = mem3.eval.lme_ablation;
+const pstats = mem3.eval.paired_stats;
 const fs = mem3.platform.fs;
 const Allocator = std.mem.Allocator;
 
@@ -57,6 +59,8 @@ const Args = struct {
     limit: ?usize = null,
     opts: lme.Options = .{},
     dump_rankings: ?[]const u8 = null,
+    /// Per-question metric rows for `mem3-bench lme-compare`.
+    dump_scores: ?[]const u8 = null,
 };
 
 fn usage() void {
@@ -73,6 +77,23 @@ fn usage() void {
         \\  --depth=N             ranking depth from Store.query (default 0 = whole corpus)
         \\  --dump-rankings=PATH  JSONL of corpus ids + ranking per question, for
         \\                         scripts/lme_official_crosscheck.py
+        \\  --dump-scores=PATH    JSONL of per-question metrics + a ranking hash, the
+        \\                         input of `mem3-bench lme-compare` (paired ablation)
+        \\
+        \\Ablation switches (pre-registered in docs/benchmarks/ablation-tri-source.md;
+        \\the defaults reproduce the plain harness exactly):
+        \\  --tags=T              matter (default) | form | spirit | heuristic | random
+        \\  --tag-seed=N          seed for --tags=random (default 0)
+        \\  --goals=G             uniform (default) | per_session
+        \\  --goal-bonus-weight=F, --existence-bonus-weight=F, --recency-bonus-weight=F
+        \\                         override the reranker weights for this run only
+        \\  --graph=on|off        off zeroes the graph arm's fusion weight
+        \\  --session-edges       one hyperedge per session (needs --granularity=turn)
+        \\  --simulate-age        created_at from the dataset's dates (live recency)
+        \\  --foresight-on-spirit cells tagged spirit carry an unexpired foresight
+        \\  --router=R            none (default) | filter | boost  (harness-side source router)
+        \\  --router-boost=F      multiplier for --router=boost (default 1.25)
+        \\
         \\  --embedder-cmd=PATH   external embedder (see bench longmemeval --help)
         \\  --embedder-arg=ARG    one argument for it; repeatable
         \\  --embed-dim=N         vector width for the external embedder (default 384)
@@ -82,7 +103,7 @@ fn usage() void {
     , .{});
 }
 
-fn readWholeFile(alloc: Allocator, path: []const u8) ![]u8 {
+pub fn readWholeFile(alloc: Allocator, path: []const u8) ![]u8 {
     const zp = fs.z(path);
     const fd = try fs.open(zp.ptr(), .{ .access = .read_only });
     defer fs.close(fd);
@@ -164,10 +185,13 @@ fn tableRow(name: []const u8, g: lme.Group, level: Level) void {
     harness.progress(
         "  {s:<28} {d:>4}  | {d:.3} {d:.3} {d:.3} {d:.3} | {d:.3} {d:.3} {d:.3} {d:.3} | {d:.3} {d:.3} {d:.3} {d:.3}\n",
         .{
-            name,           g.n,
-            m.recall_any[0], m.recall_any[1], m.recall_any[2], m.recall_any[3],
-            m.recall_all[0], m.recall_all[1], m.recall_all[2], m.recall_all[3],
-            m.ndcg[0],       m.ndcg[1],       m.ndcg[2],       m.ndcg[3],
+            name,            g.n,
+            m.recall_any[0], m.recall_any[1],
+            m.recall_any[2], m.recall_any[3],
+            m.recall_all[0], m.recall_all[1],
+            m.recall_all[2], m.recall_all[3],
+            m.ndcg[0],       m.ndcg[1],
+            m.ndcg[2],       m.ndcg[3],
         },
     );
 }
@@ -205,6 +229,52 @@ fn writeDumpLine(alloc: Allocator, fd: fs.Fd, q: lme.Question, gran: lme.Granula
     try fs.writeAll(fd, j.buf.items);
 }
 
+fn appendMetricArr(alloc: Allocator, buf: *std.ArrayList(u8), name: []const u8, vals: [lme.NK]f64) !void {
+    try buf.print(alloc, "\"{s}\":[", .{name});
+    for (vals, 0..) |v, i| {
+        if (i > 0) try buf.append(alloc, ',');
+        try buf.print(alloc, "{d:.9}", .{v});
+    }
+    try buf.append(alloc, ']');
+}
+
+fn appendMetricRow(alloc: Allocator, buf: *std.ArrayList(u8), m: lme.MetricRow) !void {
+    try buf.append(alloc, '{');
+    try appendMetricArr(alloc, buf, "ra", m.recall_any);
+    try buf.append(alloc, ',');
+    try appendMetricArr(alloc, buf, "rl", m.recall_all);
+    try buf.append(alloc, ',');
+    try appendMetricArr(alloc, buf, "nd", m.ndcg);
+    try buf.append(alloc, '}');
+}
+
+/// How many ranked ids `rank_hash` covers (the deepest metric cut is @50).
+const HASH_PREFIX: usize = 50;
+
+/// One JSONL line per evaluated question. Floats at 9 decimals (the human
+/// JSON rounds to 6) so a paired delta of two identical rankings is exactly 0
+/// and a real one is not lost to rounding. `rank_hash` is FNV-1a of the first
+/// `HASH_PREFIX` ranked ids (the deepest cut any metric reads is @50), as a
+/// string because JSON numbers cannot hold a u64 safely. It is a prefix, not
+/// the whole ranking, because the *unmodified* store's recency factor reads
+/// the wall clock, so tied scores are ordered differently between two runs
+/// deep in a turn-level ranking (positions >100; metrics @50 are unaffected)
+/// and a whole-ranking hash would report phantom differences. Post-hoc; see docs/benchmarks/ablation-tri-source.md.
+fn writeScoreLine(alloc: Allocator, fd: fs.Fd, q: lme.Question, sc: lme.QuestionScore, r: lme.Ranked) !void {
+    if (std.mem.indexOfAny(u8, q.question_id, "\"\\") != null or std.mem.indexOfAny(u8, q.question_type, "\"\\") != null)
+        return error.UnsafeId;
+    var buf = std.ArrayList(u8).empty;
+    defer buf.deinit(alloc);
+    try buf.print(alloc, "{{\"question_id\":\"{s}\",\"question_type\":\"{s}\",\"rank_hash\":\"{x:0>16}\",\"n_ranked\":{d},\"primary\":", .{
+        q.question_id, q.question_type, pstats.rankingHash(r.ranking[0..@min(r.ranking.len, HASH_PREFIX)]), r.ranking.len,
+    });
+    try appendMetricRow(alloc, &buf, sc.primary);
+    try buf.appendSlice(alloc, ",\"derived\":");
+    if (sc.derived) |d| try appendMetricRow(alloc, &buf, d) else try buf.appendSlice(alloc, "null");
+    try buf.appendSlice(alloc, "}\n");
+    try fs.writeAll(fd, buf.items);
+}
+
 pub fn run(alloc: Allocator, init: std.process.Init.Minimal) !void {
     var common = harness.CommonArgs{};
     var args = Args{};
@@ -228,6 +298,33 @@ pub fn run(alloc: Allocator, init: std.process.Init.Minimal) !void {
             args.opts.depth = try std.fmt.parseInt(usize, arg["--depth=".len..], 10);
         } else if (std.mem.startsWith(u8, arg, "--dump-rankings=")) {
             args.dump_rankings = arg["--dump-rankings=".len..];
+        } else if (std.mem.startsWith(u8, arg, "--dump-scores=")) {
+            args.dump_scores = arg["--dump-scores=".len..];
+        } else if (std.mem.startsWith(u8, arg, "--tags=")) {
+            args.opts.variant.tags = abl.TagMode.parse(arg["--tags=".len..]) orelse return error.BadTags;
+        } else if (std.mem.startsWith(u8, arg, "--tag-seed=")) {
+            args.opts.variant.tag_seed = try std.fmt.parseInt(u64, arg["--tag-seed=".len..], 10);
+        } else if (std.mem.startsWith(u8, arg, "--goals=")) {
+            args.opts.variant.goals = abl.GoalMode.parse(arg["--goals=".len..]) orelse return error.BadGoals;
+        } else if (std.mem.startsWith(u8, arg, "--goal-bonus-weight=")) {
+            args.opts.variant.goal_bonus_weight = try std.fmt.parseFloat(f32, arg["--goal-bonus-weight=".len..]);
+        } else if (std.mem.startsWith(u8, arg, "--existence-bonus-weight=")) {
+            args.opts.variant.existence_bonus_weight = try std.fmt.parseFloat(f32, arg["--existence-bonus-weight=".len..]);
+        } else if (std.mem.startsWith(u8, arg, "--recency-bonus-weight=")) {
+            args.opts.variant.recency_bonus_weight = try std.fmt.parseFloat(f32, arg["--recency-bonus-weight=".len..]);
+        } else if (std.mem.startsWith(u8, arg, "--graph=")) {
+            const g = arg["--graph=".len..];
+            if (std.mem.eql(u8, g, "off")) args.opts.variant.graph_off = true else if (!std.mem.eql(u8, g, "on")) return error.BadGraph;
+        } else if (std.mem.eql(u8, arg, "--session-edges")) {
+            args.opts.variant.session_edges = true;
+        } else if (std.mem.eql(u8, arg, "--simulate-age")) {
+            args.opts.variant.simulate_age = true;
+        } else if (std.mem.eql(u8, arg, "--foresight-on-spirit")) {
+            args.opts.variant.foresight_on_spirit = true;
+        } else if (std.mem.startsWith(u8, arg, "--router=")) {
+            args.opts.variant.router = abl.RouterMode.parse(arg["--router=".len..]) orelse return error.BadRouter;
+        } else if (std.mem.startsWith(u8, arg, "--router-boost=")) {
+            args.opts.variant.router_boost = try std.fmt.parseFloat(f32, arg["--router-boost=".len..]);
         } else if (std.mem.startsWith(u8, arg, "--embedder-cmd=")) {
             args.opts.embedder_cmd = arg["--embedder-cmd=".len..];
         } else if (std.mem.startsWith(u8, arg, "--embedder-arg=")) {
@@ -284,6 +381,15 @@ pub fn run(alloc: Allocator, init: std.process.Init.Minimal) !void {
     }
     defer if (dump_fd) |fd| fs.close(fd);
 
+    var scores_fd: ?fs.Fd = null;
+    if (args.dump_scores) |p| {
+        const zp = fs.z(p);
+        scores_fd = try fs.open(zp.ptr(), .{ .access = .write_only, .create = .truncate });
+    }
+    defer if (scores_fd) |fd| fs.close(fd);
+    var diag_total = lme.Diag{};
+    var router_pred_counts = [_]u64{ 0, 0, 0 };
+
     var agg = lme.Aggregate.init(alloc);
     defer agg.deinit();
 
@@ -317,10 +423,22 @@ pub fn run(alloc: Allocator, init: std.process.Init.Minimal) !void {
             continue;
         }
 
-        const r = try lme.rank(alloc, q, args.opts);
+        const r = lme.rank(alloc, q, args.opts) catch |err| {
+            if (err == error.EdgesNeedTurnGranularity) {
+                harness.out("longmemeval-official: --session-edges needs --granularity=turn\n", .{});
+            }
+            return err;
+        };
         defer r.deinit(alloc);
         const sc = try lme.scoreRanked(alloc, r, args.opts.granularity);
         try agg.add(q.question_type, sc);
+        if (scores_fd) |fd| try writeScoreLine(alloc, fd, q, sc, r);
+        for (0..3) |ti| diag_total.tag_counts[ti] += r.diag.tag_counts[ti];
+        diag_total.goals_created += r.diag.goals_created;
+        diag_total.edges_created += r.diag.edges_created;
+        diag_total.ages_set += r.diag.ages_set;
+        diag_total.ages_unparsed += r.diag.ages_unparsed;
+        if (r.diag.router_pred) |pp| router_pred_counts[@backingInt(pp)] += 1;
 
         evaluated += 1;
         ingest_failures += r.ingest_failures;
@@ -426,6 +544,65 @@ pub fn run(alloc: Allocator, init: std.process.Init.Minimal) !void {
     try j.key("store_path");
     try j.str("fresh in-memory Store per question; Store.query (GHW goal-aware rerank included); " ++
         "no hyperedges are added, so the graph arm contributes only seeds");
+    try j.key("variant");
+    try j.beginObject();
+    const vv = args.opts.variant;
+    try j.key("is_default");
+    try j.boolean(vv.isDefault());
+    try j.key("tags");
+    try j.str(@tagName(vv.tags));
+    try j.key("tag_seed");
+    try j.int(vv.tag_seed);
+    try j.key("goals");
+    try j.str(@tagName(vv.goals));
+    try j.key("goal_bonus_weight");
+    try j.optFloat(if (vv.goal_bonus_weight) |w| @as(f64, w) else null);
+    try j.key("existence_bonus_weight");
+    try j.optFloat(if (vv.existence_bonus_weight) |w| @as(f64, w) else null);
+    try j.key("recency_bonus_weight");
+    try j.optFloat(if (vv.recency_bonus_weight) |w| @as(f64, w) else null);
+    try j.key("graph_off");
+    try j.boolean(vv.graph_off);
+    try j.key("session_edges");
+    try j.boolean(vv.session_edges);
+    try j.key("simulate_age");
+    try j.boolean(vv.simulate_age);
+    try j.key("foresight_on_spirit");
+    try j.boolean(vv.foresight_on_spirit);
+    try j.key("router");
+    try j.str(@tagName(vv.router));
+    try j.key("router_boost");
+    try j.float(vv.router_boost);
+    try j.endObject();
+    try j.key("variant_diag");
+    try j.beginObject();
+    try j.key("ingested_docs_by_tag");
+    try j.beginObject();
+    try j.key("matter");
+    try j.int(@as(u64, diag_total.tag_counts[0]));
+    try j.key("form");
+    try j.int(@as(u64, diag_total.tag_counts[1]));
+    try j.key("spirit");
+    try j.int(@as(u64, diag_total.tag_counts[2]));
+    try j.endObject();
+    try j.key("goals_created");
+    try j.int(@as(u64, diag_total.goals_created));
+    try j.key("edges_created");
+    try j.int(@as(u64, diag_total.edges_created));
+    try j.key("ages_set");
+    try j.int(@as(u64, diag_total.ages_set));
+    try j.key("ages_unparsed");
+    try j.int(@as(u64, diag_total.ages_unparsed));
+    try j.key("router_predicted_questions");
+    try j.beginObject();
+    try j.key("matter");
+    try j.int(router_pred_counts[0]);
+    try j.key("form");
+    try j.int(router_pred_counts[1]);
+    try j.key("spirit");
+    try j.int(router_pred_counts[2]);
+    try j.endObject();
+    try j.endObject();
     try j.endObject();
 
     try j.key("counts");

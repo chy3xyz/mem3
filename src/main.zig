@@ -180,6 +180,10 @@ comptime {
     // Official LongMemEval retrieval harness: metric math, dataset parsing,
     // corpus construction and a Store-backed fixture run.
     _ = @import("eval/longmemeval_official.zig");
+    // Ablation harness (variants, tag assigner, router) and its paired
+    // bootstrap statistics. Evaluation-only; no product code path.
+    _ = @import("eval/paired_stats.zig");
+    _ = @import("eval/lme_ablation.zig");
     // The daemon entry point: banner, logger selection and signal wiring.
     _ = @import("cli_commands/serve.zig");
 }
