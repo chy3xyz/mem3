@@ -1,12 +1,12 @@
 //! Tri-Source Memory Manager — owns the three source sub-stores.
 //!
-//! **GHW Layer**: Memory (三源合恰). Sits between the three GHW layers and
+//! **GHW Layer**: Memory (tri-source coherence). Sits between the three GHW layers and
 //! the storage layer. Maintains physical isolation of the three sources
 //! while allowing the lifecycle to act on them uniformly.
 //!
 //! ## Constitution compliance
-//! - Principle I (三源完整性): every cell is routed to its source sub-store.
-//! - Principle III (存在增益驱动): the manager exposes scoring used by
+//! - Principle I (Tri-Source Integrity): every cell is routed to its source sub-store.
+//! - Principle III (existence-gain-driven lifecycle): the manager exposes scoring used by
 //!   consolidation and forgetting.
 
 const std = @import("std");

@@ -1,10 +1,10 @@
 //! Existence-gain-driven forgetting.
 //!
-//! **GHW Layer**: Memory (三源合恰). Implements the Forgetting stage of
+//! **GHW Layer**: Memory (tri-source coherence). Implements the Forgetting stage of
 //! the four-stage lifecycle (per the paper §4.3.4).
 //!
 //! ## Constitution compliance
-//! - Principle III (存在增益驱动): a memory is forgotten when
+//! - Principle III (existence-gain-driven lifecycle): a memory is forgotten when
 //!   `net_existence = importance - redundancy - conflict_score < 0`.
 //! - PCR: never delete; mark `is_fuzzy = true` and move to fuzzy store.
 

@@ -12,8 +12,8 @@ pub const VERSION_PRE: []const u8 = "alpha";
 /// Build SHA (injected at build time, defaults to "dev" for local builds).
 pub const BUILD_SHA: []const u8 = "dev";
 
-/// Codename follows the 三源合恰 + GHW tradition.
-pub const CODENAME: []const u8 = "三源合恰 · GHW-Alpha";
+/// Codename follows the Tri-Source Coherence + GHW tradition.
+pub const CODENAME: []const u8 = "Tri-Source Coherence · GHW-Alpha";
 
 /// Compose the human-readable banner.
 pub fn banner() []const u8 {

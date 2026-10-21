@@ -41,8 +41,8 @@
 //!
 //! ## Constitution compliance
 //!
-//! - Principle IV (零依赖): pure Zig, no new external deps.
-//! - Principle V (零拷贝 + comptime): no reflection, explicit fields.
+//! - Principle IV (zero dependency): pure Zig, no new external deps.
+//! - Principle V (zero-copy + comptime): no reflection, explicit fields.
 //! - Principle VII (observability): `deinit` is idempotent — safe to
 //!   call multiple times if a caller forgets (logger emits a warning).
 
@@ -165,9 +165,9 @@ pub const Store = struct {
     /// Goal Poset — owned pointer so it can be passed by ref to APIs
     /// that take `*GoalPoset`.
     goals: *ghw.GoalPoset,
-    /// GHW layer 2 (Harness / 象源). Owned; released in `deinit`.
+    /// GHW layer 2 (Harness / form source). Owned; released in `deinit`.
     harness: *ghw.HarnessRegistry,
-    /// GHW layer 3 (World / 物源). Owned; released in `deinit`.
+    /// GHW layer 3 (World / matter source). Owned; released in `deinit`.
     world: *ghw.WorldModel,
     /// The three-layer handle every memory operation now travels
     /// through. Built once in `init`; holds no ownership of its own.
@@ -1264,14 +1264,14 @@ pub const Store = struct {
             // `forget` — so the two arms cannot disagree about which
             // cells exist.
             self.indexLexicalText(id, stored);
-            // 外拓. Everything above this line is the World layer's
+            // Outward path. Everything above this line is the World layer's
             // storage job; everything GHW does with the memory happens
             // here, and it happens in layer order.
             try self.encodeAcrossLayers(id, stored);
         }
     }
 
-    /// 外拓 — carry one committed memory across all three GHW layers.
+    /// Outward path: carry one committed memory across all three GHW layers.
     ///
     /// Goal → Harness → World, in that order, each hop checked against
     /// `isValidDirection` inside `GHW.encode` before it runs. A
@@ -1318,7 +1318,7 @@ pub const Store = struct {
     }
 
     // =================================================================
-    // Retrieval (内求 — World → Harness → Goal)
+    // Retrieval (inward path: World → Harness → Goal)
     // =================================================================
 
     pub const QueryOptions = struct {

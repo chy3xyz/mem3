@@ -4,7 +4,7 @@
 **Created**: 2026-06-07
 **Feature**: [spec.md](./spec.md) | [plan.md](./plan.md) | [data-model.md](./data-model.md) | [quickstart.md](./quickstart.md) | [tasks.md](./tasks.md)
 
-**Source basis**: `dev.md` (engineering blueprint), `ghw_memory_system.agent.final.md` (formal paper), `三源合恰论.docx` (foundational ontology), `.specify/memory/constitution.md` (project principles).
+**Source basis**: `dev.md` (engineering blueprint), `ghw_memory_system.agent.final.md` (formal paper), the Tri-Source Coherence Theory manuscript (foundational ontology), `.specify/memory/constitution.md` (project principles).
 
 ---
 
@@ -24,7 +24,7 @@
 - [x] **CHK009**: All acceptance scenarios are defined. (US1: 4 scenarios; US2: 3 scenarios; US3: 2 scenarios; US4: 2 scenarios. Edge cases: 7 cases.)
 - [x] **CHK010**: Edge cases are identified. (Empty store, concurrent writes, disk full, corrupted WAL, goal deletion, source tag drift, HNSW rebuild, long-running daemon — 8 cases covered.)
 - [x] **CHK011**: Scope is clearly bounded. (§Non-Goals lists 8 explicit deferrals; §Out-of-Scope Dependencies lists 7 explicit non-dependencies.)
-- [x] **CHK012**: Dependencies and assumptions identified. (§Assumptions lists 7 assumptions; dependencies on `dev.md`, `ghw_memory_system.agent.final.md`, and `三源合恰论.docx` are explicit in the input section.)
+- [x] **CHK012**: Dependencies and assumptions identified. (§Assumptions lists 7 assumptions; dependencies on `dev.md`, `ghw_memory_system.agent.final.md`, and the Tri-Source Coherence Theory manuscript are explicit in the input section.)
 
 ## Feature Readiness
 
@@ -35,13 +35,13 @@
 
 ## Constitution Alignment
 
-- [x] **CHK017**: Spec respects Principle I (三源完整性). (FR-002 mandates source_tag; FR-027.a tests it; TS-MemCell structure is fully specified in data-model.md.)
-- [x] **CHK018**: Spec respects Principle II (GHW 三层耦合). (FR-004 mandates three modules; FR-027.b tests spirit dim; plan.md §Project Structure maps to GHW layers.)
-- [x] **CHK019**: Spec respects Principle III (存在增益驱动). (FR-003 specifies the importance formula with exact α/β/γ; FR-010 specifies the forgetting formula; FR-015 specifies the conflict resolution rule.)
-- [x] **CHK020**: Spec respects Principle IV (零依赖 + Zig 0.17). (FR-023 explicitly forbids external runtime deps; FR-024 mandates cross-compile; §Out-of-Scope Dependencies lists 7 explicit non-dependencies.)
-- [x] **CHK021**: Spec respects Principle V (零拷贝 + 编译时零开销). (FR-020 mandates `comptime serialized_size`; FR-019 mandates `std.Io`; performance targets in §Performance Standards.)
-- [x] **CHK022**: Spec respects Principle VI (测试优先). (FR-026 mandates `mem3 bench`; FR-027 mandates constitution tests; tasks.md T026-T028 are the explicit constitution test tasks.)
-- [x] **CHK023**: Spec respects Principle VII (可观测性). (FR-016 mandates CLI; FR-017 mandates HTTP /metrics; FR-025 mandates structured logging with --log-every.)
+- [x] **CHK017**: Spec respects Principle I (Tri-Source Integrity). (FR-002 mandates source_tag; FR-027.a tests it; TS-MemCell structure is fully specified in data-model.md.)
+- [x] **CHK018**: Spec respects Principle II (GHW Three-Layer Coupling). (FR-004 mandates three modules; FR-027.b tests spirit dim; plan.md §Project Structure maps to GHW layers.)
+- [x] **CHK019**: Spec respects Principle III (Existence-Gain-Driven Lifecycle). (FR-003 specifies the importance formula with exact α/β/γ; FR-010 specifies the forgetting formula; FR-015 specifies the conflict resolution rule.)
+- [x] **CHK020**: Spec respects Principle IV (Zero-Dependency Zig 0.17 Native). (FR-023 explicitly forbids external runtime deps; FR-024 mandates cross-compile; §Out-of-Scope Dependencies lists 7 explicit non-dependencies.)
+- [x] **CHK021**: Spec respects Principle V (Zero-Copy + Comptime Zero-Overhead). (FR-020 mandates `comptime serialized_size`; FR-019 mandates `std.Io`; performance targets in §Performance Standards.)
+- [x] **CHK022**: Spec respects Principle VI (Test-First + Formal Guarantees). (FR-026 mandates `mem3 bench`; FR-027 mandates constitution tests; tasks.md T026-T028 are the explicit constitution test tasks.)
+- [x] **CHK023**: Spec respects Principle VII (Observability + Single-Binary Debugging). (FR-016 mandates CLI; FR-017 mandates HTTP /metrics; FR-025 mandates structured logging with --log-every.)
 
 ## Plan-Design Coherence
 
