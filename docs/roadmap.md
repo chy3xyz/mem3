@@ -14,9 +14,14 @@ Current version: **`0.1.0-alpha`**. Supported targets: **macOS and Linux**.
   `memory_forget`, `memory_stats`. `memory_forget` defaults to `dry_run: true`,
   which is stricter than the CLI. This was the missing distribution channel:
   without it the daemon's storage was reachable only by a bespoke HTTP client.
-  **Still unverified against a real MCP host** — no client has run against it
-  yet, only against conformance probes written here, which is a weaker claim
-  and worth stating as one.
+  **Partly verified against real MCP hosts** (2026-10-21): MCP Inspector CLI
+  2.11.0, Claude Code 2.1.289 and the Cursor CLI agent 2026.10.21 each ran
+  `tools/list`, `memory_add`, `memory_query` and `memory_stats` without error,
+  all via the legacy `2025-11-25` handshake. **Still unverified**: the modern
+  `2026-07-28` path against any real client (conformance probes written here
+  are the only evidence for it), and Claude Desktop, the Cursor IDE app, Codex
+  and Gemini CLI; opencode got only as far as `tools/list`. Details and a
+  self-check in [`mcp-hosts.md`](mcp-hosts.md).
 - **Dual-era, not legacy-only.** The current revision `2026-07-28` removed the
   `initialize` handshake, moved the protocol version into every request's
   `_meta`, required a `resultType` on every result, and made `server/discover`
@@ -51,6 +56,38 @@ Current version: **`0.1.0-alpha`**. Supported targets: **macOS and Linux**.
 - **HNSW recall** — see "The graph used to be disconnected" below. On a
   400-node corpus recall@10 went 0.6090 → **0.9920** at ef=10, and reachability
   went 0.7675 → 0.9975.
+- **`--foresight` was accepted and discarded; it is now durable.**
+  Reproduction (before): `mem3 add --source=spirit --episode x --foresight
+  "rain|1|2|0.8"` printed `warning: --foresight is not yet stored`, wrote a WAL
+  record with no foresight field, and `mem3 dump` in the next process printed
+  `"foresight":[]` with the placeholder goal id `0` — a foresight-only cell lost
+  its spirit dimension across a restart. Cause: `Store.addRaw` took one goal
+  and no foresight, and neither the `memcell_insert` record nor
+  `buildCellFromParsed` had anywhere to put it. The snapshot row already
+  carried foresight, so the defect was the WAL and the insert path only.
+  Fix: `Store.addRawWithForesight`, and an optional trailing
+  `"foresight":[{"description","valid_from","valid_until","confidence"}]` field
+  on the `memcell_insert` record, emitted **only when non-empty** — a record
+  without foresight is byte-identical to before (the pinned literal test is
+  unchanged) and a WAL written before this field existed replays with empty
+  foresight, so no old file is rejected. The snapshot format did not change.
+  Entries are validated before anything is journaled (empty description, or a
+  confidence that is not a finite number in [0, 1], is `InvalidForesight`),
+  because a NaN has no JSON spelling and would make the live cell and its replay
+  disagree. The same field is carried by HTTP `POST /api/memcells` (also shown
+  by `GET /api/memcells/:id`), and MCP `memory_add`. Consolidation abstracts
+  inherit their representative's foresight in memory, and their WAL record now
+  carries it too — that last path has no dedicated test. Regression tests were written
+  first and observed failing with `expected 2, found 0` (WAL replay, snapshot
+  restore, `dump`, `add`, HTTP, MCP) before the implementation. Found on the
+  way: the HTTP 400 path of `POST /api/memcells` leaked its error body on every
+  refused insert (surfaced by the new refusal test). **Not closed:** foresight
+  is not embedded and not in the BM25 text, so `query` cannot retrieve a cell
+  by what it predicts; and a cell with no goal still carries synthetic goal id
+  `0`. A pre-change binary was not run against a post-change store, so
+  forward-compatibility (old reader, new WAL with foresight) is untested — it
+  should read the record unchanged because the old parser stops at the fields
+  it knows, but that is reasoning, not a measurement.
 
 ---
 
@@ -232,9 +269,6 @@ raw text. See `scripts/embedder_adapter_example.py`.
   insert an id a live cell already holds. Currently masked by
   `TriSourceManager.addWithId` rejecting the duplicate, but it is the same
   latent hazard and nothing tests the ordering that makes it safe.
-- **`--foresight` is accepted and discarded.** The CLI warns at encode time, but
-  the value never reaches the WAL record or the committed cell, so a
-  foresight-only cell loses its spirit dimension across a restart.
 - **Consolidation does not reach steady state, and no run length will show it.**
   Recorded run: 2,124 cycles / 397 s / 46,958 cells. `d_cells` first-decile mean
   21.632, last-decile mean 21.849 — flat. The cause is arithmetic, not a short
@@ -326,5 +360,6 @@ raw text. See `scripts/embedder_adapter_example.py`.
   not the dominant write cost, but it will become one once insert is fixed.
 - **The on-disk format is unstable.** `0.1.0-alpha`, no external users, no
   stability guarantee.
-- **No licence.** No `LICENSE` file exists. The code is unlicensed and carries no
-  granted rights until one is added.
+- **Licence: MIT** (`LICENSE`, added 2026-10-21; copyright holder is the
+  placeholder "mem3 contributors" — replace with the real owner before any
+  external release).

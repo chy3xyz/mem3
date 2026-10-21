@@ -192,7 +192,9 @@ added memory id=6
 ```
 
 `--source` accepts `matter`/`m`/`物`, `form`/`f`/`象`, `spirit`/`s`/`性`.
-`--foresight` is `description|valid_from|valid_until|confidence`.
+`--foresight` is `description|valid_from|valid_until|confidence` (entries
+`;`-separated); it is durable — journaled in the WAL record and carried in the
+snapshot, so a foresight-only cell keeps its spirit dimension across a restart.
 Facts are `subject|predicate|object`, `;`-separated.
 
 Read back what is on disk:
@@ -306,13 +308,19 @@ mem3 <subcommand> [flags]
 | `consolidate` | Run the consolidation pipeline | works |
 | `forget` | Existence-gain-driven forgetting sweep | works |
 | `serve` | Start the HTTP daemon | works |
-| `mcp` | Serve the Model Context Protocol over stdio | works; protocol version declared, not yet exercised against a real MCP host |
+| `mcp` | Serve the Model Context Protocol over stdio | works; driven end to end by MCP Inspector 2.11.0, Claude Code 2.1.289 and the Cursor CLI agent 2026.10.21 (legacy `2025-11-25` handshake only; no other host — see [`docs/mcp-hosts.md`](docs/mcp-hosts.md)) |
 | `bench` | In-process smoke suite (see [Performance](#performance)) | works; the release gate is `zig build bench` |
 | `help`, `version` | Help text / version string | works |
 
 `add` flags: `--source`, `--episode` (`--ep`), `--facts`, `--foresight`,
 `--goal-ids`, `--relevances`. Both `--foresight` and `--goal-ids` are needed
-only in the sense that at least one must be present.
+only in the sense that at least one must be present. `--foresight` entries are
+`description|valid_from|valid_until|confidence` separated by `;`; a confidence
+that is not a finite number in [0, 1], or an empty description, is refused
+(`InvalidForesight`) and nothing is written. The same field is accepted by the
+HTTP `POST /api/memcells` body (`"foresight":[{"description":..,"valid_from":..,
+"valid_until":..,"confidence":..}]`) and by MCP `memory_add`
+(`"foresight":["desc|from|until|conf"]`).
 
 `query` flags: `--topk` (`-k`, default 10), `--source-filter` (comma-separated
 sources), `--goal-ids` (comma-separated ids). With `--json` it prints
@@ -639,7 +647,7 @@ extends the file on the next run.
 
 ```bash
 ./scripts/verify.sh           # everything below, plus provenance and a not-verified list
-zig build test                # 432 tests (349 + 83)
+zig build test                # 462 tests (378 + 84)
 zig build check-constitution  # 12 constitution invariants
 zig build bench
 python3 scripts/mcp_conformance.py   # drives a live `mem3 mcp` over stdio
@@ -657,13 +665,21 @@ at a specific build.
 
 What it is *not*: an interoperability test. Every message in it was written by
 the same person who wrote the server, so a shared misreading of the spec would
-pass here and fail against a real client. No real MCP host has run against
-mem3 yet, and the script says so in its own docstring.
+pass here and fail against a real client. Three real clients have since
+been driven against it on 2026-10-21 — MCP Inspector CLI 2.11.0, Claude Code
+2.1.289 (headless) and the Cursor CLI agent 2026.10.21 — each doing
+`tools/list`, `memory_add`, `memory_query` and `memory_stats` with no errors.
+All three used the legacy `2025-11-25` handshake, so **the modern `2026-07-28`
+path still has no real-client evidence**. Not verified: Claude Desktop, the
+Cursor IDE app, Codex, Gemini CLI (needs auth), and opencode (handshake and
+`tools/list` only; its LLM gateway was down). Transcripts, per-host config
+snippets and a 5-minute self-check for the rest are in
+[`docs/mcp-hosts.md`](docs/mcp-hosts.md).
 
 `zig build test` runs two binaries — one rooted at `src/main.zig` and one at
 `tests/main.zig` (unit, integration and property tests under `tests/`). The
-counts above are what the two binaries actually report: `347/347` and `83/83`,
-for `432/432 tests passed` overall.
+counts above are what the two binaries actually report: `378/378` and `84/84`,
+for `462/462 tests passed` overall.
 
 **Zig collects `test` blocks only from files named directly in a root source
 file's `comptime { _ = @import(...) }` block, exactly one level deep.** A file
@@ -679,8 +695,8 @@ Because `zig build test` re-runs are served from the build cache and report gree
 without re-executing, drive the roots directly when you need a real count:
 
 ```bash
-zig test --dep mem3 -Mroot=src/main.zig  -Mmem3=src/lib.zig   # -> All 217 tests passed.
-zig test --dep mem3 -Mroot=tests/main.zig -Mmem3=src/lib.zig   # -> All 83 tests passed.
+zig test --dep mem3 -Mroot=src/main.zig  -Mmem3=src/lib.zig   # -> All 378 tests passed.
+zig test --dep mem3 -Mroot=tests/main.zig -Mmem3=src/lib.zig   # -> All 84 tests passed.
 zig test --dep mem3 -Mroot=tests/constitution/main.zig -Mmem3=src/lib.zig  # -> All 12 tests passed.
 ```
 
@@ -732,11 +748,10 @@ Known and measured, not discovered after the fact:
   correctly, and the score stayed 12/12 before and after.
 - **Switching embedders invalidates a persisted index.** Vectors are not
   persisted, only ids and graph topology — see [Retrieval](#retrieval).
-- **`--foresight` is accepted and discarded.** The cell is written without it;
-  the CLI now says so at encode time (`warning: --foresight is not yet stored;
-  it is absent from the WAL record and from the committed cell.`), and `dump`
-  returns `"foresight":[]` with a placeholder goal id of `0`, so a
-  foresight-only cell loses its spirit dimension.
+- **Foresight is stored but not searchable.** `--foresight` is durable (WAL and
+  snapshot), but it is not embedded and not in the BM25 text, so `query` cannot
+  find a cell by what it predicts — only by its episode and facts. A cell that
+  names no goal still carries the synthetic goal id `0` next to its foresight.
 - **HNSW recall is high on small graphs and falls off with corpus size.** The
   layered structure is built and searched by greedy descent with `ef`-bounded
   expansion, not sampled. Measured recall@10 against an exhaustive scan on a
@@ -939,9 +954,7 @@ that first. (`.onnx_external` remains reserved and returns
 
 ## License
 
-**No license file has been added to this repository yet.** Until one is, the
-code is unlicensed and carries no granted rights — do not redistribute it. If
-you need to use mem3, open an issue asking which license to apply.
+MIT — see [`LICENSE`](LICENSE).
 
 ## Further reading
 

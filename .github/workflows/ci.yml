@@ -64,6 +64,20 @@ jobs:
       - name: zig build
         run: zig build
 
+      # Constitution IV: no new shared-library dependency. Only the C runtime
+      # family is allowed; anything else (libssl, libsqlite3, ...) fails the job.
+      - name: Check linked libraries (Constitution IV)
+        run: |
+          set -euo pipefail
+          ldd zig-out/bin/mem3 | tee /tmp/ldd.txt
+          bad="$(awk '{print $1}' /tmp/ldd.txt \
+            | grep -v -E '^(linux-vdso\.so|libc\.so|libm\.so|libpthread\.so|libdl\.so|librt\.so|libgcc_s\.so|ld-linux|/lib.*/ld-linux|statically)' || true)"
+          if [ -n "$bad" ]; then
+            echo "::error::unexpected shared library dependencies:"
+            echo "$bad"
+            exit 1
+          fi
+
       - name: zig build test
         run: zig build test
 

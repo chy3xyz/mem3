@@ -15,7 +15,7 @@
 | Theory | 三源合恰论 (物/象/性) + GHW 范式 (Goal/Harness/World) |
 | Spec-kit | Initialized; spec at `specs/001-trisource-everos-mvp/` |
 | Platforms | **macOS and Linux only** — Windows and WASM refused at compile time (see [Platforms](#platforms)) |
-| Status | **v0.1.0-alpha** (CLI + MCP + persistence + 432 tests + 12 constitution invariants, all measured). All 7 constitutional principles active. |
+| Status | **v0.1.0-alpha** (CLI + MCP + persistence + 462 tests + 12 constitution invariants, all measured). All 7 constitutional principles active. |
 
 ## Read Order for New Agents
 
@@ -27,7 +27,7 @@
    intended architecture and have not been re-audited against the current
    source. Verify anything you rely on against `src/`.
 5. `ghw_memory_system.agent.final.md` — formal theory paper
-6. `.specify/memory/constitution.md` — **the 7 principles (law), v1.1.0**
+6. `.specify/memory/constitution.md` — **the 7 principles (law), v1.2.0**
 7. `specs/001-trisource-everos-mvp/spec.md` — what we're building
 8. `specs/001-trisource-everos-mvp/plan.md` — how we're building it
 9. `specs/001-trisource-everos-mvp/data-model.md` — type definitions
@@ -122,11 +122,11 @@ tests/
 | `mem3 forget` | ✅ | Existence-gain-driven forgetting sweep |
 | `mem3 bench` | ✅ | Fast in-process smoke suite; the release gate is `zig build bench` |
 | `mem3 serve` | ✅ | HTTP daemon with /healthz /metrics /api/sync /api/memcells /api/memcells/:id |
-| `mem3 mcp` | ✅ | MCP server over stdio (JSON-RPC 2.0, hand-written, zero deps). 5 tools: `memory_add` / `memory_query` / `goal_list` / `memory_forget` / `memory_stats`. **Dual-era**: modern `2026-07-28` (per-request `_meta`, `resultType`, `server/discover`) and the legacy handshake, decided per request. Accepts JSON-RPC batches. Checked by `scripts/mcp_conformance.py` against the live binary. **No real MCP host has run against it yet** |
+| `mem3 mcp` | ✅ | MCP server over stdio (JSON-RPC 2.0, hand-written, zero deps). 5 tools: `memory_add` / `memory_query` / `goal_list` / `memory_forget` / `memory_stats`. **Dual-era**: modern `2026-07-28` (per-request `_meta`, `resultType`, `server/discover`) and the legacy handshake, decided per request. Accepts JSON-RPC batches. Checked by `scripts/mcp_conformance.py` against the live binary. **Real-client evidence (2026-10-21, legacy `2025-11-25` handshake only)**: MCP Inspector CLI 2.11.0, Claude Code 2.1.289 and the Cursor CLI agent 2026.10.21 each ran `tools/list` + `memory_add` + `memory_query` + `memory_stats` cleanly; opencode 2.0.32 only handshake + `tools/list`. **Not verified**: the modern `2026-07-28` path against any real client, Claude Desktop, Cursor IDE, Codex, Gemini CLI. See `docs/mcp-hosts.md` |
 | Embedding | ✅ | Built-in hashed lexer is the default and is byte-identical to pre-MCP builds. `--embedder-cmd` delegates to a long-lived external program over a line protocol (the "optional tier"); no new link dependency either way. Requests are **hex-encoded**, not raw text — see `scripts/embedder_adapter_example.py` |
 | Lexical arm | ✅ | `src/retrieval/bm25.zig`, Okapi BM25 over unigrams + bigrams, max-normalised inside the existing `λ_dense=0.5 / λ_sparse=0.2 / λ_graph=0.3` sum. Rebuilt from cells on snapshot restore, never serialised. Identifiers that live only in an `atomic_facts` triple went from 1/12 recall to 12/12 |
 | Persistence | ✅ | WAL-first + snapshot. WAL truncated on sync. |
-| Tests | ✅ | 451: 368 (`src/main.zig`-rooted) + 83 (`tests/main.zig`-rooted), plus 12 constitution invariants as a separate gate, 0 leaks |
+| Tests | ✅ | 462: 378 (`src/main.zig`-rooted) + 84 (`tests/main.zig`-rooted), plus 12 constitution invariants as a separate gate, 0 leaks |
 | Binary | ✅ | 963,704 bytes `ReleaseFast` / 4,569,032 bytes Debug, only links libSystem. The lexical arm added 49 KB ReleaseFast (+5.4%) over the 914,456 B measured before it |
 | Toolchain | ✅ | Pinned via `.zigversion` (Zig 0.17.0) |
 | Platforms | ✅ | macOS + Linux (x86_64 and aarch64). Windows/WASM refused at compile time — see [Platforms](#platforms) |
@@ -140,9 +140,9 @@ tests/
 6. **A new test root must be reachable from `src/main.zig` or `tests/main.zig`.** `src/utils/serializer.zig` sat outside the gate for a long time: its tests had never run, and a `sizeOf` defect that silently dropped every `?[]const u8` payload survived because of it. A test that is not imported by a root is not a test.
 
 **Known limitations tracked for v0.2.1:**
-- `--foresight` is accepted and discarded. The CLI warns at encode time; the
-  cell is written without it, so a foresight-only cell loses its spirit
-  dimension across a restart.
+- Foresight is durable (WAL + snapshot, CLI/HTTP/MCP) but not searchable: it is
+  not embedded and not in the BM25 text, and a cell that names no goal still
+  carries the synthetic goal id 0 beside it.
 - Write throughput is ~5× short of the 10,000 cells/sec release target: 192
   cells/sec ReleaseFast on the durable path (fsync per record), across four
   `./scripts/verify.sh` runs: 2,779 / 3,028 / 3,800 / 3,898 cells/sec. Report
@@ -251,7 +251,7 @@ This project uses GitHub's spec-kit workflow. Key commands (via `specify` CLI or
 - `/speckit-implement` — execute the tasks
 
 The current spec-kit artifacts:
-- `.specify/memory/constitution.md` (**v1.1.0** — platform scope; see
+- `.specify/memory/constitution.md` (**v1.2.0** — v1.1.0 platform scope, v1.2.0 write-throughput amendment; see
   [`docs/constitution-amendments/2026-10-14-platform-scope.md`](docs/constitution-amendments/2026-10-14-platform-scope.md))
 - `specs/001-trisource-everos-mvp/spec.md` (DRAFT)
 - `specs/001-trisource-everos-mvp/plan.md` (ready for implementation)
@@ -263,7 +263,7 @@ The current spec-kit artifacts:
 ## Testing
 
 ```bash
-# All tests: 300 (217 src/main.zig-rooted + 83 tests/main.zig-rooted)
+# All tests: 462 (378 src/main.zig-rooted + 84 tests/main.zig-rooted)
 zig build test
 
 # Just the constitution invariants (12, separate root)
@@ -283,8 +283,8 @@ without re-executing**. When you need a count you can trust, drive the roots
 directly:
 
 ```bash
-zig test --dep mem3 -Mroot=src/main.zig  -Mmem3=src/lib.zig   # All 217 tests passed.
-zig test --dep mem3 -Mroot=tests/main.zig -Mmem3=src/lib.zig   # All 83 tests passed.
+zig test --dep mem3 -Mroot=src/main.zig  -Mmem3=src/lib.zig   # All 378 tests passed.
+zig test --dep mem3 -Mroot=tests/main.zig -Mmem3=src/lib.zig   # All 84 tests passed.
 zig test --dep mem3 -Mroot=tests/constitution/main.zig -Mmem3=src/lib.zig  # All 12 tests passed.
 ```
 
