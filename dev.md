@@ -1,8 +1,9 @@
 # TriSource-EverOS: Architecture Design and Roadmap for a Memory Operating System Built on Zig 0.17, Tri-Source Coherence Theory and the GHW Paradigm
 > Translated from the original Chinese; content is a design document and may not match the current source.
+> Section numbers: the file holds three documents. The first uses plain numbers (1 to 7), the second uses B1 to B8 and the third uses C1 to C5.
 **Version**: v0.1.0-alpha | **Date**: 2026-06-07 | **Goal**: Build the first high-performance memory OS kernel with native support for Tri-Source Coherence Theory and the GHW paradigm (Goal / Harness / World)
 
-## I. Core Design Concepts and Architecture Overview
+## 1. Core Design Concepts and Architecture Overview
 ### 1.1 Design Philosophy
 - **Memory as the kernel**: Reverses the usual "LLM first, memory second" model. The memory system is the agent's core operating-system kernel, and the LLM is only a compute process that runs on top of the memory OS
 - **Tri-source loop**: Follows Tri-Source Coherence Theory strictly. All memory is divided into three linked subsystems, the sensory source, the cognitive source and the action source, which close a full perception-cognition-action loop
@@ -46,7 +47,7 @@
 └─────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-## II. Detailed Module Design
+## 2. Detailed Module Design
 ### 2.1 GHW Goal Management Layer
 The GHW paradigm is the control center of the whole system. It decides which memories get stored, retrieved and processed first.
 
@@ -334,7 +335,7 @@ pub const IndexManager = struct {
 };
 ```
 
-## III. Key Zig 0.17 Techniques
+## 3. Key Zig 0.17 Techniques
 ### 3.1 The New std.Io Async IO Model
 Uses the new std.Io interface introduced in Zig 0.17. It has io_uring (Linux) and GCD (macOS) backends and gives async programming without function coloring.
 
@@ -411,7 +412,7 @@ fn generateSerializer(comptime T: type) fn (std.mem.Allocator, *const T) ![]cons
 const serializeMemCell = generateSerializer(MemCell);
 ```
 
-## IV. Phased Plan (12-Week Roadmap)
+## 4. Phased Plan (12-Week Roadmap)
 ### Phase 1: Skeleton and Core Data Structures (Weeks 1-2)
 **Goal**: Set up the Zig 0.17 project skeleton and implement the core data structures and basic IO
 
@@ -532,7 +533,7 @@ const serializeMemCell = generateSerializer(MemCell);
 - Finding and fixing performance bottlenecks
 - Designing a simple, easy-to-use API
 
-## V. Testing and Quality Assurance
+## 5. Testing and Quality Assurance
 ### 5.1 Unit Tests
 - Write thorough unit tests for every core module
 - Use Zig's built-in test framework
@@ -553,7 +554,7 @@ const serializeMemCell = generateSerializer(MemCell);
 - Test the consistency and coherence of memory
 - Test retention and retrieval of long-term memory
 
-## VI. Deployment and Extension
+## 6. Deployment and Extension
 ### 6.1 Single-Machine Deployment
 - Deploy as a single binary with no external dependencies
 - Supports in-memory mode and disk-persistent mode
@@ -569,7 +570,7 @@ const serializeMemCell = generateSerializer(MemCell);
 - Reduce memory use and power draw
 - Fits embedded devices and edge agents
 
-## VII. Risks and Mitigations
+## 7. Risks and Mitigations
 | Risk | Likelihood | Impact | Mitigation |
 |------|--------|------|----------|
 | Zig 0.17 API instability | Medium | High | Follow official Zig updates closely and adjust code in time; wrap unstable APIs |
@@ -584,7 +585,7 @@ const serializeMemCell = generateSerializer(MemCell);
 # TriSource-EverOS v0.1.0-alpha Full Project Skeleton (Zig 0.17 Best Practices)
 **Follows the official Zig 0.17 best practices strictly**: explicit memory management, the new std.Io async model, compile-time metaprogramming, no external dependencies, single-binary deployment. All code was compiled and verified on Zig 0.17.0-dev.3000+.
 
-## I. Project Directory Layout (Standard Zig Layout)
+## B1. Project Directory Layout (Standard Zig Layout)
 ```
 trisource-everos/
 ├── build.zig          # New Zig 0.17 build system
@@ -620,7 +621,7 @@ trisource-everos/
     └── test_hypermem.zig
 ```
 
-## II. Core Build File (build.zig)
+## B2. Core Build File (build.zig)
 **Uses the new Zig 0.17 build system API**, with the io_uring async backend, optimized builds and memory safety checks enabled.
 
 ```zig
@@ -684,7 +685,7 @@ pub fn build(b: *std.Build) void {
 }
 ```
 
-## III. Core Data Structures (src/core/memcell.zig)
+## B3. Core Data Structures (src/core/memcell.zig)
 **Combines Tri-Source Coherence and the GHW paradigm**, and uses Zig compile-time features for zero-overhead serialization and type safety.
 
 ```zig
@@ -794,7 +795,7 @@ comptime {
 }
 ```
 
-## IV. Compile-Time Zero-Overhead Serialization (src/utils/serializer.zig)
+## B4. Compile-Time Zero-Overhead Serialization (src/utils/serializer.zig)
 **Main Zig 0.17 strength**: comptime metaprogramming generates efficient serialization code for any struct, with no runtime reflection cost.
 
 ```zig
@@ -924,7 +925,7 @@ fn deserializeValue(comptime T: type, reader: anytype, allocator: std.mem.Alloca
 }
 ```
 
-## V. Tri-Source Memory Manager (src/memory/tri_source_manager.zig)
+## B5. Tri-Source Memory Manager (src/memory/tri_source_manager.zig)
 **Follows Tri-Source Coherence Theory strictly**: manages the three memory sources in isolation and links them to each other.
 
 ```zig
@@ -1040,7 +1041,7 @@ pub const TriSourceManager = struct {
 };
 ```
 
-## VI. Async Storage with the New Zig 0.17 std.Io (src/storage/lsm_store.zig)
+## B6. Async Storage with the New Zig 0.17 std.Io (src/storage/lsm_store.zig)
 **Uses the new async IO model of Zig 0.17**, with the io_uring backend and no function coloring. It performs far better than a traditional thread pool.
 
 ```zig
@@ -1126,7 +1127,7 @@ pub const LSMStore = struct {
 };
 ```
 
-## VII. System Entry Point (src/main.zig)
+## B7. System Entry Point (src/main.zig)
 **Complete system initialization and a basic usage example**, showing how to create, add and retrieve memories.
 
 ```zig
@@ -1209,7 +1210,7 @@ test "All tests" {
 }
 ```
 
-## VIII. Zig 0.17 Best Practices
+## B8. Zig 0.17 Best Practices
 1. **Explicit memory management**: pass every allocator explicitly, use `defer` and `errdefer` to guarantee cleanup, and use `ArenaAllocator` for temporary memory
 2. **New std.Io async model**: use the async API without function coloring; the io_uring (Linux) and GCD (macOS) backends are picked up automatically
 3. **Compile-time metaprogramming**: generate serialization code with `comptime` and avoid the cost of runtime reflection
@@ -1222,7 +1223,7 @@ test "All tests" {
 # TriSource-EverOS Core Engine Implementation (Zig 0.17)
 Adds production-grade code for the **HyperMem hypergraph engine** and the **hybrid retrieval engine**. It is fully compatible with the skeleton above and follows the Zig 0.17 best practices strictly.
 
-## I. HyperMem Hypergraph Engine (src/hypermem/engine.zig)
+## C1. HyperMem Hypergraph Engine (src/hypermem/engine.zig)
 The core reasoning engine of EverOS. It natively supports multi-hop associative reasoning and connects memories along the tri-source loop.
 
 ```zig
@@ -1496,7 +1497,7 @@ pub const HyperMemEngine = struct {
 };
 ```
 
-## II. Hybrid Retrieval Engine (src/retrieval/hybrid_retriever.zig)
+## C2. Hybrid Retrieval Engine (src/retrieval/hybrid_retriever.zig)
 Combines **vector semantic retrieval**, **BM25 keyword retrieval** and **multi-hop reasoning over the hypergraph** to recall memories as accurately as possible.
 
 ```zig
@@ -1897,7 +1898,7 @@ pub const HybridRetriever = struct {
 };
 ```
 
-## III. Updated System Entry Point (src/main.zig)
+## C3. Updated System Entry Point (src/main.zig)
 Shows the full flow of creating and linking memories and retrieving them with hybrid retrieval.
 
 ```zig
@@ -2105,7 +2106,7 @@ test "All tests" {
 }
 ```
 
-## IV. Build and Run Guide
+## C4. Build and Run Guide
 1. **Install Zig 0.17**:
    ```bash
    # Download the Zig 0.17 dev build (recommended version: 0.17.0-dev.3000+)
@@ -2130,7 +2131,7 @@ test "All tests" {
    zig build -Doptimize=ReleaseFast
    ```
 
-## V. Suggested Next Steps
+## C5. Suggested Next Steps
 1. **Integrate a real embedding model**: use the C API of `llama.cpp` to integrate a lightweight embedding model such as BGE-small-zh, replacing the dummy vectors in the examples
 2. **Implement a consolidation engine**: run a clustering algorithm periodically and merge similar MemCells into abstract semantic memories
 3. **Add forgetting**: implement time decay and frequency decay to clean up low-value memories automatically
