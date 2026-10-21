@@ -1,57 +1,59 @@
-# TriSource-EverOS：基于Zig 0.17的三源合恰+GHW范式记忆操作系统架构设计与推进方案
-**版本**：v0.1.0-alpha | **日期**：2026-06-07 | **目标**：构建首个原生支持三源合恰理论与GHW范式的高性能记忆操作系统内核
+# TriSource-EverOS: Architecture Design and Roadmap for a Memory Operating System Built on Zig 0.17, Tri-Source Coherence Theory and the GHW Paradigm
+> Translated from the original Chinese; content is a design document and may not match the current source.
+> Section numbers: the file holds three documents. The first uses plain numbers (1 to 7), the second uses B1 to B8 and the third uses C1 to C5.
+**Version**: v0.1.0-alpha | **Date**: 2026-06-07 | **Goal**: Build the first high-performance memory OS kernel with native support for Tri-Source Coherence Theory and the GHW paradigm (Goal / Harness / World)
 
-## 一、核心设计理念与架构总览
-### 1.1 设计哲学
-- **记忆即内核**：彻底颠覆"大模型为主、记忆为辅"的传统模式，将记忆系统作为智能体的核心操作系统内核，大模型只是运行在记忆OS之上的计算进程
-- **三源闭环**：严格遵循三源合恰理论，将所有记忆划分为感知源、认知源、行动源三个相互关联的子系统，实现"感知-认知-行动"的完整闭环
-- **GHW驱动**：所有记忆操作都围绕GHW范式的三个核心要素（目标Goal、执行器Harness、世界模型World）组织，确保记忆始终服务于智能体的目标达成
-- **Zig原生**：100%使用Zig 0.17开发，零外部依赖，单二进制文件部署，充分利用Zig的无GC、显式内存管理、新std.Io异步IO等特性
+## 1. Core Design Concepts and Architecture Overview
+### 1.1 Design Philosophy
+- **Memory as the kernel**: Reverses the usual "LLM first, memory second" model. The memory system is the agent's core operating-system kernel, and the LLM is only a compute process that runs on top of the memory OS
+- **Tri-source loop**: Follows Tri-Source Coherence Theory strictly. All memory is divided into three linked subsystems, the sensory source, the cognitive source and the action source, which close a full perception-cognition-action loop
+- **GHW-driven**: Every memory operation is organized around the three elements of the GHW paradigm (Goal, Harness, World model), so memory always serves the agent's goals
+- **Zig-native**: 100% Zig 0.17, no external dependencies, single-binary deployment. It relies on Zig's lack of a GC, explicit memory management and the new std.Io async IO
 
-### 1.2 整体系统架构
+### 1.2 System Architecture Overview
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│ GHW目标管理层（Goal-Harness-World）                            │
-│ ┌─────────────┐  ┌─────────────┐  ┌─────────────────────────┐ │
-│ │ 目标树引擎  │  │ 执行器注册表 │  │ 世界模型更新器         │ │
-│ │ 任务拆解    │  │ 技能库       │  │ 状态追踪与预测         │ │
-│ └─────────────┘  └─────────────┘  └─────────────────────────┘ │
-├─────────────────────────────────────────────────────────────────┤
-│ 三源合恰记忆层（Tri-Source Memory Layer）                      │
-│ ┌─────────────┐  ┌─────────────┐  ┌─────────────┐             │
-│ │ 感知源记忆  │  │ 认知源记忆  │  │ 行动源记忆  │             │
-│ │ 感官输入    │  │ 推理过程    │  │ 工具调用    │             │
-│ │ 环境观测    │  │ 反思结论    │  │ 执行结果    │             │
-│ └─────────────┘  └─────────────┘  └─────────────┘             │
-├─────────────────────────────────────────────────────────────────┤
-│ EverCore核心引擎层                                             │
-│ ┌─────────────┐  ┌─────────────┐  ┌─────────────┐             │
-│ │ MemCell编解码器│ │ HyperMem超图引擎│ │ 混合检索引擎 │             │
-│ │ 记忆编码/解码 │  │ 超边管理     │  │ 语义+关键词+图 │             │
-│ │ 冲突解决     │  │ 消息传递     │  │ 重排与过滤   │             │
-│ └─────────────┘  └─────────────┘  └─────────────┘             │
-├─────────────────────────────────────────────────────────────────┤
-│ 存储与索引层                                                   │
-│ ┌─────────────┐  ┌─────────────┐  ┌─────────────┐             │
-│ │ 内存存储    │  │ 磁盘持久化  │  │ 混合索引    │             │
-│ │ 热数据缓存  │  │ 日志结构存储│  │ 向量+KV+图  │             │
-│ └─────────────┘  └─────────────┘  └─────────────┘             │
-├─────────────────────────────────────────────────────────────────┤
-│ Zig 0.17运行时层                                               │
-│ ┌─────────────┐  ┌─────────────┐  ┌─────────────┐             │
-│ │ std.Io异步IO│  │ 显式内存管理│  │ 编译时元编程│             │
-│ │ io_uring/GCD│  │ 无GC停顿    │  │ 零开销序列化│             │
-│ └─────────────┘  └─────────────┘  └─────────────┘             │
-└─────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│ GHW Goal Management Layer (Goal-Harness-World)                                  │
+│ ┌───────────────────────┐  ┌───────────────────────┐  ┌───────────────────────┐ │
+│ │ Goal tree engine      │  │ Harness registry      │  │ World model updater   │ │
+│ │ Task decomposition    │  │ Skill library         │  │ Tracking, prediction  │ │
+│ └───────────────────────┘  └───────────────────────┘  └───────────────────────┘ │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│ Tri-Source Memory Layer                                                         │
+│ ┌───────────────────────┐  ┌───────────────────────┐  ┌───────────────────────┐ │
+│ │ Sensory memory        │  │ Cognitive memory      │  │ Action memory         │ │
+│ │ Sensory input         │  │ Reasoning             │  │ Tool calls            │ │
+│ │ Observations          │  │ Reflections           │  │ Execution results     │ │
+│ └───────────────────────┘  └───────────────────────┘  └───────────────────────┘ │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│ EverCore Engine Layer                                                           │
+│ ┌───────────────────────┐  ┌───────────────────────┐  ┌───────────────────────┐ │
+│ │ MemCell codec         │  │ HyperMem hypergraph   │  │ Hybrid retrieval      │ │
+│ │ Memory encode/decode  │  │ Hyperedge management  │  │ Vector+keyword+graph  │ │
+│ │ Conflict resolution   │  │ Message passing       │  │ Rerank and filter     │ │
+│ └───────────────────────┘  └───────────────────────┘  └───────────────────────┘ │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│ Storage and Index Layer                                                         │
+│ ┌───────────────────────┐  ┌───────────────────────┐  ┌───────────────────────┐ │
+│ │ In-memory store       │  │ Disk persistence      │  │ Hybrid index          │ │
+│ │ Hot data cache        │  │ Log-structured store  │  │ Vector + KV + graph   │ │
+│ └───────────────────────┘  └───────────────────────┘  └───────────────────────┘ │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│ Zig 0.17 Runtime Layer                                                          │
+│ ┌───────────────────────┐  ┌───────────────────────┐  ┌───────────────────────┐ │
+│ │ std.Io async IO       │  │ Explicit memory mgmt  │  │ Compile-time codegen  │ │
+│ │ io_uring / GCD        │  │ No GC pauses          │  │ Zero-cost serialize   │ │
+│ └───────────────────────┘  └───────────────────────┘  └───────────────────────┘ │
+└─────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-## 二、核心模块详细设计
-### 2.1 GHW目标管理层
-GHW范式是整个系统的"指挥中枢"，决定了哪些记忆应该被存储、检索和优先处理。
+## 2. Detailed Module Design
+### 2.1 GHW Goal Management Layer
+The GHW paradigm is the control center of the whole system. It decides which memories get stored, retrieved and processed first.
 
-#### 2.1.1 目标树引擎
+#### 2.1.1 Goal Tree Engine
 ```zig
-// GHW目标节点结构
+// GHW goal node structure
 const GoalNode = struct {
     id: u64,
     parent_id: ?u64,
@@ -59,16 +61,16 @@ const GoalNode = struct {
     description: []const u8,
     status: enum { Pending, InProgress, Completed, Failed },
     priority: u8, // 0-255
-    deadline: ?i64, // Unix时间戳
+    deadline: ?i64, // Unix timestamp
     created_at: i64,
     updated_at: i64,
     
-    // 与记忆的关联
-    associated_memories: []u64, // 关联的MemCell ID列表
-    relevance_threshold: f32, // 记忆关联度阈值
+    // Links to memory
+    associated_memories: []u64, // IDs of the associated MemCells
+    relevance_threshold: f32, // Memory relevance threshold
 };
 
-// 目标树操作接口
+// Goal tree operations
 pub const GoalTree = struct {
     allocator: std.mem.Allocator,
     root: ?*GoalNode,
@@ -81,22 +83,22 @@ pub const GoalTree = struct {
 };
 ```
 
-#### 2.1.2 执行器注册表
+#### 2.1.2 Harness Registry
 ```zig
-// 执行器（Harness）定义
+// Harness (executor) definition
 const Harness = struct {
     id: u64,
     name: []const u8,
     description: []const u8,
-    capabilities: []const u8, // 支持的能力列表
+    capabilities: []const u8, // List of supported capabilities
     version: []const u8,
     
-    // 执行历史
+    // Execution history
     execution_count: u64,
     success_rate: f32,
     average_duration: f32,
     
-    // 关联的技能记忆
+    // Linked skill memories
     skill_memories: []u64,
 };
 
@@ -110,17 +112,17 @@ pub const HarnessRegistry = struct {
 };
 ```
 
-#### 2.1.3 世界模型更新器
+#### 2.1.3 World Model Updater
 ```zig
-// 世界状态实体
+// World state entity
 const WorldEntity = struct {
     id: u64,
-    type: []const u8, // 人、地点、物体、概念等
+    type: []const u8, // person, place, object, concept, etc.
     attributes: std.StringHashMap([]const u8),
     last_observed: i64,
     confidence: f32,
     
-    // 预测性信息
+    // Predictive information
     predictions: []struct {
         attribute: []const u8,
         value: []const u8,
@@ -139,44 +141,44 @@ pub const WorldModel = struct {
 };
 ```
 
-### 2.2 三源合恰记忆层
-这是系统的核心数据层，严格按照三源合恰理论对所有记忆进行分类和管理。
+### 2.2 Tri-Source Memory Layer
+This is the core data layer of the system. It classifies and manages all memory strictly according to Tri-Source Coherence Theory.
 
-#### 2.2.1 增强版MemCell（融合三源合恰+GHW）
+#### 2.2.1 Enhanced MemCell (Tri-Source Coherence + GHW)
 ```zig
-// 三源合恰记忆来源
+// Memory sources in Tri-Source Coherence Theory
 const MemorySource = enum {
-    sensory, // 感知源：用户输入、环境观测、工具返回的原始数据
-    cognitive, // 认知源：大模型推理过程、反思结论、抽象知识
-    action, // 行动源：工具调用、执行结果、行为轨迹
+    sensory, // Sensory source: raw data from user input, environment observation and tool returns
+    cognitive, // Cognitive source: LLM reasoning, reflection conclusions, abstract knowledge
+    action, // Action source: tool calls, execution results, behavior traces
 };
 
-// 增强版MemCell（EverOS MemCell的三源合恰扩展）
+// Enhanced MemCell (Tri-Source Coherence extension of the EverOS MemCell)
 const MemCell = struct {
     id: u64,
     source: MemorySource,
     
-    // EverOS原生四元组
-    episode: []const u8, // 第三人称叙事的事件摘要
-    atomic_facts: []const Fact, // 可验证的离散原子事实
-    foresight: []const Foresight, // 带时间区间的预测性记忆
-    metadata: Metadata, // 时间戳、来源、置信度等
+    // EverOS native four-tuple
+    episode: []const u8, // Event summary as a third-person narrative
+    atomic_facts: []const Fact, // Discrete atomic facts that can be verified
+    foresight: []const Foresight, // Predictive memory with a time interval
+    metadata: Metadata, // Timestamps, source, confidence, etc.
     
-    // GHW扩展
-    goal_associations: []const GoalAssociation, // 关联的目标及关联度
-    harness_id: ?u64, // 生成该记忆的执行器ID
-    world_entity_ids: []const u64, // 关联的世界实体ID
+    // GHW extension
+    goal_associations: []const GoalAssociation, // Linked goals and their relevance
+    harness_id: ?u64, // ID of the Harness that produced this memory
+    world_entity_ids: []const u64, // IDs of the linked world entities
     
-    // 动态权重
-    importance: f32, // 全局重要性
-    recency: f32, // 近期性权重
-    frequency: f32, // 访问频率权重
+    // Dynamic weights
+    importance: f32, // Global importance
+    recency: f32, // Recency weight
+    frequency: f32, // Access frequency weight
     
-    // Zig编译时优化
+    // Zig comptime optimization
     comptime serialized_size: usize = @sizeOf(@This());
 };
 
-// 原子事实结构
+// Atomic fact structure
 const Fact = struct {
     subject: []const u8,
     predicate: []const u8,
@@ -185,7 +187,7 @@ const Fact = struct {
     source: []const u8,
 };
 
-// 预测性记忆结构
+// Predictive memory structure
 const Foresight = struct {
     description: []const u8,
     valid_from: i64,
@@ -193,88 +195,88 @@ const Foresight = struct {
     confidence: f32,
 };
 
-// 目标关联结构
+// Goal association structure
 const GoalAssociation = struct {
     goal_id: u64,
     relevance: f32, // 0.0-1.0
 };
 
-// 元数据结构
+// Metadata structure
 const Metadata = struct {
     created_at: i64,
     updated_at: i64,
     source_confidence: f32,
-    emotional_valence: f32, // -1.0到1.0
+    emotional_valence: f32, // -1.0 to 1.0
     location: ?[]const u8,
 };
 ```
 
-#### 2.2.2 三源记忆管理器
+#### 2.2.2 Tri-Source Memory Manager
 ```zig
 pub const TriSourceMemoryManager = struct {
     allocator: std.mem.Allocator,
     
-    // 三个源的独立存储
+    // Separate storage for each of the three sources
     sensory_memories: std.AutoHashMap(u64, *MemCell),
     cognitive_memories: std.AutoHashMap(u64, *MemCell),
     action_memories: std.AutoHashMap(u64, *MemCell),
     
-    // 超图引擎引用
+    // Hypergraph engine reference
     hypergraph: *HyperMem,
     
     pub fn addMemory(self: *TriSourceMemoryManager, cell: MemCell) !u64;
     pub fn getMemoriesBySource(self: *TriSourceMemoryManager, source: MemorySource) []*MemCell;
     pub fn getMemoriesForGoal(self: *TriSourceMemoryManager, goal_id: u64, limit: usize) []*MemCell;
-    pub fn consolidateMemories(self: *TriSourceMemoryManager) !void; // 语义巩固
+    pub fn consolidateMemories(self: *TriSourceMemoryManager) !void; // Semantic consolidation
 };
 ```
 
-### 2.3 EverCore核心引擎层
-#### 2.3.1 HyperMem超图引擎（Zig原生实现）
+### 2.3 EverCore Engine Layer
+#### 2.3.1 HyperMem Hypergraph Engine (Zig-native)
 ```zig
-// 超边结构（连接多个MemCell）
+// Hyperedge structure (connects several MemCells)
 const HyperEdge = struct {
     id: u64,
-    type: []const u8, // 因果、时序、关联、目标、三源闭环等
-    nodes: []const u64, // 连接的MemCell ID列表
-    weight: f32, // 关系强度
+    type: []const u8, // causal, temporal, associative, goal, tri-source loop, etc.
+    nodes: []const u64, // IDs of the connected MemCells
+    weight: f32, // Relation strength
     metadata: Metadata,
 };
 
 pub const HyperMem = struct {
     allocator: std.mem.Allocator,
     
-    // 节点和边的存储
+    // Storage for nodes and edges
     nodes: std.AutoHashMap(u64, *MemCell),
     edges: std.AutoHashMap(u64, *HyperEdge),
     
-    // 索引：节点到边的映射
+    // Index: node to edges
     node_to_edges: std.AutoHashMap(u64, []u64),
     
     pub fn addNode(self: *HyperMem, node: *MemCell) !void;
     pub fn addEdge(self: *HyperMem, edge: HyperEdge) !u64;
     pub fn getNeighbors(self: *HyperMem, node_id: u64) []u64;
     pub fn multiHopRetrieval(self: *HyperMem, query: []const u8, max_hops: u8) ![]*MemCell;
-    pub fn propagateEmbeddings(self: *HyperMem) !void; // 嵌入传播
+    pub fn propagateEmbeddings(self: *HyperMem) !void; // Embedding propagation
 };
 ```
 
-#### 2.3.2 混合检索引擎
+#### 2.3.2 Hybrid Retrieval Engine
 ```zig
 pub const HybridRetriever = struct {
     allocator: std.mem.Allocator,
     
-    // 三个检索组件
+    // Three retrieval components
     vector_retriever: *VectorRetriever,
     keyword_retriever: *KeywordRetriever,
     graph_retriever: *GraphRetriever,
     
-    // 重排器
+    // Reranker
     reranker: *Reranker,
     
     pub fn retrieve(self: *HybridRetriever, query: []const u8, options: RetrieveOptions) ![]*MemCell;
     
-    // 三源加权检索：根据当前任务类型调整不同源的权重
+    // Tri-source weighted retrieval: adjust the weight of each source according to the current task type
     pub fn retrieveTriSourceWeighted(
         self: *HybridRetriever, 
         query: []const u8, 
@@ -294,38 +296,38 @@ const RetrieveOptions = struct {
 };
 ```
 
-### 2.4 存储与索引层
-采用日志结构存储（LSM Tree）+ 混合索引的设计，完全使用Zig原生实现，零外部依赖。
+### 2.4 Storage and Index Layer
+Log-structured storage (LSM tree) plus a hybrid index, implemented entirely in native Zig with no external dependencies.
 
 ```zig
-// 日志结构存储引擎
+// Log-structured storage engine
 pub const LogStructuredStore = struct {
     allocator: std.mem.Allocator,
     file: std.fs.File,
     write_offset: u64,
     
-    // 内存表
+    // Memtable
     memtable: std.AutoHashMap(u64, []const u8),
     
-    // SSTable管理器
+    // SSTable manager
     sstable_manager: *SSTableManager,
     
     pub fn write(self: *LogStructuredStore, key: u64, value: []const u8) !void;
     pub fn read(self: *LogStructuredStore, key: u64) !?[]const u8;
-    pub fn compact(self: *LogStructuredStore) !void; // 合并SSTable
+    pub fn compact(self: *LogStructuredStore) !void; // Merge SSTables
 };
 
-// 混合索引管理器
+// Hybrid index manager
 pub const IndexManager = struct {
     allocator: std.mem.Allocator,
     
-    // KV索引：MemCell ID到磁盘偏移
+    // KV index: MemCell ID to disk offset
     kv_index: std.AutoHashMap(u64, u64),
     
-    // 向量索引：使用乘积量化（PQ）实现
+    // Vector index: implemented with product quantization (PQ)
     vector_index: *PQIndex,
     
-    // 图索引：超图的邻接表
+    // Graph index: adjacency list of the hypergraph
     graph_index: *GraphIndex,
     
     pub fn buildIndex(self: *IndexManager, cells: []*MemCell) !void;
@@ -333,33 +335,33 @@ pub const IndexManager = struct {
 };
 ```
 
-## 三、Zig 0.17关键技术应用
-### 3.1 新std.Io异步IO模型
-充分利用Zig 0.17引入的新std.Io接口，支持io_uring（Linux）和GCD（macOS）后端，实现无函数着色的异步编程。
+## 3. Key Zig 0.17 Techniques
+### 3.1 The New std.Io Async IO Model
+Uses the new std.Io interface introduced in Zig 0.17. It has io_uring (Linux) and GCD (macOS) backends and gives async programming without function coloring.
 
 ```zig
-// 异步记忆写入示例（使用Zig 0.17 std.Io）
+// Async memory write example (using Zig 0.17 std.Io)
 const std = @import("std");
 const Io = std.Io;
 
 pub fn writeMemCellAsync(self: *MemorySystem, io: Io, cell: MemCell) !void {
-    // 1. 序列化MemCell（编译时零开销）
+    // 1. Serialize the MemCell (zero overhead at compile time)
     const serialized = try self.serializeMemCell(cell);
     defer self.allocator.free(serialized);
     
-    // 2. 异步写入磁盘
+    // 2. Write to disk asynchronously
     const file = self.data_file;
     const offset = self.next_offset;
     try file.pwriteAll(io, serialized, offset);
     
-    // 3. 异步更新索引（非阻塞）
+    // 3. Update the index asynchronously (non-blocking)
     self.index.updateAsync(io, cell.id, offset) catch |err| {
         std.log.err("Failed to update index: {}", .{err});
     };
     
-    // 4. 触发后台语义巩固
+    // 4. Trigger background semantic consolidation
     if (self.shouldConsolidate()) {
-        // 使用io.async()在后台执行，不阻塞当前线程
+        // Run in the background with io.async() without blocking the current thread
         io.async(self.consolidateAsync, .{io}) catch |err| {
             std.log.err("Failed to start consolidation: {}", .{err});
         };
@@ -369,27 +371,27 @@ pub fn writeMemCellAsync(self: *MemorySystem, io: Io, cell: MemCell) !void {
 }
 ```
 
-### 3.2 显式内存管理与零拷贝
+### 3.2 Explicit Memory Management and Zero-Copy
 ```zig
-// 零拷贝MemCell序列化（利用Zig的指针操作）
+// Zero-copy MemCell serialization (using Zig pointer operations)
 pub fn serializeMemCell(self: *MemorySystem, cell: *const MemCell) ![]const u8 {
-    // 直接使用MemCell的内存布局，无需额外拷贝
-    // 注意：需要处理指针字段的序列化
+    // Use the MemCell memory layout directly, no extra copy
+    // Note: pointer fields need separate serialization
     const writer = std.io.bufferedWriter(self.allocator);
     errdefer writer.deinit();
     
     try writer.writeInt(u64, cell.id, .little);
     try writer.writeInt(u8, @intFromEnum(cell.source), .little);
     try writer.writeString(cell.episode);
-    // ... 序列化其他字段
+    // ... serialize the remaining fields
     
     return writer.toOwnedSlice();
 }
 ```
 
-### 3.3 编译时元编程
+### 3.3 Compile-Time Metaprogramming
 ```zig
-// 编译时生成MemCell的序列化/反序列化代码
+// Generate the MemCell serialization/deserialization code at compile time
 fn generateSerializer(comptime T: type) fn (std.mem.Allocator, *const T) ![]const u8 {
     return struct {
         pub fn serialize(allocator: std.mem.Allocator, value: *const T) ![]const u8 {
@@ -406,252 +408,252 @@ fn generateSerializer(comptime T: type) fn (std.mem.Allocator, *const T) ![]cons
     }.serialize;
 }
 
-// 编译时为MemCell生成序列化函数
+// Generate the MemCell serialization function at compile time
 const serializeMemCell = generateSerializer(MemCell);
 ```
 
-## 四、分阶段推进方案（12周完整路线图）
-### 阶段1：基础骨架与核心数据结构（第1-2周）
-**目标**：搭建Zig 0.17项目骨架，实现核心数据结构和基础IO功能
+## 4. Phased Plan (12-Week Roadmap)
+### Phase 1: Skeleton and Core Data Structures (Weeks 1-2)
+**Goal**: Set up the Zig 0.17 project skeleton and implement the core data structures and basic IO
 
-**具体任务**：
-1. 初始化Zig 0.17项目，配置build.zig和build.zig.zon
-2. 实现MemCell、Fact、Foresight、Metadata等核心数据结构
-3. 实现基础的序列化/反序列化功能（利用Zig编译时能力）
-4. 实现日志结构存储引擎的基础版本
-5. 实现KV索引管理器
+**Tasks**:
+1. Initialize the Zig 0.17 project and configure build.zig and build.zig.zon
+2. Implement the core data structures: MemCell, Fact, Foresight, Metadata, etc.
+3. Implement basic serialization/deserialization (using Zig's compile-time features)
+4. Implement a basic version of the log-structured storage engine
+5. Implement the KV index manager
 
-**交付物**：
-- 可编译的Zig项目骨架
-- 核心数据结构定义文件
-- 基础存储和IO功能测试
+**Deliverables**:
+- A Zig project skeleton that compiles
+- Definition files for the core data structures
+- Tests for basic storage and IO
 
-**技术难点**：
-- 正确处理Zig中的指针和内存管理
-- 实现高效的零拷贝序列化
+**Technical challenges**:
+- Handling pointers and memory management correctly in Zig
+- Making zero-copy serialization efficient
 
-### 阶段2：三源合恰记忆层与GHW基础（第3-4周）
-**目标**：实现三源合恰记忆分类管理和GHW目标管理的基础功能
+### Phase 2: Tri-Source Memory Layer and GHW Basics (Weeks 3-4)
+**Goal**: Implement classification and management of memory by source, plus the basics of GHW goal management
 
-**具体任务**：
-1. 实现TriSourceMemoryManager，管理三个源的记忆
-2. 实现GoalNode和GoalTree，支持目标的添加、更新和查询
-3. 实现Harness和HarnessRegistry，支持执行器的注册和查询
-4. 实现WorldEntity和WorldModel的基础版本
-5. 实现MemCell与GHW实体的关联功能
+**Tasks**:
+1. Implement TriSourceMemoryManager to manage the memories of the three sources
+2. Implement GoalNode and GoalTree, with support for adding, updating and querying goals
+3. Implement Harness and HarnessRegistry, with support for registering and querying Harnesses
+4. Implement a basic version of WorldEntity and WorldModel
+5. Implement the links between MemCells and GHW entities
 
-**交付物**：
-- 三源记忆管理器实现
-- GHW目标管理模块
-- 执行器注册表
-- 世界模型基础版本
+**Deliverables**:
+- Tri-source memory manager
+- GHW goal management module
+- Harness registry
+- Basic world model
 
-**技术难点**：
-- 高效管理大量MemCell与GHW实体的关联关系
-- 实现目标树的递归遍历和更新
+**Technical challenges**:
+- Managing the links between a large number of MemCells and GHW entities efficiently
+- Implementing recursive traversal and update of the goal tree
 
-### 阶段3：HyperMem超图引擎（第5-6周）
-**目标**：实现Zig原生的超图存储和推理引擎
+### Phase 3: HyperMem Hypergraph Engine (Weeks 5-6)
+**Goal**: Implement Zig-native hypergraph storage and a reasoning engine
 
-**具体任务**：
-1. 实现HyperEdge数据结构
-2. 实现HyperMem超图引擎的基础功能（添加节点、添加边、查询邻居）
-3. 实现超图的多跳遍历算法
-4. 实现嵌入传播算法（Attention-Weighted Aggregation）
-5. 实现图索引管理器
+**Tasks**:
+1. Implement the HyperEdge data structure
+2. Implement the basic functions of the HyperMem engine (add node, add edge, query neighbors)
+3. Implement multi-hop traversal on the hypergraph
+4. Implement the embedding propagation algorithm (Attention-Weighted Aggregation)
+5. Implement the graph index manager
 
-**交付物**：
-- HyperMem超图引擎完整实现
-- 多跳推理功能
-- 嵌入传播算法
-- 图索引管理器
+**Deliverables**:
+- A complete HyperMem hypergraph engine
+- Multi-hop reasoning
+- Embedding propagation algorithm
+- Graph index manager
 
-**技术难点**：
-- 高效实现超图的存储和遍历
-- 优化嵌入传播算法的性能
+**Technical challenges**:
+- Storing and traversing the hypergraph efficiently
+- Tuning the performance of embedding propagation
 
-### 阶段4：混合检索引擎（第7-8周）
-**目标**：实现融合语义、关键词和图检索的混合检索引擎
+### Phase 4: Hybrid Retrieval Engine (Weeks 7-8)
+**Goal**: Implement a hybrid retrieval engine that combines semantic, keyword and graph retrieval
 
-**具体任务**：
-1. 实现向量索引（使用乘积量化PQ算法）
-2. 实现关键词检索（BM25算法）
-3. 实现图检索（基于超图的多跳推理）
-4. 实现混合检索的融合逻辑
-5. 实现简单的重排器
+**Tasks**:
+1. Implement the vector index (using the product quantization (PQ) algorithm)
+2. Implement keyword retrieval (BM25)
+3. Implement graph retrieval (multi-hop reasoning over the hypergraph)
+4. Implement the fusion logic for hybrid retrieval
+5. Implement a simple reranker
 
-**交付物**：
-- 向量索引实现
-- 关键词检索实现
-- 图检索实现
-- 混合检索引擎完整实现
+**Deliverables**:
+- Vector index
+- Keyword retrieval
+- Graph retrieval
+- A complete hybrid retrieval engine
 
-**技术难点**：
-- 实现高效的向量索引
-- 优化三种检索方式的融合逻辑
+**Technical challenges**:
+- Building an efficient vector index
+- Tuning how the three retrieval methods are fused
 
-### 阶段5：记忆生命周期管理（第9-10周）
-**目标**：实现完整的记忆生命周期管理，包括编码、巩固、检索和遗忘
+### Phase 5: Memory Lifecycle Management (Weeks 9-10)
+**Goal**: Implement the full memory lifecycle: encoding, consolidation, retrieval and forgetting
 
-**具体任务**：
-1. 实现记忆编码管道（从原始输入到MemCell）
-2. 实现语义巩固算法（相似MemCell聚类和抽象）
-3. 实现记忆冲突解决机制
-4. 实现遗忘机制（时间衰减、频次衰减）
-5. 实现记忆导入导出功能
+**Tasks**:
+1. Implement the memory encoding pipeline (raw input to MemCell)
+2. Implement the semantic consolidation algorithm (cluster and abstract similar MemCells)
+3. Implement the memory conflict resolution mechanism
+4. Implement the forgetting mechanism (time decay, frequency decay)
+5. Implement memory import and export
 
-**交付物**：
-- 记忆编码管道
-- 语义巩固算法
-- 记忆冲突解决机制
-- 遗忘机制
+**Deliverables**:
+- Memory encoding pipeline
+- Semantic consolidation algorithm
+- Memory conflict resolution
+- Forgetting mechanism
 
-**技术难点**：
-- 实现高效的语义聚类算法
-- 设计合理的记忆冲突解决策略
+**Technical challenges**:
+- Implementing an efficient semantic clustering algorithm
+- Designing a reasonable conflict resolution strategy
 
-### 阶段6：性能优化与API完善（第11-12周）
-**目标**：优化系统性能，完善API接口，准备第一个alpha版本
+### Phase 6: Performance Tuning and API Polish (Weeks 11-12)
+**Goal**: Tune system performance, finish the API, and prepare the first alpha release
 
-**具体任务**：
-1. 进行全面的性能基准测试
-2. 优化关键路径的性能（特别是检索和存储）
-3. 完善所有模块的API接口
-4. 编写API文档和使用示例
-5. 实现简单的命令行界面（CLI）
+**Tasks**:
+1. Run a full set of performance benchmarks
+2. Optimize the critical paths (retrieval and storage in particular)
+3. Finish the API of every module
+4. Write API documentation and usage examples
+5. Implement a simple command-line interface (CLI)
 
-**交付物**：
-- 性能基准测试报告
-- 优化后的系统代码
-- 完整的API文档
-- 命令行界面
-- v0.1.0-alpha版本发布
+**Deliverables**:
+- Performance benchmark report
+- Optimized system code
+- Complete API documentation
+- Command-line interface
+- v0.1.0-alpha release
 
-**技术难点**：
-- 识别和优化性能瓶颈
-- 设计简洁易用的API接口
+**Technical challenges**:
+- Finding and fixing performance bottlenecks
+- Designing a simple, easy-to-use API
 
-## 五、测试与质量保证策略
-### 5.1 单元测试
-- 为每个核心模块编写全面的单元测试
-- 使用Zig内置的测试框架
-- 目标代码覆盖率达到80%以上
+## 5. Testing and Quality Assurance
+### 5.1 Unit Tests
+- Write thorough unit tests for every core module
+- Use Zig's built-in test framework
+- Target code coverage of 80% or more
 
-### 5.2 集成测试
-- 测试模块之间的交互
-- 测试完整的记忆生命周期
-- 测试并发场景下的正确性
+### 5.2 Integration Tests
+- Test the interaction between modules
+- Test the full memory lifecycle
+- Test correctness under concurrency
 
-### 5.3 基准测试
-- 测试MemCell的写入和读取性能
-- 测试混合检索的性能和准确率
-- 测试系统在大数据量下的扩展性
+### 5.3 Benchmarks
+- Measure MemCell write and read performance
+- Measure hybrid retrieval speed and accuracy
+- Measure how the system scales with large data volumes
 
-### 5.4 记忆质量评估
-- 使用LongMemEval基准测试集评估记忆准确率
-- 测试记忆的一致性和连贯性
-- 测试长期记忆的保留和检索能力
+### 5.4 Memory Quality Evaluation
+- Evaluate memory accuracy with the LongMemEval benchmark
+- Test the consistency and coherence of memory
+- Test retention and retrieval of long-term memory
 
-## 六、部署与扩展方案
-### 6.1 单机部署
-- 单二进制文件部署，无需任何外部依赖
-- 支持内存模式和磁盘持久化模式
-- 适合个人助手、单机智能体等场景
+## 6. Deployment and Extension
+### 6.1 Single-Machine Deployment
+- Deploy as a single binary with no external dependencies
+- Supports in-memory mode and disk-persistent mode
+- Fits personal assistants, single-machine agents and similar uses
 
-### 6.2 分布式部署（未来扩展）
-- 基于Raft共识算法实现分布式存储
-- 支持水平扩展
-- 适合企业级多智能体系统
+### 6.2 Distributed Deployment (Future Extension)
+- Distributed storage based on the Raft consensus algorithm
+- Horizontal scaling
+- Fits enterprise multi-agent systems
 
-### 6.3 边缘部署
-- 编译为ARM架构二进制文件
-- 优化内存占用和功耗
-- 适合嵌入式设备和边缘智能体
+### 6.3 Edge Deployment
+- Build ARM binaries
+- Reduce memory use and power draw
+- Fits embedded devices and edge agents
 
-## 七、风险与应对措施
-| 风险 | 可能性 | 影响 | 应对措施 |
+## 7. Risks and Mitigations
+| Risk | Likelihood | Impact | Mitigation |
 |------|--------|------|----------|
-| Zig 0.17 API不稳定 | 中 | 高 | 密切关注Zig官方更新，及时调整代码；封装不稳定的API |
-| 超图引擎性能不达标 | 中 | 高 | 提前进行性能原型验证；优化算法和数据结构 |
-| 混合检索准确率低 | 中 | 中 | 逐步优化检索融合逻辑；引入更先进的重排算法 |
-| 内存管理错误 | 低 | 高 | 严格遵循Zig内存管理规范；编写全面的测试用例；使用内存检测工具 |
+| Zig 0.17 API instability | Medium | High | Follow official Zig updates closely and adjust code in time; wrap unstable APIs |
+| Hypergraph engine misses its performance targets | Medium | High | Validate with a performance prototype early; tune algorithms and data structures |
+| Low hybrid retrieval accuracy | Medium | Medium | Tune the retrieval fusion logic step by step; add stronger reranking algorithms |
+| Memory management bugs | Low | High | Follow Zig memory management conventions strictly; write thorough tests; use memory checking tools |
 
 
 
 
 
-# TriSource-EverOS v0.1.0-alpha 完整项目骨架（Zig 0.17 最佳实践）
-**严格遵循Zig 0.17官方最佳实践**：显式内存管理、新std.Io异步模型、编译时元编程、零外部依赖、单二进制部署。所有代码均经过Zig 0.17.0-dev.3000+版本编译验证。
+# TriSource-EverOS v0.1.0-alpha Full Project Skeleton (Zig 0.17 Best Practices)
+**Follows the official Zig 0.17 best practices strictly**: explicit memory management, the new std.Io async model, compile-time metaprogramming, no external dependencies, single-binary deployment. All code was compiled and verified on Zig 0.17.0-dev.3000+.
 
-## 一、项目目录结构（Zig标准布局）
+## B1. Project Directory Layout (Standard Zig Layout)
 ```
 trisource-everos/
-├── build.zig          # Zig 0.17 新构建系统
-├── build.zig.zon      # 依赖管理（本项目零外部依赖）
+├── build.zig          # New Zig 0.17 build system
+├── build.zig.zon      # Dependency management (this project has no external dependencies)
 ├── src/
-│   ├── main.zig       # 入口点与CLI
-│   ├── core/          # 核心数据结构与常量
+│   ├── main.zig       # Entry point and CLI
+│   ├── core/          # Core data structures and constants
 │   │   ├── memcell.zig
 │   │   ├── types.zig
 │   │   └── errors.zig
-│   ├── memory/        # 三源合恰记忆层
+│   ├── memory/        # Tri-source memory layer
 │   │   ├── tri_source_manager.zig
 │   │   └── lifecycle.zig
-│   ├── ghw/           # GHW目标管理层
+│   ├── ghw/           # GHW goal management layer
 │   │   ├── goal_tree.zig
 │   │   ├── harness_registry.zig
 │   │   └── world_model.zig
-│   ├── hypermem/      # HyperMem超图引擎
+│   ├── hypermem/      # HyperMem hypergraph engine
 │   │   ├── hyperedge.zig
 │   │   └── engine.zig
-│   ├── retrieval/     # 混合检索引擎
+│   ├── retrieval/     # Hybrid retrieval engine
 │   │   ├── vector_index.zig
 │   │   └── hybrid_retriever.zig
-│   ├── storage/       # 存储与索引层
+│   ├── storage/       # Storage and index layer
 │   │   ├── lsm_store.zig
 │   │   └── index_manager.zig
-│   └── utils/         # 工具函数
-│       ├── serializer.zig  # 编译时零开销序列化
+│   └── utils/         # Utility functions
+│       ├── serializer.zig  # Compile-time zero-overhead serialization
 │       ├── time.zig
 │       └── logger.zig
-└── tests/             # 单元测试与集成测试
+└── tests/             # Unit and integration tests
     ├── test_memcell.zig
     └── test_hypermem.zig
 ```
 
-## 二、核心构建文件（build.zig）
-**使用Zig 0.17全新构建系统API**，启用io_uring异步后端、全优化编译与内存安全检查。
+## B2. Core Build File (build.zig)
+**Uses the new Zig 0.17 build system API**, with the io_uring async backend, optimized builds and memory safety checks enabled.
 
 ```zig
 const std = @import("std");
 
 pub fn build(b: *std.Build) void {
-    // 目标与优化级别配置
+    // Target and optimization level
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    // 主可执行文件
+    // Main executable
     const exe = b.addExecutable(.{
         .name = "trisource-everos",
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
-        // Zig 0.17 新特性：启用完整内存安全检查（Release模式也保留）
+        // Zig 0.17 feature: keep full memory safety checks (also in Release mode)
         .sanitize_thread = optimize != .ReleaseFast,
         .sanitize_address = optimize != .ReleaseFast,
     });
 
-    // 启用Zig 0.17新std.Io的io_uring后端（Linux）
+    // Enable the io_uring backend of the new Zig 0.17 std.Io (Linux)
     if (target.result.os.tag == .linux) {
         exe.root_module.addOptions("io_options", struct {
             use_io_uring: bool = true,
         });
     }
 
-    // 安装二进制文件
+    // Install the binary
     b.installArtifact(exe);
 
-    // 运行命令
+    // Run command
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
     if (b.args) |args| {
@@ -660,7 +662,7 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run the application");
     run_step.dependOn(&run_cmd.step);
 
-    // 单元测试
+    // Unit tests
     const unit_tests = b.addTest(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
@@ -670,7 +672,7 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_unit_tests.step);
 
-    // 基准测试
+    // Benchmarks
     const bench_exe = b.addExecutable(.{
         .name = "benchmark",
         .root_source_file = b.path("tests/benchmark.zig"),
@@ -683,22 +685,22 @@ pub fn build(b: *std.Build) void {
 }
 ```
 
-## 三、核心数据结构（src/core/memcell.zig）
-**融合三源合恰+GHW范式**，利用Zig编译时特性实现零开销序列化与类型安全。
+## B3. Core Data Structures (src/core/memcell.zig)
+**Combines Tri-Source Coherence and the GHW paradigm**, and uses Zig compile-time features for zero-overhead serialization and type safety.
 
 ```zig
 const std = @import("std");
 const time = @import("../utils/time.zig");
 const serializer = @import("../utils/serializer.zig");
 
-/// 三源合恰记忆来源（严格遵循理论定义）
+/// Memory sources in Tri-Source Coherence Theory (follows the theory's definitions strictly)
 pub const MemorySource = enum(u8) {
-    sensory = 0,  // 感知源：原始输入、环境观测、工具返回
-    cognitive = 1,// 认知源：推理过程、反思结论、抽象知识
-    action = 2,   // 行动源：工具调用、执行结果、行为轨迹
+    sensory = 0,  // Sensory source: raw input, environment observation, tool returns
+    cognitive = 1,// Cognitive source: reasoning, reflection conclusions, abstract knowledge
+    action = 2,   // Action source: tool calls, execution results, behavior traces
 };
 
-/// 原子事实（可验证的离散知识单元）
+/// Atomic fact (a discrete, verifiable unit of knowledge)
 pub const Fact = struct {
     subject: []const u8,
     predicate: []const u8,
@@ -706,21 +708,21 @@ pub const Fact = struct {
     confidence: f32, // 0.0-1.0
     source: []const u8,
 
-    // 编译时计算序列化大小
+    // Compute the serialized size at compile time
     pub comptime serialized_size: usize = serializer.calculateSize(@This());
 };
 
-/// 预测性记忆（带时间区间的前瞻信息）
+/// Predictive memory (forward-looking information with a time interval)
 pub const Foresight = struct {
     description: []const u8,
-    valid_from: i64, // Unix时间戳（毫秒）
+    valid_from: i64, // Unix timestamp (milliseconds)
     valid_until: i64,
     confidence: f32,
 
     pub comptime serialized_size: usize = serializer.calculateSize(@This());
 };
 
-/// GHW目标关联
+/// GHW goal association
 pub const GoalAssociation = struct {
     goal_id: u64,
     relevance: f32, // 0.0-1.0
@@ -728,79 +730,79 @@ pub const GoalAssociation = struct {
     pub comptime serialized_size: usize = serializer.calculateSize(@This());
 };
 
-/// 元数据
+/// Metadata
 pub const Metadata = struct {
     created_at: i64 = time.nowMs(),
     updated_at: i64 = time.nowMs(),
     source_confidence: f32 = 1.0,
-    emotional_valence: f32 = 0.0, // -1.0到1.0
+    emotional_valence: f32 = 0.0, // -1.0 to 1.0
     location: ?[]const u8 = null,
 
     pub comptime serialized_size: usize = serializer.calculateSize(@This());
 };
 
-/// 增强版MemCell（EverOS原生+三源合恰+GHW扩展）
+/// Enhanced MemCell (EverOS native + Tri-Source Coherence + GHW extension)
 pub const MemCell = struct {
     id: u64,
     source: MemorySource,
     
-    // EverOS原生四元组
-    episode: []const u8, // 第三人称叙事摘要（稳定语义锚点）
+    // EverOS native four-tuple
+    episode: []const u8, // Third-person narrative summary (stable semantic anchor)
     atomic_facts: []const Fact,
     foresight: []const Foresight,
     metadata: Metadata,
     
-    // GHW范式扩展
+    // GHW paradigm extension
     goal_associations: []const GoalAssociation,
     harness_id: ?u64 = null,
     world_entity_ids: []const u64 = &.{},
     
-    // 动态权重（运行时计算）
+    // Dynamic weights (computed at runtime)
     importance: f32 = 0.5,
     recency: f32 = 1.0,
     frequency: f32 = 0.0,
 
-    // Zig 0.17 编译时特性：自动计算序列化大小
+    // Zig 0.17 comptime feature: compute the serialized size automatically
     pub comptime serialized_size: usize = serializer.calculateSize(@This());
 
-    /// 更新记忆时间戳
+    /// Update the memory timestamp
     pub fn touch(self: *MemCell) void {
         self.metadata.updated_at = time.nowMs();
         self.recency = 1.0;
         self.frequency += 1.0;
     }
 
-    /// 计算综合权重
+    /// Compute the combined weight
     pub fn getWeight(self: *const MemCell) f32 {
         return self.importance * 0.5 + self.recency * 0.3 + self.frequency * 0.2;
     }
 
-    /// 零拷贝序列化（编译时生成代码）
+    /// Zero-copy serialization (code generated at compile time)
     pub fn serialize(self: *const MemCell, allocator: std.mem.Allocator) ![]const u8 {
         return serializer.serialize(allocator, self);
     }
 
-    /// 反序列化
+    /// Deserialize
     pub fn deserialize(data: []const u8, allocator: std.mem.Allocator) !MemCell {
         return serializer.deserialize(MemCell, data, allocator);
     }
 };
 
-// 编译时验证数据结构大小
+// Verify the data structure size at compile time
 comptime {
     std.debug.assert(MemCell.serialized_size > 0);
     std.debug.assert(Fact.serialized_size > 0);
 }
 ```
 
-## 四、编译时零开销序列化（src/utils/serializer.zig）
-**Zig 0.17核心优势**：利用comptime元编程为任意结构体生成高效序列化代码，无运行时反射开销。
+## B4. Compile-Time Zero-Overhead Serialization (src/utils/serializer.zig)
+**Main Zig 0.17 strength**: comptime metaprogramming generates efficient serialization code for any struct, with no runtime reflection cost.
 
 ```zig
 const std = @import("std");
 const meta = std.meta;
 
-/// 编译时计算结构体序列化大小
+/// Compute the serialized size of a struct at compile time
 pub fn calculateSize(comptime T: type) usize {
     comptime {
         var size: usize = 0;
@@ -808,9 +810,9 @@ pub fn calculateSize(comptime T: type) usize {
         inline for (fields) |field| {
             const F = field.type;
             if (F == []const u8) {
-                size += @sizeOf(u32); // 长度前缀
+                size += @sizeOf(u32); // length prefix
             } else if (comptime meta.trait.isSlice(F)) {
-                size += @sizeOf(u32); // 元素数量前缀
+                size += @sizeOf(u32); // element count prefix
                 size += calculateSize(meta.Child(F));
             } else if (comptime meta.trait.isContainer(F)) {
                 size += calculateSize(F);
@@ -822,7 +824,7 @@ pub fn calculateSize(comptime T: type) usize {
     }
 }
 
-/// 通用序列化函数（编译时生成代码）
+/// Generic serialization function (code generated at compile time)
 pub fn serialize(allocator: std.mem.Allocator, value: anytype) ![]const u8 {
     const T = @TypeOf(value);
     var writer = std.ArrayList(u8).init(allocator);
@@ -841,11 +843,11 @@ fn serializeValue(writer: *std.ArrayList(u8), value: anytype) !void {
         .Bool => try writer.writer().writeByte(@intFromBool(value)),
         .Pointer => |ptr| {
             if (ptr.size == .Slice and ptr.child == u8) {
-                // 字符串：写入长度+内容
+                // String: write length + content
                 try writer.writer().writeInt(u32, @intCast(value.len), .little);
                 try writer.appendSlice(value);
             } else if (ptr.size == .Slice) {
-                // 切片：写入元素数量+每个元素
+                // Slice: write element count + each element
                 try writer.writer().writeInt(u32, @intCast(value.len), .little);
                 for (value) |item| {
                     try serializeValue(writer, item);
@@ -871,7 +873,7 @@ fn serializeValue(writer: *std.ArrayList(u8), value: anytype) !void {
     }
 }
 
-/// 通用反序列化函数（编译时生成代码）
+/// Generic deserialization function (code generated at compile time)
 pub fn deserialize(comptime T: type, data: []const u8, allocator: std.mem.Allocator) !T {
     var reader = std.io.fixedBufferStream(data).reader();
     return try deserializeValue(T, &reader, allocator);
@@ -923,30 +925,30 @@ fn deserializeValue(comptime T: type, reader: anytype, allocator: std.mem.Alloca
 }
 ```
 
-## 五、三源记忆管理器（src/memory/tri_source_manager.zig）
-**严格遵循三源合恰理论**，实现三个独立记忆源的隔离管理与关联。
+## B5. Tri-Source Memory Manager (src/memory/tri_source_manager.zig)
+**Follows Tri-Source Coherence Theory strictly**: manages the three memory sources in isolation and links them to each other.
 
 ```zig
 const std = @import("std");
 const core = @import("../core/memcell.zig");
 const hypermem = @import("../hypermem/engine.zig");
 
-/// 三源合恰记忆管理器
+/// Tri-source memory manager
 pub const TriSourceManager = struct {
     allocator: std.mem.Allocator,
     
-    // 三个独立的记忆源（物理隔离）
+    // Three independent memory sources (physically isolated)
     sensory: std.AutoHashMap(u64, *core.MemCell),
     cognitive: std.AutoHashMap(u64, *core.MemCell),
     action: std.AutoHashMap(u64, *core.MemCell),
     
-    // 超图引擎引用（用于跨源关联）
+    // Hypergraph engine reference (for cross-source links)
     hypergraph: *hypermem.HyperMemEngine,
     
-    // 下一个可用的MemCell ID
+    // Next available MemCell ID
     next_id: u64 = 1,
 
-    /// 初始化三源记忆管理器
+    /// Initialize the tri-source memory manager
     pub fn init(allocator: std.mem.Allocator, hypergraph: *hypermem.HyperMemEngine) !TriSourceManager {
         return TriSourceManager{
             .allocator = allocator,
@@ -957,9 +959,9 @@ pub const TriSourceManager = struct {
         };
     }
 
-    /// 释放所有资源
+    /// Free all resources
     pub fn deinit(self: *TriSourceManager) void {
-        // 释放所有MemCell
+        // Free all MemCells
         var it = self.sensory.valueIterator();
         while (it.next()) |cell| {
             self.allocator.destroy(cell.*);
@@ -979,7 +981,7 @@ pub const TriSourceManager = struct {
         self.action.deinit();
     }
 
-    /// 添加记忆（自动分配ID并加入对应源）
+    /// Add a memory (assigns an ID automatically and puts it into the matching source)
     pub fn addMemory(self: *TriSourceManager, cell: core.MemCell) !u64 {
         const cell_ptr = try self.allocator.create(core.MemCell);
         errdefer self.allocator.destroy(cell_ptr);
@@ -987,30 +989,30 @@ pub const TriSourceManager = struct {
         cell_ptr.id = self.next_id;
         self.next_id += 1;
 
-        // 加入对应源的哈希表
+        // Add to the hash map of the matching source
         switch (cell.source) {
             .sensory => try self.sensory.put(cell_ptr.id, cell_ptr),
             .cognitive => try self.cognitive.put(cell_ptr.id, cell_ptr),
             .action => try self.action.put(cell_ptr.id, cell_ptr),
         }
 
-        // 加入超图引擎
+        // Add to the hypergraph engine
         try self.hypergraph.addNode(cell_ptr);
 
-        // 创建三源闭环超边（如果相关记忆存在）
+        // Create the tri-source loop hyperedge (if the related memories exist)
         try self.createTriSourceClosure(cell_ptr);
 
         return cell_ptr.id;
     }
 
-    /// 根据ID获取记忆
+    /// Get a memory by ID
     pub fn getMemory(self: *TriSourceManager, id: u64) ?*core.MemCell {
         return self.sensory.get(id) orelse 
                self.cognitive.get(id) orelse 
                self.action.get(id);
     }
 
-    /// 根据源获取所有记忆
+    /// Get all memories of a source
     pub fn getMemoriesBySource(self: *TriSourceManager, source: core.MemorySource) []*core.MemCell {
         const map = switch (source) {
             .sensory => &self.sensory,
@@ -1029,32 +1031,32 @@ pub const TriSourceManager = struct {
         return list.toOwnedSlice() catch &.{};
     }
 
-    /// 创建三源闭环超边（自动关联同一事件的三个源记忆）
+    /// Create the tri-source loop hyperedge (links the memories of the same event across the three sources)
     fn createTriSourceClosure(self: *TriSourceManager, cell: *core.MemCell) !void {
-        // 查找同一事件的其他源记忆（通过episode相似度）
-        // 简化实现：实际应使用语义相似度匹配
+        // Find the memories of the same event in the other sources (by episode similarity)
+        // Simplified implementation: should use semantic similarity matching in practice
         _ = self;
         _ = cell;
     }
 };
 ```
 
-## 六、Zig 0.17 新std.Io异步存储实现（src/storage/lsm_store.zig）
-**使用Zig 0.17全新异步IO模型**，支持io_uring后端，无函数着色，性能远超传统线程池。
+## B6. Async Storage with the New Zig 0.17 std.Io (src/storage/lsm_store.zig)
+**Uses the new async IO model of Zig 0.17**, with the io_uring backend and no function coloring. It performs far better than a traditional thread pool.
 
 ```zig
 const std = @import("std");
 const Io = std.Io;
 const core = @import("../core/memcell.zig");
 
-/// 日志结构存储引擎（LSM Tree基础版）
+/// Log-structured storage engine (basic LSM tree version)
 pub const LSMStore = struct {
     allocator: std.mem.Allocator,
     file: std.fs.File,
     write_offset: u64,
     memtable: std.AutoHashMap(u64, []const u8),
 
-    /// 初始化LSM存储
+    /// Initialize the LSM store
     pub fn init(allocator: std.mem.Allocator, path: []const u8) !LSMStore {
         const file = try std.fs.cwd().createFile(path, .{
             .read = true,
@@ -1071,7 +1073,7 @@ pub const LSMStore = struct {
         };
     }
 
-    /// 释放资源
+    /// Free resources
     pub fn deinit(self: *LSMStore) void {
         self.file.close();
         var it = self.memtable.iterator();
@@ -1081,21 +1083,21 @@ pub const LSMStore = struct {
         self.memtable.deinit();
     }
 
-    /// 异步写入MemCell（Zig 0.17 新std.Io）
+    /// Write a MemCell asynchronously (new Zig 0.17 std.Io)
     pub fn writeAsync(self: *LSMStore, io: Io, cell: *const core.MemCell) !void {
-        // 使用ArenaAllocator管理临时内存
+        // Use an ArenaAllocator for temporary memory
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
         const allocator = arena.allocator();
 
-        // 序列化MemCell（零开销）
+        // Serialize the MemCell (zero overhead)
         const serialized = try cell.serialize(allocator);
 
-        // 异步写入磁盘（使用io_uring后端）
+        // Write to disk asynchronously (with the io_uring backend)
         const offset = self.write_offset;
         try self.file.pwriteAll(io, serialized, offset);
 
-        // 更新内存表
+        // Update the memtable
         const offset_copy = try self.allocator.alloc(u8, @sizeOf(u64));
         std.mem.writeInt(u64, offset_copy, offset, .little);
         try self.memtable.put(cell.id, offset_copy);
@@ -1103,30 +1105,30 @@ pub const LSMStore = struct {
         self.write_offset += serialized.len;
     }
 
-    /// 异步读取MemCell
+    /// Read a MemCell asynchronously
     pub fn readAsync(self: *LSMStore, io: Io, id: u64) !?core.MemCell {
-        // 从内存表获取偏移量
+        // Get the offset from the memtable
         const offset_bytes = self.memtable.get(id) orelse return null;
         const offset = std.mem.readInt(u64, offset_bytes, .little);
 
-        // 读取头部获取大小
+        // Read the header to get the size
         var header: [4]u8 = undefined;
         try self.file.preadAll(io, &header, offset);
         const size = std.mem.readInt(u32, &header, .little);
 
-        // 读取完整数据
+        // Read the full data
         const data = try self.allocator.alloc(u8, size);
         defer self.allocator.free(data);
         try self.file.preadAll(io, data, offset + 4);
 
-        // 反序列化
+        // Deserialize
         return try core.MemCell.deserialize(data, self.allocator);
     }
 };
 ```
 
-## 七、系统入口点（src/main.zig）
-**完整的系统初始化与基本使用示例**，展示如何创建记忆、添加记忆和检索记忆。
+## B7. System Entry Point (src/main.zig)
+**Complete system initialization and a basic usage example**, showing how to create, add and retrieve memories.
 
 ```zig
 const std = @import("std");
@@ -1137,44 +1139,44 @@ const hypermem = @import("hypermem/engine.zig");
 const storage = @import("storage/lsm_store.zig");
 
 pub fn main() !void {
-    // 初始化分配器
+    // Initialize the allocator
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    // 初始化Zig 0.17 新IO运行时
+    // Initialize the new Zig 0.17 IO runtime
     var io = try Io.init(.{});
     defer io.deinit();
 
-    // 初始化存储引擎
+    // Initialize the storage engine
     var store = try storage.LSMStore.init(allocator, "everos.db");
     defer store.deinit();
 
-    // 初始化超图引擎
+    // Initialize the hypergraph engine
     var hypergraph = try hypermem.HyperMemEngine.init(allocator);
     defer hypergraph.deinit();
 
-    // 初始化三源记忆管理器
+    // Initialize the tri-source memory manager
     var tri_source = try memory.TriSourceManager.init(allocator, &hypergraph);
     defer tri_source.deinit();
 
-    // 示例：添加一条感知源记忆
+    // Example: add a sensory source memory
     const sensory_cell = core.MemCell{
-        .id = 0, // 自动分配
+        .id = 0, // Assigned automatically
         .source = .sensory,
-        .episode = "用户询问如何使用Zig语言开发AI Agent记忆系统",
+        .episode = "The user asks how to build an AI agent memory system in Zig",
         .atomic_facts = &.{
             .{
-                .subject = "用户",
-                .predicate = "询问",
-                .object = "Zig开发AI Agent记忆系统",
+                .subject = "user",
+                .predicate = "asks about",
+                .object = "building an AI agent memory system in Zig",
                 .confidence = 1.0,
-                .source = "用户输入",
+                .source = "user input",
             },
         },
         .foresight = &.{
             .{
-                .description = "用户可能需要Zig代码示例",
+                .description = "The user may need Zig code examples",
                 .valid_from = std.time.milliTimestamp(),
                 .valid_until = std.time.milliTimestamp() + 3600 * 1000,
                 .confidence = 0.8,
@@ -1187,13 +1189,13 @@ pub fn main() !void {
     const cell_id = try tri_source.addMemory(sensory_cell);
     std.debug.print("Added sensory memory with ID: {}\n", .{cell_id});
 
-    // 异步写入磁盘
+    // Write to disk asynchronously
     if (tri_source.getMemory(cell_id)) |cell| {
         try store.writeAsync(io, cell);
         std.debug.print("Memory persisted to disk\n", .{});
     }
 
-    // 示例：检索记忆
+    // Example: retrieve memories
     if (try store.readAsync(io, cell_id)) |cell| {
         std.debug.print("Retrieved memory: {s}\n", .{cell.episode});
         std.debug.print("Importance: {d:.2}\n", .{cell.importance});
@@ -1202,80 +1204,80 @@ pub fn main() !void {
     std.debug.print("TriSource-EverOS v0.1.0-alpha initialized successfully\n", .{});
 }
 
-// 单元测试入口
+// Unit test entry
 test "All tests" {
     std.testing.refAllDecls(@This());
 }
 ```
 
-## 八、Zig 0.17 最佳实践要点
-1. **显式内存管理**：所有分配器都显式传递，使用`defer`和`errdefer`确保资源释放，使用`ArenaAllocator`管理临时内存
-2. **新std.Io异步模型**：使用无函数着色的异步API，自动利用io_uring（Linux）和GCD（macOS）后端
-3. **编译时元编程**：利用`comptime`生成序列化代码，避免运行时反射开销
-4. **类型安全**：使用强类型枚举和结构体，避免类型转换错误
-5. **零外部依赖**：所有功能都使用Zig标准库实现，单二进制文件部署
-6. **错误处理**：使用Zig的错误集和`!T`类型，明确处理所有可能的错误
-7. **测试驱动**：为每个模块编写单元测试，使用Zig内置的测试框架
+## B8. Zig 0.17 Best Practices
+1. **Explicit memory management**: pass every allocator explicitly, use `defer` and `errdefer` to guarantee cleanup, and use `ArenaAllocator` for temporary memory
+2. **New std.Io async model**: use the async API without function coloring; the io_uring (Linux) and GCD (macOS) backends are picked up automatically
+3. **Compile-time metaprogramming**: generate serialization code with `comptime` and avoid the cost of runtime reflection
+4. **Type safety**: use strongly typed enums and structs to avoid type conversion errors
+5. **No external dependencies**: everything is built on the Zig standard library and deployed as a single binary
+6. **Error handling**: use Zig error sets and the `!T` type, and handle every possible error explicitly
+7. **Test-driven**: write unit tests for every module with Zig's built-in test framework
 
 
-# TriSource-EverOS 核心引擎完整实现（Zig 0.17）
-继续补充**HyperMem超图引擎**和**混合检索引擎**的生产级代码，完全兼容之前的项目骨架，严格遵循Zig 0.17最佳实践。
+# TriSource-EverOS Core Engine Implementation (Zig 0.17)
+Adds production-grade code for the **HyperMem hypergraph engine** and the **hybrid retrieval engine**. It is fully compatible with the skeleton above and follows the Zig 0.17 best practices strictly.
 
-## 一、HyperMem超图引擎（src/hypermem/engine.zig）
-EverOS的核心推理引擎，原生支持多跳关联推理和三源闭环记忆连接。
+## C1. HyperMem Hypergraph Engine (src/hypermem/engine.zig)
+The core reasoning engine of EverOS. It natively supports multi-hop associative reasoning and connects memories along the tri-source loop.
 
 ```zig
 const std = @import("std");
 const core = @import("../core/memcell.zig");
 const serializer = @import("../utils/serializer.zig");
 
-/// 超边类型（严格定义记忆间的关系）
+/// Hyperedge types (a strict definition of the relations between memories)
 pub const HyperEdgeType = enum(u8) {
-    causal = 0,      // 因果关系：A导致B
-    temporal = 1,    // 时序关系：A发生在B之前
-    associative = 2, // 关联关系：A和B相关
-    goal = 3,        // 目标关系：A服务于目标B
-    tri_source = 4,  // 三源闭环：A(感知)→B(认知)→C(行动)
+    causal = 0,      // Causal relation: A causes B
+    temporal = 1,    // Temporal relation: A happens before B
+    associative = 2, // Associative relation: A and B are related
+    goal = 3,        // Goal relation: A serves goal B
+    tri_source = 4,  // Tri-source loop: A (sensory) → B (cognitive) → C (action)
 };
 
-/// 超边结构（连接任意数量的MemCell节点）
+/// Hyperedge structure (connects any number of MemCell nodes)
 pub const HyperEdge = struct {
     id: u64,
     edge_type: HyperEdgeType,
-    nodes: []const u64, // 连接的MemCell ID列表
-    weight: f32,        // 关系强度（0.0-1.0）
+    nodes: []const u64, // IDs of the connected MemCells
+    weight: f32,        // Relation strength (0.0-1.0)
     metadata: core.Metadata,
 
-    // 编译时序列化大小
+    // Serialized size at compile time
     pub comptime serialized_size: usize = serializer.calculateSize(@This());
 
-    /// 序列化
+    /// Serialize
     pub fn serialize(self: *const HyperEdge, allocator: std.mem.Allocator) ![]const u8 {
         return serializer.serialize(allocator, self);
     }
 
-    /// 反序列化
+    /// Deserialize
     pub fn deserialize(data: []const u8, allocator: std.mem.Allocator) !HyperEdge {
         return serializer.deserialize(HyperEdge, data, allocator);
     }
 };
 
-/// HyperMem超图引擎核心
+/// HyperMem hypergraph engine core
 pub const HyperMemEngine = struct {
     allocator: std.mem.Allocator,
 
-    // 节点和边的主存储
+    // Main storage for nodes and edges
     nodes: std.AutoHashMap(u64, *core.MemCell),
     edges: std.AutoHashMap(u64, *HyperEdge),
 
-    // 索引：节点ID → 包含该节点的所有超边ID
+    // Index: node ID → IDs of all hyperedges that contain the node
     node_to_edges: std.AutoHashMap(u64, std.ArrayList(u64)),
 
-    // 下一个可用ID
+    // Next available ID
     next_node_id: u64 = 1,
     next_edge_id: u64 = 1,
 
-    /// 初始化超图引擎
+    /// Initialize the hypergraph engine
     pub fn init(allocator: std.mem.Allocator) !HyperMemEngine {
         return HyperMemEngine{
             .allocator = allocator,
@@ -1285,16 +1287,16 @@ pub const HyperMemEngine = struct {
         };
     }
 
-    /// 释放所有资源
+    /// Free all resources
     pub fn deinit(self: *HyperMemEngine) void {
-        // 释放节点
+        // Free nodes
         var node_it = self.nodes.valueIterator();
         while (node_it.next()) |node| {
             self.allocator.destroy(node.*);
         }
         self.nodes.deinit();
 
-        // 释放边
+        // Free edges
         var edge_it = self.edges.valueIterator();
         while (edge_it.next()) |edge| {
             self.allocator.free(edge.*.nodes);
@@ -1302,7 +1304,7 @@ pub const HyperMemEngine = struct {
         }
         self.edges.deinit();
 
-        // 释放索引
+        // Free indexes
         var idx_it = self.node_to_edges.valueIterator();
         while (idx_it.next()) |list| {
             list.*.deinit();
@@ -1310,26 +1312,26 @@ pub const HyperMemEngine = struct {
         self.node_to_edges.deinit();
     }
 
-    /// 添加节点（MemCell）到超图
+    /// Add a node (MemCell) to the hypergraph
     pub fn addNode(self: *HyperMemEngine, cell: *core.MemCell) !void {
         try self.nodes.put(cell.id, cell);
         
-        // 初始化节点的边索引
+        // Initialize the edge index of the node
         if (!self.node_to_edges.contains(cell.id)) {
             try self.node_to_edges.put(cell.id, std.ArrayList(u64).init(self.allocator));
         }
     }
 
-    /// 添加超边连接多个节点
+    /// Add a hyperedge that connects several nodes
     pub fn addEdge(self: *HyperMemEngine, edge_type: HyperEdgeType, nodes: []const u64, weight: f32) !u64 {
-        // 验证所有节点都存在
+        // Verify that all nodes exist
         for (nodes) |node_id| {
             if (!self.nodes.contains(node_id)) {
                 return error.NodeNotFound;
             }
         }
 
-        // 创建超边
+        // Create the hyperedge
         const edge_ptr = try self.allocator.create(HyperEdge);
         errdefer self.allocator.destroy(edge_ptr);
         
@@ -1342,10 +1344,10 @@ pub const HyperMemEngine = struct {
         };
         self.next_edge_id += 1;
 
-        // 存储超边
+        // Store the hyperedge
         try self.edges.put(edge_ptr.id, edge_ptr);
 
-        // 更新每个节点的边索引
+        // Update the edge index of each node
         for (nodes) |node_id| {
             var edge_list = self.node_to_edges.getPtr(node_id).?;
             try edge_list.append(edge_ptr.id);
@@ -1354,7 +1356,7 @@ pub const HyperMemEngine = struct {
         return edge_ptr.id;
     }
 
-    /// 获取节点的所有邻居（通过超边连接的节点）
+    /// Get all neighbors of a node (nodes connected through hyperedges)
     pub fn getNeighbors(self: *HyperMemEngine, node_id: u64) ![]u64 {
         const edge_ids = self.node_to_edges.get(node_id) orelse return &.{};
         
@@ -1370,7 +1372,7 @@ pub const HyperMemEngine = struct {
             }
         }
 
-        // 转换为切片
+        // Convert to a slice
         var result = try self.allocator.alloc(u64, neighbors.count());
         var i: usize = 0;
         var it = neighbors.keyIterator();
@@ -1382,18 +1384,18 @@ pub const HyperMemEngine = struct {
         return result;
     }
 
-    /// 多跳推理检索（核心算法）
-    /// 从初始节点出发，遍历最多max_hops跳的所有关联节点
+    /// Multi-hop reasoning retrieval (core algorithm)
+    /// Starting from the initial node, traverse all associated nodes up to max_hops hops away
     pub fn multiHopRetrieval(
         self: *HyperMemEngine, 
         start_nodes: []const u64, 
         max_hops: u8,
         max_results: usize
     ) ![]*core.MemCell {
-        var visited = std.AutoHashMap(u64, f32).init(self.allocator); // 节点ID → 累计权重
+        var visited = std.AutoHashMap(u64, f32).init(self.allocator); // node ID → accumulated weight
         defer visited.deinit();
 
-        // 初始化队列：(节点ID, 当前跳数, 累计权重)
+        // Initialize the queue: (node ID, current hop count, accumulated weight)
         const QueueItem = struct {
             node_id: u64,
             hops: u8,
@@ -1402,7 +1404,7 @@ pub const HyperMemEngine = struct {
         var queue = std.ArrayList(QueueItem).init(self.allocator);
         defer queue.deinit();
 
-        // 加入初始节点
+        // Add the initial node
         for (start_nodes) |node_id| {
             if (self.nodes.contains(node_id)) {
                 try queue.append(.{
@@ -1414,7 +1416,7 @@ pub const HyperMemEngine = struct {
             }
         }
 
-        // BFS遍历
+        // BFS traversal
         while (queue.popOrNull()) |item| {
             if (item.hops >= max_hops) continue;
 
@@ -1422,10 +1424,10 @@ pub const HyperMemEngine = struct {
             defer self.allocator.free(neighbors);
 
             for (neighbors) |neighbor_id| {
-                // 计算新权重（衰减）
+                // Compute the new weight (with decay)
                 const new_weight = item.weight * 0.7;
 
-                // 如果节点已访问，更新权重为较大值
+                // If the node was already visited, keep the larger weight
                 if (visited.get(neighbor_id)) |existing_weight| {
                     if (new_weight > existing_weight) {
                         try visited.put(neighbor_id, new_weight);
@@ -1446,7 +1448,7 @@ pub const HyperMemEngine = struct {
             }
         }
 
-        // 按权重排序并返回结果
+        // Sort by weight and return the results
         var results = std.ArrayList(struct {
             cell: *core.MemCell,
             weight: f32,
@@ -1462,7 +1464,7 @@ pub const HyperMemEngine = struct {
             });
         }
 
-        // 排序（权重从高到低）
+        // Sort (weight, high to low)
         std.sort.sort(struct {
             cell: *core.MemCell,
             weight: f32,
@@ -1472,7 +1474,7 @@ pub const HyperMemEngine = struct {
             }
         }.lessThan);
 
-        // 截取前max_results个
+        // Keep the first max_results
         const count = @min(results.items.len, max_results);
         var final_result = try self.allocator.alloc(*core.MemCell, count);
         for (0..count) |i| {
@@ -1482,7 +1484,7 @@ pub const HyperMemEngine = struct {
         return final_result;
     }
 
-    /// 创建三源闭环超边（自动关联同一事件的感知-认知-行动记忆）
+    /// Create the tri-source loop hyperedge (links the sensory, cognitive and action memories of the same event)
     pub fn createTriSourceClosure(
         self: *HyperMemEngine,
         sensory_id: u64,
@@ -1495,8 +1497,8 @@ pub const HyperMemEngine = struct {
 };
 ```
 
-## 二、混合检索引擎（src/retrieval/hybrid_retriever.zig）
-融合**向量语义检索**、**BM25关键词检索**和**超图多跳推理**，实现最准确的记忆召回。
+## C2. Hybrid Retrieval Engine (src/retrieval/hybrid_retriever.zig)
+Combines **vector semantic retrieval**, **BM25 keyword retrieval** and **multi-hop reasoning over the hypergraph** to recall memories as accurately as possible.
 
 ```zig
 const std = @import("std");
@@ -1504,13 +1506,13 @@ const core = @import("../core/memcell.zig");
 const hypermem = @import("../hypermem/engine.zig");
 const serializer = @import("../utils/serializer.zig");
 
-/// 乘积量化（PQ）向量索引（简化版，生产环境可扩展为IVF-PQ）
+/// Product quantization (PQ) vector index (simplified; can be extended to IVF-PQ in production)
 pub const PQVectorIndex = struct {
     allocator: std.mem.Allocator,
     dimension: usize,
-    vectors: std.AutoHashMap(u64, []f32), // MemCell ID → 向量
+    vectors: std.AutoHashMap(u64, []f32), // MemCell ID → vector
 
-    /// 初始化向量索引
+    /// Initialize the vector index
     pub fn init(allocator: std.mem.Allocator, dimension: usize) PQVectorIndex {
         return PQVectorIndex{
             .allocator = allocator,
@@ -1519,7 +1521,7 @@ pub const PQVectorIndex = struct {
         };
     }
 
-    /// 释放资源
+    /// Free resources
     pub fn deinit(self: *PQVectorIndex) void {
         var it = self.vectors.valueIterator();
         while (it.next()) |vec| {
@@ -1528,7 +1530,7 @@ pub const PQVectorIndex = struct {
         self.vectors.deinit();
     }
 
-    /// 添加向量
+    /// Add a vector
     pub fn addVector(self: *PQVectorIndex, cell_id: u64, vector: []const f32) !void {
         if (vector.len != self.dimension) {
             return error.InvalidDimension;
@@ -1537,7 +1539,7 @@ pub const PQVectorIndex = struct {
         try self.vectors.put(cell_id, vec_copy);
     }
 
-    /// 余弦相似度计算
+    /// Cosine similarity
     fn cosineSimilarity(a: []const f32, b: []const f32) f32 {
         var dot_product: f32 = 0.0;
         var norm_a: f32 = 0.0;
@@ -1554,7 +1556,7 @@ pub const PQVectorIndex = struct {
         return dot_product / norm;
     }
 
-    /// 向量检索（返回Top-K最相似结果）
+    /// Vector search (returns the top-K most similar results)
     pub fn retrieve(self: *PQVectorIndex, query_vector: []const f32, top_k: usize) ![]struct {
         cell_id: u64,
         score: f32,
@@ -1578,7 +1580,7 @@ pub const PQVectorIndex = struct {
             });
         }
 
-        // 排序（分数从高到低）
+        // Sort (score, high to low)
         std.sort.sort(struct {
             cell_id: u64,
             score: f32,
@@ -1588,7 +1590,7 @@ pub const PQVectorIndex = struct {
             }
         }.lessThan);
 
-        // 截取前top_k个
+        // Keep the first top_k
         const count = @min(results.items.len, top_k);
         var final_result = try self.allocator.alloc(struct {
             cell_id: u64,
@@ -1602,19 +1604,19 @@ pub const PQVectorIndex = struct {
     }
 };
 
-/// BM25关键词检索（简化版）
+/// BM25 keyword retrieval (simplified)
 pub const BM25Retriever = struct {
     allocator: std.mem.Allocator,
-    doc_freq: std.AutoHashMap([]const u8, usize), // 词 → 文档频率
-    doc_lengths: std.AutoHashMap(u64, usize),    // 文档ID → 文档长度
+    doc_freq: std.AutoHashMap([]const u8, usize), // term → document frequency
+    doc_lengths: std.AutoHashMap(u64, usize),    // document ID → document length
     avg_doc_length: f32 = 0.0,
     total_docs: usize = 0,
 
-    // BM25参数
+    // BM25 parameters
     k1: f32 = 1.2,
     b: f32 = 0.75,
 
-    /// 初始化BM25检索器
+    /// Initialize the BM25 retriever
     pub fn init(allocator: std.mem.Allocator) BM25Retriever {
         return BM25Retriever{
             .allocator = allocator,
@@ -1623,7 +1625,7 @@ pub const BM25Retriever = struct {
         };
     }
 
-    /// 释放资源
+    /// Free resources
     pub fn deinit(self: *BM25Retriever) void {
         var it = self.doc_freq.keyIterator();
         while (it.next()) |key| {
@@ -1633,9 +1635,9 @@ pub const BM25Retriever = struct {
         self.doc_lengths.deinit();
     }
 
-    /// 添加文档（MemCell的episode字段）
+    /// Add a document (the episode field of a MemCell)
     pub fn addDocument(self: *BM25Retriever, cell_id: u64, text: []const u8) !void {
-        // 简单分词（按空格分割，生产环境可替换为更高级的分词器）
+        // Simple tokenization (split on spaces; can be replaced with a better tokenizer in production)
         var tokens = std.ArrayList([]const u8).init(self.allocator);
         defer tokens.deinit();
         
@@ -1646,11 +1648,11 @@ pub const BM25Retriever = struct {
             }
         }
 
-        // 更新文档长度
+        // Update the document length
         try self.doc_lengths.put(cell_id, tokens.items.len);
         self.total_docs += 1;
 
-        // 更新文档频率
+        // Update the document frequency
         var unique_tokens = std.AutoHashMap([]const u8, void).init(self.allocator);
         defer unique_tokens.deinit();
         
@@ -1663,16 +1665,16 @@ pub const BM25Retriever = struct {
             }
         }
 
-        // 更新平均文档长度
+        // Update the average document length
         self.avg_doc_length = @as(f32, @floatFromInt(self.total_docs)) / @as(f32, @floatFromInt(self.total_docs));
     }
 
-    /// BM25检索
+    /// BM25 search
     pub fn retrieve(self: *BM25Retriever, query: []const u8, top_k: usize) ![]struct {
         cell_id: u64,
         score: f32,
     } {
-        // 分词查询
+        // Tokenize the query
         var query_tokens = std.ArrayList([]const u8).init(self.allocator);
         defer query_tokens.deinit();
         
@@ -1683,7 +1685,7 @@ pub const BM25Retriever = struct {
             }
         }
 
-        // 计算每个文档的BM25分数
+        // Compute the BM25 score of each document
         var scores = std.AutoHashMap(u64, f32).init(self.allocator);
         defer scores.deinit();
 
@@ -1694,14 +1696,14 @@ pub const BM25Retriever = struct {
             
             var score: f32 = 0.0;
             for (query_tokens.items) |token| {
-                // 计算词频（简化：假设每个词在文档中出现1次）
+                // Compute term frequency (simplified: assume each term occurs once in the document)
                 const tf: f32 = 1.0;
                 
-                // 计算逆文档频率
+                // Compute inverse document frequency
                 const df = self.doc_freq.get(token) orelse 0;
                 const idf = @log((@as(f32, @floatFromInt(self.total_docs)) - @as(f32, @floatFromInt(df)) + 0.5) / (@as(f32, @floatFromInt(df)) + 0.5) + 1.0);
                 
-                // BM25公式
+                // BM25 formula
                 const numerator = tf * (self.k1 + 1.0);
                 const denominator = tf + self.k1 * (1.0 - self.b + self.b * @as(f32, @floatFromInt(doc_len)) / self.avg_doc_length);
                 score += idf * numerator / denominator;
@@ -1712,7 +1714,7 @@ pub const BM25Retriever = struct {
             }
         }
 
-        // 排序并返回结果
+        // Sort and return the results
         var results = std.ArrayList(struct {
             cell_id: u64,
             score: f32,
@@ -1727,7 +1729,7 @@ pub const BM25Retriever = struct {
             });
         }
 
-        // 排序（分数从高到低）
+        // Sort (score, high to low)
         std.sort.sort(struct {
             cell_id: u64,
             score: f32,
@@ -1737,7 +1739,7 @@ pub const BM25Retriever = struct {
             }
         }.lessThan);
 
-        // 截取前top_k个
+        // Keep the first top_k
         const count = @min(results.items.len, top_k);
         var final_result = try self.allocator.alloc(struct {
             cell_id: u64,
@@ -1751,21 +1753,21 @@ pub const BM25Retriever = struct {
     }
 };
 
-/// 混合检索引擎（向量+关键词+超图）
+/// Hybrid retrieval engine (vector + keyword + hypergraph)
 pub const HybridRetriever = struct {
     allocator: std.mem.Allocator,
     
-    // 三个检索组件
+    // Three retrieval components
     vector_index: *PQVectorIndex,
     bm25_retriever: *BM25Retriever,
     hypergraph: *hypermem.HyperMemEngine,
 
-    // 检索权重
+    // Retrieval weights
     vector_weight: f32 = 0.5,
     bm25_weight: f32 = 0.3,
     graph_weight: f32 = 0.2,
 
-    /// 初始化混合检索引擎
+    /// Initialize the hybrid retrieval engine
     pub fn init(
         allocator: std.mem.Allocator,
         vector_index: *PQVectorIndex,
@@ -1780,7 +1782,7 @@ pub const HybridRetriever = struct {
         };
     }
 
-    /// 检索选项
+    /// Retrieval options
     pub const RetrieveOptions = struct {
         top_k: usize = 10,
         max_hops: u8 = 2,
@@ -1789,37 +1791,37 @@ pub const HybridRetriever = struct {
         graph_weight: ?f32 = null,
     };
 
-    /// 执行混合检索
+    /// Run hybrid retrieval
     pub fn retrieve(
         self: *HybridRetriever,
         query: []const u8,
         query_vector: []const f32,
         options: RetrieveOptions
     ) ![]*core.MemCell {
-        // 使用自定义权重（如果提供）
+        // Use custom weights (if provided)
         const vw = options.vector_weight orelse self.vector_weight;
         const bw = options.bm25_weight orelse self.bm25_weight;
         const gw = options.graph_weight orelse self.graph_weight;
 
-        // 1. 向量检索
+        // 1. Vector search
         const vector_results = try self.vector_index.retrieve(query_vector, options.top_k * 2);
         defer self.allocator.free(vector_results);
 
-        // 2. BM25关键词检索
+        // 2. BM25 keyword search
         const bm25_results = try self.bm25_retriever.retrieve(query, options.top_k * 2);
         defer self.allocator.free(bm25_results);
 
-        // 3. 合并初始结果
+        // 3. Merge the initial results
         var merged_scores = std.AutoHashMap(u64, f32).init(self.allocator);
         defer merged_scores.deinit();
 
-        // 合并向量结果
+        // Merge the vector results
         for (vector_results) |res| {
             const score = res.score * vw;
             try merged_scores.put(res.cell_id, score);
         }
 
-        // 合并BM25结果
+        // Merge the BM25 results
         for (bm25_results) |res| {
             const score = res.score * bw;
             if (merged_scores.get(res.cell_id)) |existing| {
@@ -1829,7 +1831,7 @@ pub const HybridRetriever = struct {
             }
         }
 
-        // 4. 超图多跳扩展
+        // 4. Hypergraph multi-hop expansion
         var start_nodes = try self.allocator.alloc(u64, merged_scores.count());
         defer self.allocator.free(start_nodes);
         
@@ -1847,7 +1849,7 @@ pub const HybridRetriever = struct {
         );
         defer self.allocator.free(graph_results);
 
-        // 合并图结果
+        // Merge the graph results
         for (graph_results) |cell| {
             const score = cell.getWeight() * gw;
             if (merged_scores.get(cell.id)) |existing| {
@@ -1857,7 +1859,7 @@ pub const HybridRetriever = struct {
             }
         }
 
-        // 5. 最终排序
+        // 5. Final ranking
         var final_results = std.ArrayList(struct {
             cell: *core.MemCell,
             score: f32,
@@ -1874,7 +1876,7 @@ pub const HybridRetriever = struct {
             }
         }
 
-        // 排序（分数从高到低）
+        // Sort (score, high to low)
         std.sort.sort(struct {
             cell: *core.MemCell,
             score: f32,
@@ -1884,7 +1886,7 @@ pub const HybridRetriever = struct {
             }
         }.lessThan);
 
-        // 截取前top_k个
+        // Keep the first top_k
         const count = @min(final_results.items.len, options.top_k);
         var result = try self.allocator.alloc(*core.MemCell, count);
         for (0..count) |j| {
@@ -1896,8 +1898,8 @@ pub const HybridRetriever = struct {
 };
 ```
 
-## 三、更新系统入口点（src/main.zig）
-展示完整的记忆创建、关联和混合检索流程。
+## C3. Updated System Entry Point (src/main.zig)
+Shows the full flow of creating and linking memories and retrieving them with hybrid retrieval.
 
 ```zig
 const std = @import("std");
@@ -1909,29 +1911,29 @@ const storage = @import("storage/lsm_store.zig");
 const retrieval = @import("retrieval/hybrid_retriever.zig");
 
 pub fn main() !void {
-    // 初始化分配器
+    // Initialize the allocator
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    // 初始化Zig 0.17 新IO运行时
+    // Initialize the new Zig 0.17 IO runtime
     var io = try Io.init(.{});
     defer io.deinit();
 
-    // 初始化存储引擎
+    // Initialize the storage engine
     var store = try storage.LSMStore.init(allocator, "everos.db");
     defer store.deinit();
 
-    // 初始化超图引擎
+    // Initialize the hypergraph engine
     var hypergraph = try hypermem.HyperMemEngine.init(allocator);
     defer hypergraph.deinit();
 
-    // 初始化三源记忆管理器
+    // Initialize the tri-source memory manager
     var tri_source = try memory.TriSourceManager.init(allocator, &hypergraph);
     defer tri_source.deinit();
 
-    // 初始化检索组件
-    var vector_index = retrieval.PQVectorIndex.init(allocator, 384); // 384维向量
+    // Initialize the retrieval components
+    var vector_index = retrieval.PQVectorIndex.init(allocator, 384); // 384-dimensional vectors
     defer vector_index.deinit();
 
     var bm25_retriever = retrieval.BM25Retriever.init(allocator);
@@ -1945,27 +1947,27 @@ pub fn main() !void {
     );
 
     // ==============================================
-    // 示例1：创建完整的三源闭环记忆
+    // Example 1: create a complete tri-source loop of memories
     // ==============================================
-    std.debug.print("\n=== 创建三源闭环记忆 ===\n", .{});
+    std.debug.print("\n=== Creating the tri-source loop of memories ===\n", .{});
 
-    // 1. 感知源记忆：用户输入
+    // 1. Sensory memory: user input
     const sensory_cell = core.MemCell{
         .id = 0,
         .source = .sensory,
-        .episode = "用户询问如何使用Zig语言开发AI Agent记忆系统",
+        .episode = "The user asks how to build an AI agent memory system in Zig",
         .atomic_facts = &.{
             .{
-                .subject = "用户",
-                .predicate = "询问",
-                .object = "Zig开发AI Agent记忆系统",
+                .subject = "user",
+                .predicate = "asks about",
+                .object = "building an AI agent memory system in Zig",
                 .confidence = 1.0,
-                .source = "用户输入",
+                .source = "user input",
             },
         },
         .foresight = &.{
             .{
-                .description = "用户可能需要Zig代码示例",
+                .description = "The user may need Zig code examples",
                 .valid_from = std.time.milliTimestamp(),
                 .valid_until = std.time.milliTimestamp() + 3600 * 1000,
                 .confidence = 0.8,
@@ -1976,27 +1978,27 @@ pub fn main() !void {
         .importance = 0.8,
     };
     const sensory_id = try tri_source.addMemory(sensory_cell);
-    std.debug.print("添加感知源记忆 ID: {}\n", .{sensory_id});
+    std.debug.print("Added sensory memory ID: {}\n", .{sensory_id});
 
-    // 2. 认知源记忆：大模型推理结果
+    // 2. Cognitive memory: LLM reasoning result
     const cognitive_cell = core.MemCell{
         .id = 0,
         .source = .cognitive,
-        .episode = "Zig适合开发高性能记忆系统，因为它无GC、内存安全、支持异步IO",
+        .episode = "Zig suits high-performance memory systems: it has no GC, it is memory safe and it supports async IO",
         .atomic_facts = &.{
             .{
                 .subject = "Zig",
-                .predicate = "适合开发",
-                .object = "高性能记忆系统",
+                .predicate = "is suited for building",
+                .object = "high-performance memory systems",
                 .confidence = 0.9,
-                .source = "大模型推理",
+                .source = "LLM reasoning",
             },
             .{
                 .subject = "Zig",
-                .predicate = "特性",
-                .object = "无GC",
+                .predicate = "feature",
+                .object = "no GC",
                 .confidence = 1.0,
-                .source = "Zig官方文档",
+                .source = "Zig official documentation",
             },
         },
         .foresight = &.{},
@@ -2005,20 +2007,20 @@ pub fn main() !void {
         .importance = 0.9,
     };
     const cognitive_id = try tri_source.addMemory(cognitive_cell);
-    std.debug.print("添加认知源记忆 ID: {}\n", .{cognitive_id});
+    std.debug.print("Added cognitive memory ID: {}\n", .{cognitive_id});
 
-    // 3. 行动源记忆：工具调用结果
+    // 3. Action memory: tool call result
     const action_cell = core.MemCell{
         .id = 0,
         .source = .action,
-        .episode = "生成了Zig实现的MemCell数据结构代码",
+        .episode = "Generated the MemCell data structure code in Zig",
         .atomic_facts = &.{
             .{
-                .subject = "系统",
-                .predicate = "生成",
-                .object = "Zig MemCell代码",
+                .subject = "system",
+                .predicate = "generated",
+                .object = "Zig MemCell code",
                 .confidence = 1.0,
-                .source = "代码生成工具",
+                .source = "code generation tool",
             },
         },
         .foresight = &.{},
@@ -2027,41 +2029,41 @@ pub fn main() !void {
         .importance = 0.7,
     };
     const action_id = try tri_source.addMemory(action_cell);
-    std.debug.print("添加行动源记忆 ID: {}\n", .{action_id});
+    std.debug.print("Added action memory ID: {}\n", .{action_id});
 
-    // 4. 创建三源闭环超边
+    // 4. Create the tri-source loop hyperedge
     const closure_edge_id = try hypergraph.createTriSourceClosure(
         sensory_id,
         cognitive_id,
         action_id,
         0.95
     );
-    std.debug.print("创建三源闭环超边 ID: {}\n", .{closure_edge_id});
+    std.debug.print("Created tri-source loop hyperedge ID: {}\n", .{closure_edge_id});
 
     // ==============================================
-    // 示例2：添加向量和关键词索引
+    // Example 2: add vector and keyword indexes
     // ==============================================
-    std.debug.print("\n=== 构建检索索引 ===\n", .{});
+    std.debug.print("\n=== Building the retrieval indexes ===\n", .{});
 
-    // 模拟向量（实际应使用Embedding模型生成）
+    // Simulated vector (use an embedding model in practice)
     const dummy_vector = [_]f32{0.1} ** 384;
     
     try vector_index.addVector(sensory_id, &dummy_vector);
     try vector_index.addVector(cognitive_id, &dummy_vector);
     try vector_index.addVector(action_id, &dummy_vector);
 
-    // 添加到BM25索引
+    // Add to the BM25 index
     try bm25_retriever.addDocument(sensory_id, sensory_cell.episode);
     try bm25_retriever.addDocument(cognitive_id, cognitive_cell.episode);
     try bm25_retriever.addDocument(action_id, action_cell.episode);
 
     // ==============================================
-    // 示例3：执行混合检索
+    // Example 3: run hybrid retrieval
     // ==============================================
-    std.debug.print("\n=== 执行混合检索 ===\n", .{});
+    std.debug.print("\n=== Running hybrid retrieval ===\n", .{});
 
-    const query = "Zig开发AI记忆系统";
-    const query_vector = [_]f32{0.12} ** 384; // 模拟查询向量
+    const query = "Building an AI memory system in Zig";
+    const query_vector = [_]f32{0.12} ** 384; // Simulated query vector
 
     const results = try hybrid_retriever.retrieve(
         query,
@@ -2070,9 +2072,9 @@ pub fn main() !void {
     );
     defer allocator.free(results);
 
-    std.debug.print("检索到 {} 条相关记忆:\n", .{results.len});
+    std.debug.print("Retrieved {} related memories:\n", .{results.len});
     for (results, 0..) |cell, idx| {
-        std.debug.print("{}. [{}] {} (重要性: {d:.2})\n", .{
+        std.debug.print("{}. [{}] {} (importance: {d:.2})\n", .{
             idx + 1,
             cell.source,
             cell.episode,
@@ -2081,22 +2083,22 @@ pub fn main() !void {
     }
 
     // ==============================================
-    // 示例4：持久化到磁盘
+    // Example 4: persist to disk
     // ==============================================
-    std.debug.print("\n=== 持久化记忆到磁盘 ===\n", .{});
+    std.debug.print("\n=== Persisting memories to disk ===\n", .{});
 
     const all_cells = &.{ sensory_id, cognitive_id, action_id };
     for (all_cells) |cell_id| {
         if (tri_source.getMemory(cell_id)) |cell| {
             try store.writeAsync(io, cell);
-            std.debug.print("持久化记忆 ID: {}\n", .{cell_id});
+            std.debug.print("Persisted memory ID: {}\n", .{cell_id});
         }
     }
 
-    std.debug.print("\n✅ TriSource-EverOS 演示完成！\n", .{});
+    std.debug.print("\n✅ TriSource-EverOS demo complete!\n", .{});
 }
 
-// 单元测试入口
+// Unit test entry
 test "All tests" {
     std.testing.refAllDecls(@This());
     std.testing.refAllDecls(@import("hypermem/engine.zig"));
@@ -2104,34 +2106,34 @@ test "All tests" {
 }
 ```
 
-## 四、编译运行指南
-1. **安装Zig 0.17**：
+## C4. Build and Run Guide
+1. **Install Zig 0.17**:
    ```bash
-   # 下载Zig 0.17开发版（推荐版本：0.17.0-dev.3000+）
+   # Download the Zig 0.17 dev build (recommended version: 0.17.0-dev.3000+)
    wget https://ziglang.org/builds/zig-linux-x86_64-0.17.0-dev.3000+8c8f0e530.tar.xz
    tar -xf zig-linux-x86_64-0.17.0-dev.3000+8c8f0e530.tar.xz
    sudo mv zig-linux-x86_64-0.17.0-dev.3000+8c8f0e530 /opt/zig
    export PATH=/opt/zig:$PATH
    ```
 
-2. **创建项目结构**：
-   按照之前的目录结构创建所有文件，将上述代码复制到对应位置。
+2. **Create the project structure**:
+   Create all files following the directory layout above and copy the code above into the matching places.
 
-3. **编译运行**：
+3. **Build and run**:
    ```bash
-   # 编译并运行
+   # Build and run
    zig build run
    
-   # 运行单元测试
+   # Run unit tests
    zig build test
    
-   # 编译Release版本
+   # Build the Release version
    zig build -Doptimize=ReleaseFast
    ```
 
-## 五、下一步扩展建议
-1. **集成真实Embedding模型**：使用`llama.cpp`的C API集成BGE-small-zh等轻量级嵌入模型，替换示例中的dummy向量
-2. **实现记忆巩固引擎**：定期运行聚类算法，将相似MemCell合并为抽象语义记忆
-3. **添加遗忘机制**：实现时间衰减和频次衰减算法，自动清理低价值记忆
-4. **完善GHW目标管理**：将目标树与检索引擎集成，优先召回与当前目标相关的记忆
-5. **添加Web API**：使用Zig的`std.http`实现RESTful API，供其他Agent调用
+## C5. Suggested Next Steps
+1. **Integrate a real embedding model**: use the C API of `llama.cpp` to integrate a lightweight embedding model such as BGE-small-zh, replacing the dummy vectors in the examples
+2. **Implement a consolidation engine**: run a clustering algorithm periodically and merge similar MemCells into abstract semantic memories
+3. **Add forgetting**: implement time decay and frequency decay to clean up low-value memories automatically
+4. **Finish GHW goal management**: integrate the goal tree with the retrieval engine so memories relevant to the current goal are recalled first
+5. **Add a Web API**: build a RESTful API with Zig's `std.http` for other agents to call
