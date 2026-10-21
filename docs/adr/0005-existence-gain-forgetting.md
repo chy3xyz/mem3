@@ -62,9 +62,59 @@ A **keyed fact** has non-empty trimmed subject, predicate and object. Two facts
 *conflict* iff subject and predicate match (normalised) and the object differs.
 "Newer" is **arrival order (`id`)**, not `created_at`, which callers can set.
 
-A cell is **superseded** iff *all* of its keyed facts are contradicted by newer
-cells (conservative: one contradicted fact out of two does not supersede it).
-A cell with no keyed facts is never superseded.
+**Only single-valued predicates can conflict** (see "Single-valued predicates"
+below). A fact whose predicate is not on the single-valued list is treated as
+multi-valued: a second value is an addition, not a correction, so it supersedes
+nothing and contributes nothing to `conflict_score`.
+
+A cell is **superseded** iff *every* fact it asserts is on the single-valued
+list *and* contradicted by a newer cell (conservative: one contradicted fact out
+of two does not supersede it, and a cell that also asserts a multi-valued fact
+is never hidden by a change to the single-valued one, because that fact is still
+true). A cell with no keyed facts is never superseded. A cell restored with
+`unsupersede` (`supersede_pinned`) is never superseded again.
+
+### Single-valued predicates
+
+`Config.supersede_mode` (CLI `--supersede=off|functional|all`, default
+`functional`; `--no-supersede` = `off`):
+
+| mode | which predicates can supersede |
+|---|---|
+| `functional` (default) | the list below, or the operator's own list |
+| `all` | every predicate: the first cut of this ADR, an explicit opt-in |
+| `off` | none |
+
+`--functional-predicates=a,b,c` **replaces** the built-in list; a leading `+`
+(`+is,role`) extends it; a trailing `*` is a prefix (`current_*`). Matching is on
+the normalised predicate (trimmed, lower-case, space/hyphen → `_`), so
+`Lives In` is `lives_in`. The list is process configuration (CLI flags on `add`,
+`forget`, `serve`, `mcp`), not per-call, and an unknown mode or a flag without a
+value is an error rather than a silent fallback.
+
+Built-in list (`memory/conflict.zig: default_functional`), with the reason for
+each entry and the case where it is wrong:
+
+| predicate | why it is on the list | known failure |
+|---|---|---|
+| `lives_in`, `resides_in` | one residence at a time | a person with two homes |
+| `located_in` | a thing is in one place | hierarchical use: `Paris located_in France` then `Paris located_in Europe` |
+| `works_at`, `employed_by` | one primary employer | a person with two jobs |
+| `has_status`, `status` | one current state | none known |
+| `version` | one current version of a thing | a thing with several maintained versions |
+| `name` | one primary name | aliases and nicknames |
+| `email` | one primary address | several addresses |
+| `owner` | one owner of a resource | co-ownership |
+| `born_in`, `birthday` | one value, ever; a different one is a correction | none known |
+| `current_*` | "the current X" is single-valued by construction | none known |
+
+Deliberately **not** on the list, although the request that asked for this
+suggested `is`: `is`, `has`, `owns`, `likes`, `prefers`, `uses`, `knows`,
+`role`, `title`. "Alice is a doctor" and "Alice is tall" are both true; `is`
+is the most multi-valued predicate there is. Every entry above has a failure
+case, so the list is a bet that those cases are rarer than the plain
+single-valued ones, not a proof; that is why it is configurable and why a
+wrong supersession is reversible (`unsupersede`).
 
 ```
 conflict_score(c) = importance(superseder(c))   if c is superseded, else 0
@@ -95,20 +145,40 @@ PCR holds: every forgotten cell moves to the fuzzy store (`is_fuzzy`,
 `fuzzed_at`), a superseded cell is only *marked* (`superseded_at`,
 `superseded_by`). Superseded cells are excluded from default `query` (CLI, HTTP,
 MCP) and returned with `--include-superseded` / `"includeSuperseded"` /
-`include_superseded`. `inspect` shows `superseded_at`, `superseded_by` and
-`supersedes`, and falls back to the fuzzy store; `dump` carries both fields and
-`--include-fuzzy` lists forgotten cells.
+`include_superseded`. `inspect` shows `superseded_at`, `superseded_by`,
+`supersede_pinned` and `supersedes`, and falls back to the fuzzy store; `dump`
+carries `superseded_at` / `superseded_by` / `supersede_pinned` on every line by
+default (and `--include-fuzzy` lists forgotten cells).
+
+**Audit.** A supersession is never silent: the `add` result (CLI `--json`, HTTP
+`POST /api/memcells`, MCP `memory_add`) carries
+`"superseded":[{"id":4,"subject":"user","predicate":"lives_in"}]`, naming each
+older cell and the predicate that justified it, and the human CLI line ends
+with `undo with mem3 unsupersede <id>`.
+
+**Reversal.** `mem3 unsupersede <id>` (MCP `memory_unsupersede {id}`) restores a
+superseded cell, including one already forgotten into the fuzzy store: clears
+`superseded_at` / `superseded_by` and sets `supersede_pinned`, which
+write-time detection and the sweep both honour, so the next sweep does not
+re-supersede it. It is journaled before it takes effect. An unknown id or a cell
+that is not superseded is an error, not a no-op. It does not un-forget a cell
+(there is still no `mem3 remember`, T084).
 
 ### 5. Persistence
 
 - **WAL**: a supersession is a `memcell_update (0x02)` record,
-  `{"id","superseded_at","superseded_by"}`, journaled *before* the in-memory
-  mutation. Builds that predate it ignore the record type, so an older binary
+  `{"id","superseded_at","superseded_by"}`, and its reversal is
+  `{"id","unsuperseded":true}`; both are journaled *before* the in-memory
+  mutation. Replay applies them in file order, so a WAL holding stamp then
+  reversal ends restored, and a reversal on top of a snapshot that still holds
+  the stamp wins. Builds that predate it ignore the record type, so an older binary
   reading a newer WAL still loads (and simply does not know the stamp).
   I chose this over trailing fields on `memcell_insert` because supersession
   happens *after* the old cell's insert is journaled; there is no insert
   record to append to.
-- **Snapshot v3**: each cell ends with `has_superseded_by u8 [+ u64]`. v1 and v2
+- **Snapshot v3**: each cell ends with a `flags u8 [+ superseded_by u64]`
+  (bit 0 = has `superseded_by`, bit 1 = `supersede_pinned`; the first v3 writer
+  stored 0/1 there, which reads unchanged). v1 and v2
   files still load (`superseded_by = null`). **A v3 file is refused by a v2
   build**, and a snapshot truncates the WAL, so *downgrading after a sync loses
   the data.* There is no downgrade path; this is the same trade v2 made.
@@ -163,10 +233,12 @@ the whole cost there.
 
 ## What was deliberately NOT done
 
-- **No single-/multi-valued predicate classification.** `user|likes|X` and
-  `user|likes|Y` are *treated as a conflict*. That is the main false-positive
-  risk (see Evaluation). A schema of functional predicates would fix it and
-  would be new product surface; it is not in the spec.
+- **No learned or schema-driven predicate classification.** Single-valued-ness
+  comes from a short built-in list or the operator's list. A predicate the list
+  does not name is treated as multi-valued even when it is really
+  single-valued (`shoe_size`): **those contradictions are no longer
+  superseded automatically.** That recall was given up on purpose (see
+  Evaluation, row (c)).
 - **Partial contradictions do not supersede.** Only a cell whose *every* keyed
   fact is contradicted.
 - **`Fact.confidence` is not used** (every ingest path writes 1.0).
@@ -195,59 +267,83 @@ the whole cost there.
 4. **`conflict_score` is the superseder's importance**, not a similarity.
 5. **`net_existence` uses undecayed importance**, with decay as its own rule,
    so age is not charged twice and the original behaviour is unchanged.
+6. **The spec's "two MemCells with conflicting atomic_facts" is narrowed to
+   single-valued predicates.** The first cut applied it to every predicate and
+   measured 120 of 180 multi-valued cells wrongly superseded (below). The
+   shipped default supersedes only listed predicates; `--supersede=all`
+   restores the literal reading.
 
 ## Evaluation
 
-`mem3-forgetting-eval --mode=netex` (seed 42; the same corpus is built twice,
-"before" being the decay-only forgetter reproduced by switching the new terms
-off). 1,100 cells: 400 unique, 60 duplicate groups of 4, 60 contradiction pairs,
-60 subjects × 3 "likes" values, 60 templated ticket pairs, 40 stale.
+`mem3-forgetting-eval --mode=netex` (seed 42, 1,220 cells). The same corpus is
+built three times: **decay_only** (the forgetter before net_existence, the new
+terms switched off), **all** (the first cut: every predicate single-valued,
+`--supersede=all`) and **functional** (the shipped default). Corpus: 400 unique,
+60 duplicate groups of 4, 60 `status` contradiction pairs (single-valued, on the
+list), 60 `shoe_size` contradiction pairs (single-valued in reality, **not** on
+the list), 60 subjects x 3 values of a rotating multi-valued predicate
+(`likes`/`knows`/`uses`/`prefers`/`speaks`/`visited`), 60 templated ticket pairs,
+40 stale.
 
-| measure | before | after |
-|---|---:|---:|
-| exact-copy pairs reduced to one cell | 0/60 | **60/60** |
-| most important member of a duplicate group kept | 60/60 | 60/60 |
-| 1-token near-duplicates (J≈0.86) forgotten | 0/60 | 0/60 (by design) |
-| unique high-importance cells forgotten | 0/400 | **0/400** |
-| stale cells forgotten (decay) | 40/40 | 40/40 |
-| contradicted (old) cells superseded | 0/60 | **60/60** |
-| contradiction pairs whose top-1 hit is the *current* value | 32/60 (53%) | **60/60 (100%)** |
-| **multi-valued** cells wrongly superseded | 0/180 | **120/180** |
-| **multi-valued** cells wrongly forgotten | 0/180 | **62/180** |
-| duplicate copies in top-5 (mean) | 4.00 | 3.00 |
+| measure | decay_only | all | **functional (default)** |
+|---|---:|---:|---:|
+| (a) `status` cells contradicted and superseded | 0/60 | 60/60 | **60/60** |
+| (a) pairs whose top-1 hit is the *current* value | 32/60 (53%) | 60/60 | **60/60 (100%)** |
+| (b) multi-valued cells wrongly superseded | 0/180 | 120/180 | **0/180** |
+| (b) multi-valued cells wrongly forgotten | 0/180 | 68/180 | **0/180** |
+| (c) `shoe_size` contradictions superseded | 0/60 | 60/60 | **0/60** |
+| (c) pairs whose top-1 hit is the *current* value | 21/60 (35%) | 60/60 | **21/60 (35%)** |
+| exact-copy pairs reduced to one cell | 0/60 | 60/60 | 60/60 |
+| most important member of a duplicate group kept | 60/60 | 60/60 | 60/60 |
+| unique cells forgotten | 0/400 | 0/400 | 0/400 |
+| stale cells forgotten (decay) | 40/40 | 40/40 | 40/40 |
 
-Across seeds 1, 2, 3 and 42 I re-checked only: exact-copy pairs (60/60 each),
-unique cells forgotten (0/400 each), supersession precision (60/180 and 120
-multi-valued false marks, each) and the top-1 row (25–32/60, i.e. 42–53%,
-before; 60/60 after). The other rows are seed 42 only. Reading it honestly:
+Rows (a), (b) and (c) are asserted, not just printed: the harness exits non-zero
+if the default arm supersedes or forgets a multi-valued or unknown-predicate
+cell, fails to supersede a contradicted `status` cell, or forgets a unique one.
+The same properties are tests (`tests/integration/supersede_e2e.zig`,
+`tests/unit/supersede_policy.zig`). Seeds 1, 2 and 3 give the same (a), (b) and
+(c) supersession numbers (60/60, 0/180, 0/60 for functional; 120/180 false marks
+for `all`); the top-1 figures vary by seed (decay_only 40-53% for (a), 35-58% for
+(c)); `all` forgets 55, 64, 58 multi-valued cells on seeds 1, 2, 3.
 
-- **Benefit that shows:** exact duplicates collapse, contradictions are marked
-  and a default query returns the current value every time instead of about half
-  the time.
-- **No benefit shown for near-duplicates**: by design they are lowered, not
-  forgotten, so the duplicate-crowding measure improves only from 4.00 to 3.00.
-- **A real cost:** the subject+predicate key is wrong for multi-valued
-  predicates. 120 of 180 `likes` cells were marked superseded and 62 of those
-  *forgotten* (to the fuzzy store; recoverable, but gone from recall). That is a
-  precision of 33% on supersession (60 true of 180 marked), which is what the
-  `supersede_on_conflict` switch exists for. A user storing multi-valued
-  predicates should turn it off until predicate schemas exist.
-- Templated tickets that differ by one token were not forgotten (0/120 on seeds
-  1–3; 1/120 on seed 42, which I attribute to the generator drawing the same
-  ticket number twice and so producing an exact duplicate — **not verified**).
+What the numbers say, honestly:
 
-The evaluation corpus is synthetic and authored by me alongside the code it
-tests. It shows the mechanisms work as defined; it says nothing about how often
-real memory stores contain these patterns.
+- **The cost of the first cut is gone**: 0 wrongly superseded and 0 wrongly
+  forgotten multi-valued cells, down from 120 and 68.
+- **The recall given up is real.** Row (c): 60 genuine contradictions that the
+  first cut superseded are now left alone, so a query for `shoe_size` returns
+  both values and the old one ranks first in 39 of 60 queries on seed 42 (top-1
+  current 21/60 = the same as with no supersession at all). This is the chosen
+  trade: a stale value shown beside its correction is recoverable by the reader;
+  a true value hidden from recall is not visible to anyone. If you know your
+  single-valued predicates, name them with `--functional-predicates`.
+- **Row (a) is unchanged** by the narrowing: listed predicates still supersede
+  60/60 and the current value is the top hit every time.
+- Near-duplicates are still lowered, not forgotten, so duplicate crowding in the
+  top 5 improves only from 4.00 to 3.00.
+- A superseded cell can still be *forgotten* (31 of 60 `status` old cells here):
+  that happens only when its superseder is more important, it goes to the fuzzy
+  store (not deleted), and `unsupersede` still works on it.
+
+The corpus is synthetic and authored by me alongside the code it tests. The
+`shoe_size` and `likes` families were chosen to be the cases the design is
+about; the evaluation says nothing about how often real memory stores contain
+them, nor how often a *listed* predicate is in fact multi-valued (the table
+above lists a failure case for each).
 
 ## Consequences
 
 - **Positive**: FR-010/FR-015 are implemented as written, with definitions that
   can be argued with because they are stated. `superseded_at` is finally set.
   A restart no longer loses forgotten cells.
-- **Negative**: default recall now hides superseded cells, and the heuristic key
-  hides *legitimate* earlier values of multi-valued predicates. This is a
-  behaviour change visible to users of `memory_query`.
+- **Negative**: default recall hides superseded cells (a behaviour change visible
+  to users of `memory_query`), and a *listed* predicate that is multi-valued in
+  someone's data (two jobs, two emails) will still hide an earlier value. It is
+  reported on the add that caused it and reversible with `unsupersede`.
+- **Negative**: unlisted single-valued predicates are no longer superseded
+  automatically; stale values stay visible until the operator names the
+  predicate.
 - **Negative**: snapshot v3 is one-way.
-- **Open**: functional-predicate schemas; profiling the remaining superlinear
+- **Open**: predicate schemas beyond a flat list; a way to see all pins; profiling the remaining superlinear
   wall time on a dense templated corpus; a real (non-synthetic) corpus.

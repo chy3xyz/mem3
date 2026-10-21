@@ -424,7 +424,8 @@ fn meanTop5(s: Side) f64 {
     return if (s.dup_queries == 0) 0.0 else @as(f64, @floatFromInt(s.dup_members_in_top5)) / @as(f64, @floatFromInt(s.dup_queries));
 }
 
-/// Returns false if a guarantee of the default (functional) arm is broken.
+/// Prints the table, then fails with `error.GuaranteeBroken` if a guarantee of the
+/// default (functional) arm does not hold.
 pub fn runNetex(alloc: Allocator, seed: u64, shape: Shape) !void {
     const sides = [3]Side{
         try evaluate(alloc, seed, shape, .decay_only),
