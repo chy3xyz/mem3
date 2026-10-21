@@ -2223,6 +2223,14 @@ test "HNSW: graph fingerprint, shipped config, 400 x 32" {
     try std.testing.expectEqual(@as(u64, 5441432509814034711), fp);
 }
 
+test "HNSW: graph fingerprint, dim 100 (vector body plus scalar tail), 1000 x 100" {
+    if (comptime !fingerprint_pinned) return error.SkipZigTest;
+    var cfg = Config{};
+    cfg.hnsw_ef_construction = 100;
+    const fp = try fingerprintOf(std.testing.allocator, 1000, 100, cfg);
+    try std.testing.expectEqual(@as(u64, 3420897809111039506), fp);
+}
+
 test "HNSW: graph fingerprint, small m and efc, 1500 x 24" {
     var cfg = Config{};
     cfg.hnsw_m = 8;
