@@ -130,6 +130,11 @@ fn diag(comptime fmt: []const u8, args: anytype) void {
     /// substituted: the tool is long-lived and takes its model path from
     /// its own arguments.
     embedder_args: []const []const u8 = &.{},
+    /// WAL durability mode. `.always` (the default) is the historical
+    /// fsync-per-record path, byte-for-byte; `.group` shares one fsync
+    /// between concurrent writers and still acknowledges only after it;
+    /// `.interval_ms` is explicitly weaker. See `Config.WalSync`.
+    wal_sync: Config.WalSync = .always,
 };
 
 /// In-process memory store. Composes TriSourceManager + GoalPoset +
@@ -180,6 +185,10 @@ pub const Store = struct {
     snapshot_path: []u8,
     /// `<data_dir>/mem3.wal`. Borrowed. Empty string when in-memory.
     wal_path: []u8,
+    /// Durability mode the WAL is (re)opened with. Kept on the Store, not
+    /// read back off the live WAL, because `takeSnapshot` builds a new WAL
+    /// object and must give it the same mode.
+    wal_sync: Config.WalSync = .always,
     /// Set to true after `deinit` — guards double-free.
     deinit_called: bool = false,
 
@@ -332,6 +341,7 @@ pub const Store = struct {
         );
 
         // Persistence (optional)
+        self.wal_sync = opts.wal_sync;
         if (opts.data_dir) |dir| {
             try self.openAndReplayPersistence(dir);
         }
@@ -1871,6 +1881,10 @@ pub fn encodeGoalWALPayloadRaw(
             // only; the snapshot copy is unaffected.
             const goal_stats = self.rejournalGoals(wal_ptr);
             self.rejournalHyperedges(wal_ptr);
+            // The re-journal above ran in the fresh WAL's default `.always`
+            // mode, exactly as before this setting existed; only records
+            // appended from here on use the configured mode.
+            wal_ptr.setSync(self.wal_sync);
             if (goal_stats.failed > 0) {
                 diag("snapshot: {d}/{d} goal records failed to re-journal into the fresh WAL (the snapshot copy is unaffected)", .{ goal_stats.failed, goal_stats.attempted });
             }
@@ -1968,6 +1982,7 @@ pub fn encodeGoalWALPayloadRaw(
             return;
         };
         std.log.info("WAL: opened {s} (replay={d} bytes)", .{ self.wal_path, existing.items.len });
+        wal_ptr.setSync(self.wal_sync);
         self.wal = wal_ptr;
 
         try self.loadSnapshot();
@@ -2078,7 +2093,9 @@ pub fn encodeGoalWALPayloadRaw(
                 ctx_ptr.count.* += 1;
             }
         }.cb) catch |err| {
-            log.warn("WAL replay stopped at record {d}: {}", .{ replay_count, err });
+            // `diag`: a torn tail is a legitimate, tested input, and the test runner
+            // dies on any log line it did not expect.
+            diag("WAL replay stopped at record {d}: {}", .{ replay_count, err });
         };
         if (max_replayed_id > 0) {
             _ = self.ids.fetchMax(max_replayed_id + 1, .monotonic);

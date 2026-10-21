@@ -61,12 +61,14 @@ comptime {
     _ = @import("fs.zig");
     _ = @import("stdio.zig");
     _ = @import("env.zig");
+    _ = @import("signal.zig");
 }
 
 pub const clock = @import("clock.zig");
 pub const fs = @import("fs.zig");
 pub const stdio = @import("stdio.zig");
 pub const env = @import("env.zig");
+pub const signal = @import("signal.zig");
 
 // Direct re-exports for the common cases.
 pub const nowRealtimeMs = clock.realtimeMs;

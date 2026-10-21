@@ -327,8 +327,25 @@ sources), `--goal-ids` (comma-separated ids). With `--json` it prints
 `{"query":[ids...],"count":N}`.
 
 Global flags: `--json`, `--data-dir=<path>` (default `data`), `--log-format=human|jsonl|silent`,
-`--log-every=<seconds>`, `--embedder-cmd=<path>`, `--embedder-arg=<arg>`
-(repeatable), `--dry-run`, `--help`, `--version`.
+`--log-every=<seconds>`, `--wal-sync=always|group|interval:<ms>`,
+`--embedder-cmd=<path>`, `--embedder-arg=<arg>` (repeatable), `--dry-run`,
+`--help`, `--version`.
+
+`--wal-sync` (serve, mcp, add and every command that opens a store): `always`
+(default) fsyncs every record before the write returns. `group` still
+acknowledges a write only after an fsync that covers it, but concurrent
+writers share one; the daemon then serves connections on threads. `interval:N`
+fsyncs at most every N ms and is **weaker**: an OS crash or power cut can lose
+up to ~N ms (+ a 100 ms tick) of acknowledged writes (a process crash loses
+nothing). The on-disk WAL bytes are identical in all modes. On the measured
+host `group` was not faster than `always` (see
+[`docs/roadmap.md`](docs/roadmap.md)).
+
+`serve` and `mcp` exit 0 on SIGINT/SIGTERM after draining in-flight requests
+and flushing the WAL. Logging is off unless asked: `--log-format=jsonl` writes
+one JSON object per line to **stderr** (startup, maintenance, summary,
+shutdown events, nothing else); `--log-every=N` adds a summary every N
+seconds; `--log-format=silent` also suppresses the startup banner.
 
 `serve` flags: `--port=<n>` (default 7777), `--bind=<addr>` (default 127.0.0.1).
 
@@ -654,7 +671,7 @@ extends the file on the next run.
 
 ```bash
 ./scripts/verify.sh           # everything below, plus provenance and a not-verified list
-zig build test                # 462 tests (378 + 84)
+zig build test                # 507 tests (407 + 100)
 zig build check-constitution  # 12 constitution invariants
 zig build bench
 python3 scripts/mcp_conformance.py   # drives a live `mem3 mcp` over stdio
@@ -685,8 +702,8 @@ snippets and a 5-minute self-check for the rest are in
 
 `zig build test` runs two binaries — one rooted at `src/main.zig` and one at
 `tests/main.zig` (unit, integration and property tests under `tests/`). The
-counts above are what the two binaries actually report: `378/378` and `84/84`,
-for `462/462 tests passed` overall.
+counts above are what the two binaries actually report: `407/407` and `100/100`,
+for `507/507 tests passed` overall.
 
 **Zig collects `test` blocks only from files named directly in a root source
 file's `comptime { _ = @import(...) }` block, exactly one level deep.** A file
@@ -702,8 +719,8 @@ Because `zig build test` re-runs are served from the build cache and report gree
 without re-executing, drive the roots directly when you need a real count:
 
 ```bash
-zig test --dep mem3 -Mroot=src/main.zig  -Mmem3=src/lib.zig   # -> All 378 tests passed.
-zig test --dep mem3 -Mroot=tests/main.zig -Mmem3=src/lib.zig   # -> All 84 tests passed.
+zig test --dep mem3 -Mroot=src/main.zig  -Mmem3=src/lib.zig   # -> All 407 tests passed.
+zig test --dep mem3 -Mroot=tests/main.zig -Mmem3=src/lib.zig   # -> All 100 tests passed.
 zig test --dep mem3 -Mroot=tests/constitution/main.zig -Mmem3=src/lib.zig  # -> All 12 tests passed.
 ```
 
@@ -769,8 +786,10 @@ Known and measured, not discovered after the fact:
   **0.6760** (n=30k), **0.4300** (n=100k) at the default `ef=100`, reaching
   0.9890 only at ef=3200. Saturation needs roughly `ef ≈ 0.08·n`, so the
   default is a small-corpus setting: say nothing about a 100k index at `ef=100`.
-- **The WAL fsyncs on every record**, costing ~1.2 ms per durable append. There
-  is no group commit.
+- **The WAL fsyncs on every record by default**, costing ~1.2 ms per durable
+  append in an earlier measurement. `--wal-sync=group|interval:N` exist but
+  were not faster on the measured host (fsync was ~30 µs there); see
+  [`docs/roadmap.md`](docs/roadmap.md).
 - **The daemon's HTTP stack is POSIX-only.** Raw `socket`/`bind`/`listen`/
   `accept` and a libc `pthread_mutex_t`; this is the stated reason Windows is
   not a supported target. See [Supported platforms](#supported-platforms).
@@ -890,7 +909,8 @@ range, not the best one — the spread is nearly 40% run to run.
 The cause is **HNSW insert, not fsync**, and that attribution has been measured
 rather than assumed: a phase profile of the write pipeline puts `hnsw.insert` at
 ~55% of the cost and the embedder at ~42%, with the `Store`'s own code under 3%.
-Group commit would not move this number. A cheaper insert path would.
+Group commit does not move this number (`--wal-sync=group` was measured against
+it and sat inside run-to-run noise). A cheaper insert path would.
 
 The embedder share is smaller than it looks, and **an earlier revision of this
 document got the reason wrong by two orders of magnitude.** It claimed that at

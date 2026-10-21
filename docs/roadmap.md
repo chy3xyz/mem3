@@ -9,6 +9,24 @@ Current version: **`0.1.0-alpha`**. Supported targets: **macOS and Linux**.
 
 ## Recently closed
 
+- **WAL group commit, opt-in** (`--wal-sync=always|group|interval:N`; default
+  `always` is byte-identical to before). `group` acknowledges a write only
+  after an fsync that covers it (leader/follower, the store lock is *not* held
+  across the fsync); `interval:N` is explicitly weaker and can lose up to ~N ms
+  (+ a 100 ms tick) of acknowledged writes to an OS crash or power cut. A
+  failed fsync is never acknowledged, and a later successful one never blesses
+  earlier records. **Measured on this host, it does not make writes faster**
+  (see "Write throughput" below): fsync here costs ~30 µs, `hnsw.insert` under
+  the store lock dominates, so 1,600 concurrent writes shared 16 fsyncs. The
+  feature is closed as *correct and available*, not as *a speedup*; its payoff
+  needs a slow fsync (a Linux disk), which has **not been measured**.
+- **Daemon hygiene** (T092/T095/T101/T102): `serve` and `mcp` stop cleanly on
+  SIGINT/SIGTERM (exit 0, in-flight requests drained, WAL flushed; `mcp`
+  snapshots a dirty store as it always did on EOF); `--log-format` and
+  `--log-every` are wired to a stderr logger (`--log-format=jsonl` is pure
+  JSONL); the default stays silent. Rotation is external
+  ([`deploy/logrotate.conf`](deploy/logrotate.conf), not run under a real
+  logrotate).
 - **MCP server** (`mem3 mcp`, JSON-RPC 2.0 over stdio, hand-written, zero
   dependencies). Five tools: `memory_add`, `memory_query`, `goal_list`,
   `memory_forget`, `memory_stats`. `memory_forget` defaults to `dry_run: true`,
@@ -148,6 +166,27 @@ Target: **10,000 cells/sec** at release.
 | ReleaseFast (durable path) | **2,779 – 3,898 cells/sec** |
 
 600-cell in-memory corpus, via `mem3 bench`.
+
+**WAL durability modes (2026-10-21, A/B interleaved, 5 rounds, loaded host,
+load average 30–100).** Concurrent HTTP writers against the real daemon
+(`scripts/wal_loadtest.py`, 16 threads × 2,400 writes, 200-write windows,
+ReleaseFast; "base" is the pre-change build):
+
+| Variant | Median overall /s | Median worst window /s | Min worst window /s |
+|---|---|---|---|
+| base | 767.9 | 615.7 | 503.0 |
+| `always` (new build) | 727.5 | 560.7 | 344.1 |
+| `group` | 745.3 | 527.1 | 349.2 |
+| `interval:50` | 870.0 | 661.8 | 355.2 |
+
+The spread inside one variant (344–616) is larger than the gap between
+variants: **no variant is distinguishable from another on this host.**
+Single-threaded `mem3-bench throughput --scale=0.4`, 5 interleaved rounds,
+base vs new build: median overall 1,240 vs 1,170 cells/sec, median worst
+window 942 vs 942, min worst window 839 vs 759; `met_target` was `false` in
+every run. These loaded-host numbers are *not* the 2,779–3,898 figures above
+and are not comparable to them. Amortisation, from the daemon's own summary
+line over 1,600 concurrent writes: `always` 1,600 fsyncs, `group` 1,584.
 
 **The cause is HNSW insert, not fsync.** `hnsw.insert` costs ~899 µs/op
 amortised — comparable to the ~1.2 ms per-record WAL fsync, and larger than the
@@ -356,8 +395,15 @@ raw text. See `scripts/embedder_adapter_example.py`.
   constitution both state < 30s for 100k vectors; measured is **430.6 s**
   (dim=384, efc=200, whole-index build). Cost of the recall fix, which keeps
   more edges alive. `efc=100` roughly halves it and still misses.
-- **No group commit.** `wal.append` fsyncs on every record (~1.2 ms). Currently
-  not the dominant write cost, but it will become one once insert is fixed.
+- **Group commit is opt-in and unproven as a speedup.** Default `wal.append`
+  still fsyncs every record. `--wal-sync=group` exists and loses no
+  acknowledged write across `kill -9` in the e2e test, but on the measured
+  host (macOS, plain `fsync`, not `F_FULLFSYNC`) it is within noise of
+  `always`. Whether it pays on a Linux disk has not been measured.
+- **The daemon parses a request from one `read(2)`.** A client that sends
+  head and body as two writes (Python `http.client` does) can get a 400. Found
+  while writing `scripts/wal_loadtest.py`, identical on the pre-change build,
+  not fixed here.
 - **The on-disk format is unstable.** `0.1.0-alpha`, no external users, no
   stability guarantee.
 - **Licence: MIT** (`LICENSE`, added 2026-10-21; copyright holder is the
