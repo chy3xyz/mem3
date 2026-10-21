@@ -4,7 +4,7 @@
 
 ## Context
 
-The paper's `ghw_memory_system.agent.final.md` §3.2.1 establishes a formal mapping from the three sources (M/F/S) to the GHW three layers (Goal/Harness/World). The paper is written in Chinese; the quotation below is translated:
+The paper's `ghw_memory_system.agent.final.md` §3.2.1 establishes a formal mapping from the three sources (M/F/S) to the GHW three layers (Goal/Harness/World). The quotation below is translated from the paper's Chinese text:
 
 > The directionality of the spirit source becomes goal generation in the Goal layer.
 > The representational power of the form source becomes regulatory capacity in the Harness layer.
