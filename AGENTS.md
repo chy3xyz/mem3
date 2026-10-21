@@ -67,6 +67,7 @@ src/
 ├── core/                     # GHW L1 基础层: types, errors, ids, config
 ├── ghw/                      # GHW L2: goal_tree, goal_node, harness_registry, world_model
 ├── memory/                   # GHW L3: tri_source_manager, lifecycle, encoder, consolidator,
+│                             #   cluster_index (incremental single-linkage state),
 │                             #   forgetter, fuzzy, coherence
 ├── hypermem/                 # GHW L4: engine, hyperedge, multi_hop, msg_passing, graph_index
 ├── retrieval/                # GHW L4: hnsw, kv_index, keyword, hybrid_retriever, reranker,
@@ -99,10 +100,11 @@ src/
 
 tests/
 ├── main.zig                  # Master test runner (comptime-imports everything)
-├── unit/                     # cli, coherence, consolidator, hnsw
+├── unit/                     # cli, coherence, consolidator, consolidator_incremental, hnsw
 ├── integration/
 │   ├── store_persistence_e2e.zig   # insert, goal, snapshot+replay, forget+restart, isolation
-│   └── http_server_e2e.zig         # /healthz, POST+GET /api/memcells, restart preservation
+│   ├── http_server_e2e.zig         # /healthz, POST+GET /api/memcells, restart preservation
+│   └── consolidate_incremental_e2e.zig  # Store-owned cache, forget tracking, abstract foresight via WAL
 ├── property/                 # Randomized round-trip coverage
 │   ├── serializer_roundtrip.zig    # Fact slice, primitives, array of struct
 │   └── adjoint.zig                 # every encoded record decodes back; replay is idempotent
@@ -120,7 +122,7 @@ tests/
 | `mem3 hyperedge` | ✅ | `add` / `list` / `multi-hop` |
 | `mem3 dump` | ✅ | JSONL export of the full store |
 | `mem3 inspect` | ✅ | MemCell + hypergraph neighborhood; emits valid JSON |
-| `mem3 consolidate` | ✅ | HAC clustering, abstract generation, PCR preserved |
+| `mem3 consolidate` | ✅ | HAC clustering, abstract generation, PCR preserved. Incremental across passes within one process (`Store` owns the cache); a fresh CLI process does one full O(n²) pass |
 | `mem3 forget` | ✅ | Existence-gain-driven forgetting sweep |
 | `mem3 bench` | ✅ | Fast in-process smoke suite; the release gate is `zig build bench` |
 | `mem3 serve` | ✅ | HTTP daemon with /healthz /metrics /api/sync /api/memcells /api/memcells/:id |
@@ -129,7 +131,7 @@ tests/
 | Lexical arm | ✅ | `src/retrieval/bm25.zig`, Okapi BM25 over unigrams + bigrams, max-normalised inside the existing `λ_dense=0.5 / λ_sparse=0.2 / λ_graph=0.3` sum. Rebuilt from cells on snapshot restore, never serialised. Identifiers that live only in an `atomic_facts` triple went from 1/12 recall to 12/12 |
 | Persistence | ✅ | WAL-first + snapshot. WAL truncated on sync. `--wal-sync=always\|group\|interval:N` (default `always`, byte-identical); `interval` is weaker and documented as such. |
 | Daemon hygiene | ✅ | `serve`/`mcp` exit 0 on SIGINT/SIGTERM (`src/platform/signal.zig`: handler only stores an atomic; loops poll with a timeout). `--log-format`/`--log-every` feed `src/utils/logger.zig`; default is silent and byte-identical. JSONL goes to stderr only. |
-| Tests | ✅ | 507: 407 (`src/main.zig`-rooted) + 100 (`tests/main.zig`-rooted), plus 12 constitution invariants as a separate gate, 0 leaks |
+| Tests | ✅ | 541: 421 (`src/main.zig`-rooted) + 120 (`tests/main.zig`-rooted), plus 12 constitution invariants as a separate gate, 0 leaks |
 | Binary | ✅ | 963,704 bytes `ReleaseFast` / 4,569,032 bytes Debug, only links libSystem. The lexical arm added 49 KB ReleaseFast (+5.4%) over the 914,456 B measured before it |
 | Toolchain | ✅ | Pinned via `.zigversion` (Zig 0.17.0) |
 | Platforms | ✅ | macOS + Linux (x86_64 and aarch64). Windows/WASM refused at compile time — see [Platforms](#platforms) |
@@ -268,7 +270,7 @@ The current spec-kit artifacts:
 ## Testing
 
 ```bash
-# All tests: 507 (407 src/main.zig-rooted + 100 tests/main.zig-rooted)
+# All tests: 541 (421 src/main.zig-rooted + 120 tests/main.zig-rooted)
 zig build test
 
 # Just the constitution invariants (12, separate root)
@@ -288,8 +290,8 @@ without re-executing**. When you need a count you can trust, drive the roots
 directly:
 
 ```bash
-zig test --dep mem3 -Mroot=src/main.zig  -Mmem3=src/lib.zig   # All 407 tests passed.
-zig test --dep mem3 -Mroot=tests/main.zig -Mmem3=src/lib.zig   # All 100 tests passed.
+zig test --dep mem3 -Mroot=src/main.zig  -Mmem3=src/lib.zig   # All 421 tests passed.
+zig test --dep mem3 -Mroot=tests/main.zig -Mmem3=src/lib.zig   # All 120 tests passed.
 zig test --dep mem3 -Mroot=tests/constitution/main.zig -Mmem3=src/lib.zig  # All 12 tests passed.
 ```
 

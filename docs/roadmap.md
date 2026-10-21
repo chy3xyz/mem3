@@ -9,6 +9,68 @@ Current version: **`0.1.0-alpha`**. Supported targets: **macOS and Linux**.
 
 ## Recently closed
 
+- **Consolidation is incremental** (`Consolidator` + `src/memory/cluster_index.zig`).
+  The pass used to compare every cell pair: 1.01e9 pairs at 45,000 cells. The
+  union-find and a per-cell token signature (512 bits) now persist across passes
+  and only cells that arrived since the last pass are compared — against every
+  present cell and against each other, once each. The partition is **identical**
+  to the full recompute's: held by `tests/unit/consolidator_incremental.zig`
+  against an independent O(n²) oracle and a cold instance over randomized
+  add/forget, and at scale by an order-independent digest of every abstract's
+  text and importance, which matched between baseline and new builds in all
+  6 A/B pairs (5k/20k/45k × 2 runs) and in the 20k run with 50 cells forgotten
+  per pass. Measured with `mem3-consolidate-bench` (`zig build
+  example-consolidate-bench`; raw runs in
+  [`benchmarks/consolidation-incremental.md`](benchmarks/consolidation-incremental.md)), baseline = `main` at 03e588f, A/B interleaved,
+  2 runs per cell, long-run corpus shape, 400 cells ingested between passes.
+  **The host was heavily loaded (load average 55–80 on 10 cores)**, so absolute
+  times are inflated ~3× over the 20.3 s the long run recorded for the baseline
+  at 45k; use CPU time (not wall) and the ratios, not the absolutes.
+
+  | cells | pass kind | pairs base → new | CPU ms/pass base → new | speed-up |
+  |---:|---|---|---|---:|
+  | 5,000 | first (cold) | 1.25e7 → 1.25e7 | 747 → 785 | 0.95× (noise-level; same work) |
+  | ~5.9k | steady | 1.72e7 → 3.16e6 | 1,015 → 223 | 4.6× |
+  | 20,000 | first (cold) | 2.00e8 → 2.00e8 | 11,625 → 11,954 | 0.97× |
+  | ~20.9k | steady | 2.18e8 → 1.17e7 | 12,696 → 809 | 15.7× |
+  | 45,000 | first (cold) | 1.01e9 → 1.01e9 | 58,950 → 59,762 | 0.99× |
+  | ~45.9k | steady | 1.05e9 → 2.59e7 | 61,640 → 1,760 | 35.0× |
+
+  **Growth exponent** (log-log, 5k→45k): baseline 1.99 (CPU) / 2.00 (pairs);
+  incremental **first pass 1.97 / 2.00 — still O(n²), unavoidably**;
+  incremental **steady pass 1.00 (CPU) / 1.02 (pairs)**. The steady figure holds
+  only because arrivals per pass are fixed (555 = 400 ingested + ~155 abstracts
+  the previous pass created); the earlier probe's "~56×" counted 400 and
+  missed the abstracts, and the measured pair reduction at 45k is 40.7×.
+  Whole trajectory, empty → 20k in 37 passes: 2.63e9 pairs and 150.7 / 154.6 s
+  CPU for the baseline against 2.07e8 pairs and 14.0 / 14.3 s for the new build
+  (10.7×). New build alone, empty → 45,309 cells in 82 passes: 1.03e9 pairs,
+  71.3 s CPU, last pass 1.75 s; the baseline's 2.84e10 pairs for the same
+  trajectory is arithmetic, not a measurement (it was not run). With cells
+  forgotten before each pass at 45k: 50/pass → ~1.99 s CPU (+13%, ~42 clusters
+  rebuilt), 400/pass → ~2.3 s (+33%, ~140 rebuilt); one run of the 400 case
+  was cut short, so it is a single sample.
+  **Memory**: the cache is 108.7 B/cell once warm (5.02 MB at 46,135 cells; 643
+  KB at 5,000 cells, 128 B/cell with growth slack), measured exactly through a
+  counting allocator handed only to the consolidator — more than the 64 B/cell
+  the signature alone would cost, because of the id, hash, parent and flags
+  columns and the id→slot map. Transient peak during a pass: 6.3 MB against the
+  baseline's 4.2 MB. Process-level peak RSS was 29–32 MB for both and the
+  difference is inside the run-to-run spread, so no RSS figure is claimed.
+  **Removal rule** (a union-find cannot split, a single-linkage cluster can): a
+  removed cell marks its component dirty; every survivor of a dirty component is
+  reset to a singleton and all-pairs is re-run *within those survivors only*.
+  Exact, because there are no edges between components; one rebuild per dirty
+  component per pass; free for a singleton or a lone survivor. Invalidation: a
+  changed `consolidation_threshold` (compared as bits), a different manager, an
+  allocation failure, or `invalidate()` clears everything and the next pass is
+  full. A cell whose id is reused with different content is detected by a
+  64-bit content hash and treated as removed-then-added (a hash collision would
+  miss it). Behaviour changes: abstract ids are now minted in ascending order
+  of each cluster's lowest member id (previously hash-map order; the set of
+  abstracts is unchanged), and abstract text/vocabulary is built from the cached
+  signatures instead of re-tokenizing members. Not verified: Linux execution
+  (both Linux targets cross-compile, nothing was run there); the 100k scale.
 - **WAL group commit, opt-in** (`--wal-sync=always|group|interval:N`; default
   `always` is byte-identical to before). `group` acknowledges a write only
   after an fsync that covers it (leader/follower, the store lock is *not* held
@@ -95,7 +157,8 @@ Current version: **`0.1.0-alpha`**. Supported targets: **macOS and Linux**.
   disagree. The same field is carried by HTTP `POST /api/memcells` (also shown
   by `GET /api/memcells/:id`), and MCP `memory_add`. Consolidation abstracts
   inherit their representative's foresight in memory, and their WAL record now
-  carries it too — that last path has no dedicated test. Regression tests were written
+  carries it too (that last path is now covered by
+  `tests/integration/consolidate_incremental_e2e.zig`). Regression tests were written
   first and observed failing with `expected 2, found 0` (WAL replay, snapshot
   restore, `dump`, `add`, HTTP, MCP) before the implementation. Found on the
   way: the HTTP 400 path of `POST /api/memcells` leaked its error body on every
@@ -334,26 +397,21 @@ raw text. See `scripts/embedder_adapter_example.py`.
   (O(n log n), and it also makes a cell's index stable across passes — the
   precondition any incremental clustering needs) and by sorting the returned
   `abstract_ids` ascending.
-- **Consolidation is all-pairs and superlinear.** `Consolidator.consolidate`
-  compares every cell pair. Over the run above, 89.9× more cells cost 154.6×
-  more consolidation time (exponent 1.12; 126.9 ms/pass at 518 cells →
-  **20,257.6 ms/pass at 44,909 cells**). At the constitutional 100k scale that
-  is ~5.0 billion pair comparisons per pass. The pair loop itself was already
-  made 75× faster and bit-identical; O(n²) is the remaining problem.
-  **An inverted index is not the obvious win here and was rejected on
-  arithmetic**: the signature is 512 bits with ~55 tokens per cell, so bucket
-  collisions are dense and the candidate set comes out at ~2.95n² against
-  n²/2 for the full scan — about six times *worse*. The promising direction
-  is keeping the union-find across passes and comparing only newly arrived
-  cells against everything already present: at the long run's 400 cells per
-  pass that is ~1.8e7 pairs instead of 1.01e9, roughly 56×. A standalone
-  probe confirms this yields an **identical partition** (pair-wise agreement
-  640000/640000; only the chosen root differs, and the root is just a
-  `cluster_map` key). It costs resident memory for a per-cell signature cache
-  (~2.9 MB at 45k cells, 6.4 MB at 100k, growing linearly) and needs a
-  defined invalidation rule when `consolidation_threshold` changes. Not
-  implemented — both are open design decisions, and the id-ordered cell list
-  from the fix above is the prerequisite for it.
+- **Consolidation: what incremental clustering did not remove.** See
+  "Consolidation is incremental" under Recently closed for the measurements.
+  (1) The first pass in a process is still all-pairs, O(n²) — 1.01e9 pairs and
+  ~58 s CPU at 45,000 cells on the loaded measurement host — and that is every
+  `mem3 consolidate` CLI call, because a fresh process has no cache.
+  (2) The steady-state pass is O(new × n): linear only while arrivals per pass
+  stay fixed. If arrivals scale with the corpus it is quadratic again.
+  (3) Every pass still emits an abstract for *every* multi-member cluster,
+  including clusters that did not change (155 per pass in the harness), and
+  those abstracts are the next pass's new cells (~28% of arrivals in the
+  bench). That is the pre-existing behaviour and was kept on purpose; changing
+  it would change what consolidation produces. (4) A large cluster that loses a
+  member on every pass pays that cluster's quadratic rebuild each time.
+  (5) Not measured: the 100k scale, and a workload where forgetting actually
+  fires at volume (the long run fuzzied nothing).
 - **`abstracts` per pass is flat at 155 from 5k cells on.** That is the
   harness's 5-topic synthetic corpus saturating, not convergence — do not read
   it as evidence.
