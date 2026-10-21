@@ -1,6 +1,6 @@
 //! Goal Poset (Partially Ordered Set).
 //!
-//! **GHW Layer**: Goal (性源). Sits at the top of the GHW three-layer
+//! **GHW Layer**: Goal (spirit source). Sits at the top of the GHW three-layer
 //! architecture and is the slowest, most stable layer.
 //!
 //! ## Structure
@@ -14,8 +14,8 @@
 //! queries ("all goals between X and Y").
 //!
 //! ## Constitution compliance
-//! - Principle II (GHW 三层耦合): this file is the Goal layer.
-//! - Principle III (存在增益驱动): goals are evaluated by `updateMetaGoals`.
+//! - Principle II (GHW three-layer coupling): this file is the Goal layer.
+//! - Principle III (existence-gain-driven lifecycle): goals are evaluated by `updateMetaGoals`.
 //! - FR-011: goals have parent_id, priority, status, and associated memcells.
 
 const std = @import("std");

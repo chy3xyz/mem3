@@ -1,7 +1,7 @@
 //! JSON-RPC 2.0 envelope: validation of an incoming line, and the two
 //! shapes of outgoing message.
 //!
-//! **GHW layer**: Harness 层 (象源). The envelope is pure protocol: it
+//! **GHW layer**: Harness layer (form source). The envelope is pure protocol: it
 //! carries no memory, crosses no GHW layer, and its only job is to
 //! decide whether a line is a request, a notification, or garbage —
 //! and to refuse to answer a notification.
