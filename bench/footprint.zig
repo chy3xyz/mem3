@@ -65,6 +65,63 @@ const Sample = struct {
     rss_kb: u64,
 };
 
+/// Counts the bytes the store has asked for and not yet given back.
+///
+/// RSS (`ru_maxrss`) is the number the target is written in, but on a loaded,
+/// memory-pressured host macOS compresses and purges pages, so the same build
+/// reads anywhere from 0.4 GB to 2.7 GB at 100k cells run to run. This count
+/// is deterministic: it is the sum of live allocation request sizes, so it
+/// excludes allocator metadata, size-class rounding and fragmentation (all of
+/// which RSS includes) and is a lower bound on what the process holds.
+const CountingAllocator = struct {
+    backing: Allocator,
+    live: usize = 0,
+    peak: usize = 0,
+
+    fn allocator(self: *CountingAllocator) Allocator {
+        return .{ .ptr = self, .vtable = &.{
+            .alloc = alloc,
+            .resize = resize,
+            .remap = remap,
+            .free = free,
+        } };
+    }
+
+    fn grow(self: *CountingAllocator, by: usize) void {
+        self.live += by;
+        if (self.live > self.peak) self.peak = self.live;
+    }
+
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const self: *CountingAllocator = @ptrCast(@alignCast(ctx));
+        const p = self.backing.rawAlloc(len, alignment, ra) orelse return null;
+        self.grow(len);
+        return p;
+    }
+
+    fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) bool {
+        const self: *CountingAllocator = @ptrCast(@alignCast(ctx));
+        if (!self.backing.rawResize(memory, alignment, new_len, ra)) return false;
+        self.live -= memory.len;
+        self.grow(new_len);
+        return true;
+    }
+
+    fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) ?[*]u8 {
+        const self: *CountingAllocator = @ptrCast(@alignCast(ctx));
+        const p = self.backing.rawRemap(memory, alignment, new_len, ra) orelse return null;
+        self.live -= memory.len;
+        self.grow(new_len);
+        return p;
+    }
+
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ra: usize) void {
+        const self: *CountingAllocator = @ptrCast(@alignCast(ctx));
+        self.backing.rawFree(memory, alignment, ra);
+        self.live -= memory.len;
+    }
+};
+
 const Footprint = struct {
     samples: []Sample,
     baseline_kb: u64,
@@ -78,6 +135,9 @@ const Footprint = struct {
     hyperedges: usize,
     wal_bytes: u64,
     cells_by_source: [3]usize,
+    vector_stride_bytes: usize,
+    live_bytes: usize,
+    live_peak_bytes: usize,
 
     fn deinit(self: Footprint, alloc: Allocator) void {
         alloc.free(self.samples);
@@ -89,7 +149,7 @@ const Footprint = struct {
 
     /// Exact vector payload held by the index.
     fn vectorBytes(self: Footprint) f64 {
-        return @as(f64, @floatFromInt(self.hnsw_nodes)) * @as(f64, DIM) * 4.0;
+        return @as(f64, @floatFromInt(self.hnsw_nodes)) * @as(f64, @floatFromInt(self.vector_stride_bytes));
     }
 
     /// Exact neighbour-id payload held by the index.
@@ -112,7 +172,8 @@ fn measure(
     const baseline = harness.peakRssKb() orelse 0;
     try samples.append(alloc, .{ .cells = 0, .rss_kb = baseline });
 
-    const store = try mem3.Store.init(alloc, .{
+    var counted = CountingAllocator{ .backing = alloc };
+    const store = try mem3.Store.init(counted.allocator(), .{
         .data_dir = if (durable) scratch.path else null,
         .seed_default_goals = true,
         .vector_storage = if (int8) .int8 else .f32,
@@ -183,6 +244,9 @@ fn measure(
             store.cellCountBySource(.form),
             store.cellCountBySource(.spirit),
         },
+        .vector_stride_bytes = store.hnsw.vec_stride,
+        .live_bytes = counted.live,
+        .live_peak_bytes = counted.peak,
     };
 }
 
@@ -385,6 +449,15 @@ pub fn run(alloc: Allocator, init: std.process.Init.Minimal) !void {
     try j.int(fp.wal_bytes);
     try j.key("wal_bytes_per_cell");
     try j.float(if (fp.cells == 0) 0 else @as(f64, @floatFromInt(fp.wal_bytes)) / @as(f64, @floatFromInt(fp.cells)));
+    // Deterministic counterpart to the RSS remainder below: live allocation
+    // request bytes, read from the counting allocator. See CountingAllocator.
+    const nc: f64 = if (fp.cells == 0) 1 else @floatFromInt(fp.cells);
+    try j.key("live_requested_bytes_per_cell");
+    try j.float(@as(f64, @floatFromInt(fp.live_bytes)) / nc);
+    try j.key("live_peak_requested_bytes_per_cell");
+    try j.float(@as(f64, @floatFromInt(fp.live_peak_bytes)) / nc);
+    try j.key("live_requested_other_bytes_per_cell");
+    try j.float((@as(f64, @floatFromInt(fp.live_bytes)) - fp.vectorBytes() - fp.edgeIdBytes()) / nc);
     try j.key("unattributed_bytes");
     try j.float(remainder);
     try j.key("unattributed_bytes_per_cell");
@@ -493,4 +566,21 @@ test "footprint: vector bytes are exactly count * dim * 4" {
 
     try std.testing.expectEqual(@as(f64, 64.0 * @as(f64, DIM) * 4.0), fp.vectorBytes());
     try std.testing.expect(fp.hnsw_nodes >= 64);
+}
+test "footprint: int8 vectors are exactly count * dim bytes, and the live count covers them" {
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
+    defer std.testing.expect(gpa.deinit() == .ok) catch @panic("leak");
+    const alloc = gpa.allocator();
+
+    const scratch = try harness.Scratch.init(alloc, null, "footprint-accounting-i8");
+    defer scratch.deinit(alloc);
+
+    const fp = try measure(alloc, 64, 0, scratch, false, true);
+    defer fp.deinit(alloc);
+
+    try std.testing.expectEqual(@as(f64, 64.0 * @as(f64, DIM)), fp.vectorBytes());
+    // The allocator count is a lower bound on the store's footprint: it
+    // must at least hold the vectors and the neighbour ids it was asked for.
+    try std.testing.expect(@as(f64, @floatFromInt(fp.live_bytes)) >= fp.vectorBytes() + fp.edgeIdBytes());
+    try std.testing.expect(fp.live_peak_bytes >= fp.live_bytes);
 }
