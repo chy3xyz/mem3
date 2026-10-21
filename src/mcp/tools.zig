@@ -1,4 +1,4 @@
-//! The MCP tool catalogue: schema, dispatch, and the five tools that map
+//! The MCP tool catalogue: schema, dispatch, and the six tools that map
 //! onto `store.Store`.
 //!
 //! **GHW layer**: all three, in order. Every tool here is a memory
@@ -30,7 +30,8 @@ const core = @import("../core/mod.zig");
 const json = @import("json.zig");
 const out = @import("json_out.zig");
 const protocol = @import("protocol.zig");
-const Store = @import("../store/mod.zig").Store;
+const mem3_store = @import("../store/mod.zig");
+const Store = mem3_store.Store;
 const cli_add = @import("../cli_commands/add.zig");
 const Fact = core.Fact;
 const GoalAssociation = core.GoalAssociation;
@@ -73,15 +74,19 @@ pub const CATALOGUE = [_]Tool{
         \\nor a foresight is rejected.
         \\
         \\If a fact "subject|predicate|object" contradicts an older cell's fact
-        \\(same subject and predicate, different object) and ALL of that older
-        \\cell's facts are contradicted by newer cells, the older cell is marked
-        \\superseded (never deleted). Subject, predicate and object must all be
-        \\non-empty for a fact to take part. Subject+predicate is a heuristic
-        \\key: a predicate that can legitimately have several objects
-        \\("likes") will supersede its earlier values.
+        \\(same subject and predicate, different object) AND the predicate is a
+        \\known single-valued one (lives_in, works_at, status, name, email,
+        \\owner, version, current_*, ...), and ALL of that older cell's facts are
+        \\contradicted by newer cells, the older cell is marked superseded
+        \\(never deleted). Every other predicate (likes, knows, uses, is, ...) is
+        \\treated as multi-valued and never supersedes anything. The list is set
+        \\when the server starts (`mem3 mcp --supersede=off|functional|all`,
+        \\`--functional-predicates=a,b`).
         \\
-        \\Returns the assigned MemCell id, and `superseded` (the ids of the
-        \\older cells this memory replaced) when there are any.
+        \\Returns the assigned MemCell id, and `superseded` when this memory
+        \\replaced older cells: a list of {id, subject, predicate} naming each
+        \\older cell and the predicate that justified it. A wrong replacement
+        \\is undone with `memory_unsupersede`.
         ,
         .schema = "{\"type\":\"object\",\"properties\":{\"episode\":{\"type\":\"string\",\"description\":\"物 — the raw episode text\"},\"source\":{\"type\":\"string\",\"enum\":[\"matter\",\"form\",\"spirit\"],\"description\":\"ontological source tag (required)\"},\"facts\":{\"type\":\"array\",\"items\":{\"type\":\"string\"},\"description\":\"象 — subject|predicate|object triples\"},\"goal_ids\":{\"type\":\"array\",\"items\":{\"type\":\"integer\"},\"description\":\"性 — goal bindings\"},\"relevances\":{\"type\":\"array\",\"items\":{\"type\":\"number\"},\"description\":\"per-goal relevance in [0,1]\"},\"foresight\":{\"type\":\"array\",\"items\":{\"type\":\"string\"},\"description\":\"spirit — predicted claims as desc|valid_from_ms|valid_until_ms|confidence; durable\"}},\"required\":[\"episode\",\"source\"]}",
     },
@@ -131,6 +136,18 @@ pub const CATALOGUE = [_]Tool{
         \\estimate of the cell payload in bytes.
         ,
         .schema = "{\"type\":\"object\",\"properties\":{},\"required\":[]}",
+    },
+    .{
+        .name = "memory_unsupersede",
+        .description =
+        \\Undo a supersession: restore a cell that a newer fact marked
+        \\superseded (see `superseded` in the `memory_add` result). The cell is
+        \\current again, returns in default `memory_query` results, and is pinned
+        \\so a later write or forgetting sweep does not supersede it a second
+        \\time. Journaled before it takes effect. An unknown id, or a cell that
+        \\is not superseded, is an error.
+        ,
+        .schema = "{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"integer\",\"minimum\":0,\"description\":\"MemCell id to restore\"}},\"required\":[\"id\"]}",
     },
 };
 
@@ -219,6 +236,8 @@ pub fn call(
         try toolMemoryForget(alloc, store, arguments, &body);
     } else if (std.mem.eql(u8, tool.name, "memory_stats")) {
         try toolMemoryStats(alloc, store, &body);
+    } else if (std.mem.eql(u8, tool.name, "memory_unsupersede")) {
+        try toolMemoryUnsupersede(alloc, store, arguments, &body);
     } else {
         return error.UnknownTool;
     }
@@ -351,8 +370,8 @@ fn toolMemoryAdd(
     const source_text = (try argString(arguments, "source")) orelse return error.ToolFailed;
     const source = core.MemorySource.fromString(source_text) catch return error.ToolFailed;
 
-    var superseded: std.ArrayList(u64) = .empty;
-    defer superseded.deinit(alloc);
+    var superseded: std.ArrayList(mem3_store.Supersession) = .empty;
+    defer mem3_store.freeSupersessions(alloc, &superseded);
     const id = cli_add.addMemoryReporting(store, alloc, .{
         .source = source,
         .episode = episode,
@@ -375,12 +394,8 @@ fn toolMemoryAdd(
     // Additive: present only when this memory replaced an older fact. The
     // old cells are marked, not deleted; `mem3 inspect <id>` shows them.
     if (superseded.items.len > 0) {
-        try body.appendSlice(alloc, ",\"superseded\":[");
-        for (superseded.items, 0..) |sid, i| {
-            if (i > 0) try body.append(alloc, ',');
-            try out.uint(body, alloc, sid);
-        }
-        try body.append(alloc, ']');
+        try body.appendSlice(alloc, ",\"superseded\":");
+        try mem3_store.appendSupersededJson(alloc, body, superseded.items);
     }
     try body.append(alloc, '}');
 }
@@ -463,6 +478,23 @@ fn toolMemoryQuery(
         try body.append(alloc, '}');
     }
     try body.appendSlice(alloc, "]}");
+}
+
+/// `memory_unsupersede` — restore a wrongly superseded cell.
+fn toolMemoryUnsupersede(
+    alloc: Allocator,
+    store: *Store,
+    arguments: ?json.Value,
+    body: *std.ArrayList(u8),
+) ToolError!void {
+    const n = (try argNumber(arguments, "id")) orelse return error.ToolFailed;
+    const id = asCount(n) orelse return error.InvalidParams;
+    // Unknown id / not superseded / journal failure: a well-formed call
+    // that changed nothing.
+    store.unsupersede(id) catch return error.ToolFailed;
+    try body.appendSlice(alloc, "{\"id\":");
+    try out.uint(body, alloc, id);
+    try body.appendSlice(alloc, ",\"unsuperseded\":true,\"pinned\":true}");
 }
 
 /// `goal_list` — the live Goal Poset.
@@ -640,7 +672,11 @@ test "tools: every catalogue name is dispatchable and every dispatch name is in 
         .{ .name = "memory_forget", .args = "{}" },
         .{ .name = "memory_stats", .args = "{}" },
     };
-    try testing.expectEqual(CATALOGUE.len, cases.len);
+    // `memory_unsupersede` needs a superseded cell to succeed on; it has its
+    // own tests below, and the loop here only covers tools that run on an
+    // empty store.
+    try testing.expectEqual(CATALOGUE.len, cases.len + 1);
+    try testing.expect(findTool("memory_unsupersede") != null);
 
     for (cases) |c| {
         try testing.expect(findTool(c.name) != null);
@@ -711,7 +747,10 @@ test "tools: memory_add reports the older cells a contradicting fact superseded"
     defer d2.deinit();
     const sup = json.get(d2.root, "superseded").?.asArray().?;
     try testing.expectEqual(@as(usize, 1), sup.len);
-    try testing.expectEqual(@as(f64, @floatFromInt(old_id)), sup[0].asNumber().?);
+    // The audit trail: which cell, and on which predicate.
+    try testing.expectEqual(@as(f64, @floatFromInt(old_id)), json.get(sup[0], "id").?.asNumber().?);
+    try testing.expectEqualStrings("lives_in", json.get(sup[0], "predicate").?.asString().?);
+    try testing.expectEqualStrings("user", json.get(sup[0], "subject").?.asString().?);
 
     // Marked, not deleted.
     const old = store.getCell(old_id).?;
@@ -733,6 +772,69 @@ test "tools: memory_add reports the older cells a contradicting fact superseded"
     var da = try json.parse(alloc, all.text);
     defer da.deinit();
     try testing.expectEqual(@as(f64, 2), json.get(da.root, "count").?.asNumber().?);
+}
+
+test "tools: a multi-valued predicate never supersedes, and memory_add reports nothing" {
+    const alloc = testing.allocator;
+    var store = try testStore(alloc);
+    defer store.deinit();
+    var a = try callWith(alloc, store, "memory_add",
+        \\{"episode":"the user likes tea","source":"matter","facts":["user|likes|tea"],"goal_ids":[1]}
+    );
+    a.deinit();
+    var b = try callWith(alloc, store, "memory_add",
+        \\{"episode":"the user likes coffee","source":"matter","facts":["user|likes|coffee"],"goal_ids":[1]}
+    );
+    defer b.deinit();
+    var d = try json.parse(alloc, b.text);
+    defer d.deinit();
+    try testing.expect(json.get(d.root, "superseded") == null);
+    try testing.expectEqual(@as(usize, 0), store.superseded_live);
+}
+
+test "tools: memory_unsupersede restores a cell, is an error for a live or unknown one" {
+    const alloc = testing.allocator;
+    var store = try testStore(alloc);
+    defer store.deinit();
+    var first = try callWith(alloc, store, "memory_add",
+        \\{"episode":"the user lives in Paris","source":"matter","facts":["user|lives_in|Paris"],"goal_ids":[1]}
+    );
+    defer first.deinit();
+    var d1 = try json.parse(alloc, first.text);
+    defer d1.deinit();
+    const old_id: u64 = @intFromFloat(json.get(d1.root, "id").?.asNumber().?);
+    var second = try callWith(alloc, store, "memory_add",
+        \\{"episode":"the user moved to Berlin","source":"matter","facts":["user|lives_in|Berlin"],"goal_ids":[1]}
+    );
+    defer second.deinit();
+    var d2 = try json.parse(alloc, second.text);
+    defer d2.deinit();
+    const new_id: u64 = @intFromFloat(json.get(d2.root, "id").?.asNumber().?);
+    try testing.expect(store.getCell(old_id).?.metadata.superseded_at != null);
+
+    var args_buf: [64]u8 = undefined;
+    const args = try std.fmt.bufPrint(&args_buf, "{{\"id\":{d}}}", .{old_id});
+    var ok = try callWith(alloc, store, "memory_unsupersede", args);
+    defer ok.deinit();
+    try testing.expect(!ok.is_error);
+    try testing.expect(store.getCell(old_id).?.metadata.superseded_at == null);
+    try testing.expect(store.getCell(old_id).?.metadata.supersede_pinned);
+
+    // Both are in default recall again.
+    var q = try callWith(alloc, store, "memory_query",
+        \\{"query":"where does the user live"}
+    );
+    defer q.deinit();
+    var dq = try json.parse(alloc, q.text);
+    defer dq.deinit();
+    try testing.expectEqual(@as(f64, 2), json.get(dq.root, "count").?.asNumber().?);
+
+    // Already restored, never superseded, unknown, wrong type.
+    try testing.expectError(error.ToolFailed, callWith(alloc, store, "memory_unsupersede", args));
+    const live_args = try std.fmt.bufPrint(&args_buf, "{{\"id\":{d}}}", .{new_id});
+    try testing.expectError(error.ToolFailed, callWith(alloc, store, "memory_unsupersede", live_args));
+    try testing.expectError(error.ToolFailed, callWith(alloc, store, "memory_unsupersede", "{\"id\":987654}"));
+    try testing.expectError(error.InvalidParams, callWith(alloc, store, "memory_unsupersede", "{\"id\":\"x\"}"));
 }
 
 test "tools: memory_add refuses an untagged memory" {

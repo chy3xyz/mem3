@@ -65,7 +65,12 @@ pub const SNAPSHOT_MAGIC: u32 = 0x4D45_4D53; // "MEMS" in little-endian
 /// Appended to the END of every cell row (active and fuzzy alike), after
 /// `fuzzed_at`:
 ///
-///     has_superseded_by u8  [+ superseded_by u64]
+///     flags u8  [+ superseded_by u64 if bit 0]
+///
+/// `flags` bit 0 = has `superseded_by` (the only bit the first v3 writer
+/// used, as a 0/1 bool, so those files read unchanged); bit 1 =
+/// `supersede_pinned` (an operator ran `mem3 unsupersede`; the cell is never
+/// superseded again). Unknown bits are ignored.
 ///
 /// Everything before it is byte-for-byte what v2 wrote, so a v3 reader
 /// loads a v1/v2 file by not reading the suffix: such a cell comes back with
@@ -77,6 +82,9 @@ pub const SNAPSHOT_MAGIC: u32 = 0x4D45_4D53; // "MEMS" in little-endian
 /// not downgrade — after a snapshot the WAL is empty of cells, so a build
 /// that refuses the snapshot has nothing to rebuild them from.
 pub const SNAPSHOT_VERSION: u32 = 3;
+
+const SUPERSEDED_BY_BIT: u8 = 1;
+const SUPERSEDE_PINNED_BIT: u8 = 2;
 
 /// Format version 2: goal rows carry their timestamps (`SNAPSHOT_VERSION`
 /// above is the current one).
@@ -497,7 +505,10 @@ fn writeCellSnapshot(w: *BufferedWriter, cell: CellSnapshot) !void {
     try w.writeBool(cell.metadata.fuzzed_at != null);
     if (cell.metadata.fuzzed_at) |ts| try w.writeI64(ts);
     // v3 suffix. See SNAPSHOT_VERSION.
-    try w.writeBool(cell.metadata.superseded_by != null);
+    var flags: u8 = 0;
+    if (cell.metadata.superseded_by != null) flags |= SUPERSEDED_BY_BIT;
+    if (cell.metadata.supersede_pinned) flags |= SUPERSEDE_PINNED_BIT;
+    try w.writeU8(flags);
     if (cell.metadata.superseded_by) |by| try w.writeU64(by);
 }
 
@@ -716,9 +727,11 @@ fn readCellSnapshot(alloc: Allocator, r: *BufferedReader, cell: *CellSnapshot, h
     const has_fuzz = try r.readBool();
     cs.metadata.fuzzed_at = if (has_fuzz) try r.readI64() else null;
     cs.metadata.superseded_by = null;
+    cs.metadata.supersede_pinned = false;
     if (has_superseded_by) {
-        const has_by = try r.readBool();
-        cs.metadata.superseded_by = if (has_by) try r.readU64() else null;
+        const flags = try r.readU8();
+        cs.metadata.superseded_by = if (flags & SUPERSEDED_BY_BIT != 0) try r.readU64() else null;
+        cs.metadata.supersede_pinned = flags & SUPERSEDE_PINNED_BIT != 0;
     }
     // Nothing below can fail, so ownership transfers cleanly.
     cs.metadata.location = location;

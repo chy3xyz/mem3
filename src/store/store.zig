@@ -145,6 +145,52 @@ fn diag(comptime fmt: []const u8, args: anytype) void {
 /// HyMem + HNSW + (optional) WAL + (optional) snapshot. The HTTP
 /// server and every CLI command build one of these via `init` and
 /// call `deinit` when done.
+/// One older cell a write superseded, and why: the subject and predicate of
+/// the contradicting fact. Owned strings; free with `freeSupersessions`.
+pub const Supersession = struct {
+    id: u64,
+    subject: []u8,
+    predicate: []u8,
+};
+
+pub fn freeSupersessions(alloc: Allocator, list: *std.ArrayList(Supersession)) void {
+    for (list.items) |sp| {
+        alloc.free(sp.subject);
+        alloc.free(sp.predicate);
+    }
+    list.deinit(alloc);
+}
+
+/// `[{"id":N,"subject":"...","predicate":"..."}, ...]`: the audit trail an add
+/// reports for what it superseded. Shared by the CLI, HTTP and MCP surfaces so
+/// they cannot drift apart.
+pub fn appendSupersededJson(alloc: Allocator, buf: *std.ArrayList(u8), items: []const Supersession) !void {
+    try buf.append(alloc, '[');
+    for (items, 0..) |sp, i| {
+        if (i > 0) try buf.append(alloc, ',');
+        try buf.print(alloc, "{{\"id\":{d},\"subject\":", .{sp.id});
+        try appendJsonEscaped(alloc, buf, sp.subject);
+        try buf.appendSlice(alloc, ",\"predicate\":");
+        try appendJsonEscaped(alloc, buf, sp.predicate);
+        try buf.append(alloc, '}');
+    }
+    try buf.append(alloc, ']');
+}
+
+fn appendJsonEscaped(alloc: Allocator, buf: *std.ArrayList(u8), text: []const u8) !void {
+    try buf.append(alloc, '"');
+    for (text) |ch| switch (ch) {
+        '"' => try buf.appendSlice(alloc, "\\\""),
+        '\\' => try buf.appendSlice(alloc, "\\\\"),
+        '\n' => try buf.appendSlice(alloc, "\\n"),
+        '\r' => try buf.appendSlice(alloc, "\\r"),
+        '\t' => try buf.appendSlice(alloc, "\\t"),
+        0...8, 11, 12, 14...31 => try buf.print(alloc, "\\u{x:0>4}", .{ch}),
+        else => try buf.append(alloc, ch),
+    };
+    try buf.append(alloc, '"');
+}
+
 pub const Store = struct {
     alloc: Allocator,
     /// Single shared monotonic id source. Allocates ids for MemCells,
@@ -189,6 +235,8 @@ pub const Store = struct {
     /// Live cells carrying `superseded_at`: how far a default query must
     /// over-fetch to still return `topk` current hits. Derived, may lag low.
     superseded_live: usize = 0,
+    /// Owned copy of `cfg.functional_predicates` (`setFunctionalPredicates`).
+    functional_owned: ?[]u8 = null,
     /// WAL for crash-safe persistence. `null` when built with
     /// `data_dir == null` (in-memory mode).
     wal: ?*WAL,
@@ -378,6 +426,8 @@ pub const Store = struct {
 
         self.cell_index.deinit();
         self.conflicts.deinit();
+        if (self.functional_owned) |f| self.alloc.free(f);
+        self.functional_owned = null;
         self.xlog.deinit();
         // Kills the child process if an external embedder was opted into,
         // and is a no-op for the two built-ins.
@@ -447,8 +497,9 @@ pub const Store = struct {
     }
 
     /// `addRawWithForesight` that also reports which older cells the new one
-    /// superseded (FR-015 write-time conflict resolution). The ids are
-    /// appended to `superseded_out` when it is given; the old cells are only
+    /// superseded (FR-015 write-time conflict resolution). Each one (id, and
+    /// the subject and predicate that contradicted it) is appended to
+    /// `superseded_out` when it is given; the old cells are only
     /// *marked* (`superseded_at` / `superseded_by`), never removed.
     pub fn addRawReporting(
         self: *Store,
@@ -458,7 +509,7 @@ pub const Store = struct {
         goal_id: u64,
         relevance: f32,
         foresight: []const Foresight,
-        superseded_out: ?*std.ArrayList(u64),
+        superseded_out: ?*std.ArrayList(Supersession),
     ) !u64 {
         try validateForesight(foresight);
         const id = self.ids.fetchAdd(1, .monotonic);
@@ -508,31 +559,107 @@ pub const Store = struct {
         return id;
     }
 
-    /// Switch conflict resolution on or off for this Store: write-time
-    /// marking and the sweep's re-detection. Affects future operations only;
-    /// cells already marked stay marked.
-    pub fn setSupersedeOnConflict(self: *Store, on: bool) void {
-        self.lc.cfg.supersede_on_conflict = on;
-        self.lc.forgetter.cfg.supersede_on_conflict = on;
+    /// Choose which predicates may supersede (`off` / `functional` / `all`).
+    /// Affects future operations only (write-time marking and the sweep's
+    /// re-detection); cells already marked stay marked.
+    pub fn setSupersedeMode(self: *Store, mode: core.SupersedeMode) void {
+        self.lc.cfg.supersede_mode = mode;
+        self.lc.forgetter.cfg.supersede_mode = mode;
+        self.conflicts.policy.mode = mode;
+    }
+
+    /// Replace the single-valued predicate list (`null` = built-in list; a
+    /// leading `+` extends it). The text is copied.
+    pub fn setFunctionalPredicates(self: *Store, list: ?[]const u8) !void {
+        const copy: ?[]u8 = if (list) |l| try self.alloc.dupe(u8, l) else null;
+        if (self.functional_owned) |old| self.alloc.free(old);
+        self.functional_owned = copy;
+        self.lc.cfg.functional_predicates = copy;
+        self.lc.forgetter.cfg.functional_predicates = copy;
+        self.conflicts.policy.predicates = copy;
     }
 
     /// Mark every older live cell that cell `id` contradicts as superseded.
     /// Best effort by design: the insert has already been journaled and
     /// committed, so a failure here must not fail the add. An unrecorded
     /// conflict is repaired by the next `forget` sweep, which re-detects it.
-    fn supersedeOlder(self: *Store, id: u64, out: ?*std.ArrayList(u64)) void {
-        if (!self.lc.cfg.supersede_on_conflict) return;
+    fn supersedeOlder(self: *Store, id: u64, out: ?*std.ArrayList(Supersession)) void {
+        if (self.lc.cfg.supersede_mode == .off) return;
         const newer = self.cell_index.get(id) orelse return;
-        var hits: std.ArrayList(*MemCell) = .empty;
+        self.conflicts.policy = memory.conflict.Policy.fromConfig(self.lc.cfg);
+        var hits: std.ArrayList(memory.conflict.Hit) = .empty;
         defer hits.deinit(self.alloc);
-        self.conflicts.detect(self.alloc, newer, &hits) catch |err| {
+        self.conflicts.detectHits(self.alloc, newer, &hits) catch |err| {
             diag("conflict detection failed for cell {d}: {}", .{ id, err });
             return;
         };
         const now = wallClockMs();
-        for (hits.items) |old| {
-            if (!self.markSuperseded(old, id, now)) continue;
-            if (out) |o| o.append(self.alloc, old.id) catch |err| diag("superseded id not reported for cell {d}: {}", .{ old.id, err });
+        for (hits.items) |h| {
+            // Copy before marking: `markSuperseded` is the only fallible
+            // step that matters, and the report must only name cells that
+            // really were marked.
+            const subject = self.alloc.dupe(u8, h.via.subject) catch |err| {
+                diag("supersession of cell {d} not reportable: {}", .{ h.old.id, err });
+                _ = self.markSuperseded(h.old, id, now);
+                continue;
+            };
+            const predicate = self.alloc.dupe(u8, h.via.predicate) catch |err| {
+                self.alloc.free(subject);
+                diag("supersession of cell {d} not reportable: {}", .{ h.old.id, err });
+                _ = self.markSuperseded(h.old, id, now);
+                continue;
+            };
+            if (!self.markSuperseded(h.old, id, now)) {
+                self.alloc.free(subject);
+                self.alloc.free(predicate);
+                continue;
+            }
+            if (out) |o| {
+                o.append(self.alloc, .{ .id = h.old.id, .subject = subject, .predicate = predicate }) catch |err| {
+                    self.alloc.free(subject);
+                    self.alloc.free(predicate);
+                    diag("superseded id not reported for cell {d}: {}", .{ h.old.id, err });
+                };
+            } else {
+                self.alloc.free(subject);
+                self.alloc.free(predicate);
+            }
+        }
+    }
+
+    /// Undo a supersession: the cell is current again and is *pinned*, so
+    /// neither a later write nor a forgetting sweep supersedes it a second
+    /// time. Works on a cell in the fuzzy store too. Journal first, then
+    /// mutate, like every other state change: a failed journal write changes
+    /// nothing. `error.CellNotFound` / `error.NotSuperseded` rather than a
+    /// silent no-op, so a typo cannot look like a restore.
+    pub fn unsupersede(self: *Store, id: u64) !void {
+        const cell = self.mgr.get(id) orelse self.lc.fuzzy.cells.get(id) orelse return error.CellNotFound;
+        if (cell.metadata.superseded_at == null) return error.NotSuperseded;
+        if (self.wal) |wal| {
+            var buf: [64]u8 = undefined;
+            const payload = std.fmt.bufPrint(&buf, "{{\"id\":{d},\"unsuperseded\":true}}", .{id}) catch return error.WalAppendFailed;
+            wal.append(.{ .record_type = .memcell_update, .payload = payload, .timestamp = wallClockSec() }) catch |err| {
+                diag("unsupersede of cell {d} not journaled: {}", .{ id, err });
+                return error.WalAppendFailed;
+            };
+        }
+        self.applyUnsupersede(cell);
+    }
+
+    fn applyUnsupersede(self: *Store, cell: *MemCell) void {
+        if (cell.metadata.superseded_at == null) {
+            cell.metadata.supersede_pinned = true;
+            return;
+        }
+        const was_live_superseded = !cell.metadata.is_fuzzy;
+        cell.metadata.superseded_at = null;
+        cell.metadata.superseded_by = null;
+        cell.metadata.supersede_pinned = true;
+        if (was_live_superseded) {
+            if (self.superseded_live > 0) self.superseded_live -= 1;
+            // Back into the conflict index: it is a current cell again.
+            self.conflicts.index(cell) catch |err| diag("conflict index failed for cell {d}: {}", .{ cell.id, err });
         }
     }
 
@@ -2261,16 +2388,22 @@ pub fn encodeGoalWALPayloadRaw(
         try forgotten.append(self.alloc, id);
     }
 
-    /// Replay one `memcell_update` record: a supersession stamp. Idempotent
-    /// (a snapshot may already carry it) and tolerant of a cell that is
-    /// gone. Older builds ignore the record type entirely.
+    /// Replay one `memcell_update` record: a supersession stamp
+    /// (`superseded_at` + `superseded_by`) or its reversal (`unsuperseded`).
+    /// Idempotent (a snapshot may already carry either) and tolerant of a
+    /// cell that is gone. Older builds ignore the record type entirely.
     fn applySupersessionRecord(self: *Store, payload: []const u8) void {
         const id = extractJsonInt(payload, "id") orelse return;
-        const at = extractJsonInt(payload, "superseded_at") orelse return;
-        const by = extractJsonInt(payload, "superseded_by") orelse return;
-        if (id < 0 or by < 0) return;
+        if (id < 0) return;
         const uid: u64 = @intCast(id);
         const cell = self.mgr.get(uid) orelse self.lc.fuzzy.cells.get(uid) orelse return;
+        if (std.mem.indexOf(u8, payload, "\"unsuperseded\"") != null) {
+            self.applyUnsupersede(cell);
+            return;
+        }
+        const at = extractJsonInt(payload, "superseded_at") orelse return;
+        const by = extractJsonInt(payload, "superseded_by") orelse return;
+        if (by < 0) return;
         if (cell.metadata.superseded_at != null) return;
         self.applySupersession(cell, @intCast(by), at);
     }

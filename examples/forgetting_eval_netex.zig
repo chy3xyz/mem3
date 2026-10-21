@@ -9,33 +9,40 @@
 //! (multi-valued predicates, templated text) so that the false-positive
 //! rate is a measured number, not an omission.
 //!
-//! ## netex: before / after on a corpus with known ground truth
+//! ## netex: three arms on a corpus with known ground truth
 //!
-//! The same seeded corpus is built twice:
+//! The same seeded corpus is built three times, through the same encoder and
+//! the same sweep entry point (`Store.forget`) as production:
 //!
-//!   before — the forgetter as it was: decay only. Reproduced in the same
-//!            binary by switching the new terms off (`supersede_on_conflict
-//!            = false`, `redundancy_threshold > 1`), so the comparison is
-//!            like-for-like and not against a remembered number.
-//!   after  — the shipped forgetter.
+//!   decay_only  the forgetter before net_existence: decay only. Reproduced in
+//!               the same binary by switching the new terms off
+//!               (`supersede_mode = off`, `redundancy_threshold > 1`), so the
+//!               comparison is like-for-like.
+//!   all         the first net_existence cut: every (subject, predicate) is
+//!               single-valued. Kept as `--supersede=all`; it is the arm whose
+//!               multi-valued false positives motivated the default below.
+//!   functional  the shipped default: only the single-valued predicate list
+//!               (`memory/conflict.zig`) may supersede.
 //!
 //! Cell kinds, by construction:
 //!
 //!   unique       distinct text, distinct fact          must never be forgotten
 //!   dup_*        groups of an original + exact copy +  keep exactly one (the
 //!                1-token and 2-token edits, same fact  most important)
-//!   conflict_old a fact later contradicted             should be superseded
-//!   conflict_new its contradiction                     must stay current
-//!   multi        one subject, one predicate, 3 values  nothing is contradicted
-//!                ("likes"): a heuristic key's weak spot (ground truth: none)
+//!   conflict_*   `status` (functional) old/new pair    old superseded, new current
+//!   unknown_*    `shoe_size` (not on the list) pair    ground truth: contradiction;
+//!                                                      the default does NOT supersede
+//!                                                      it, on purpose (abandoned recall)
+//!   multi        one subject, a multi-valued predicate, ground truth: none superseded,
+//!                three values (likes/knows/uses/...)    none forgotten
 //!   templ        "ticket N closed by ..." pairs        distinct info with
 //!                differing only in N, no facts         near-identical text
-//!   stale        back-dated far past the decay edge    decays under both
+//!   stale        back-dated far past the decay edge    decays under all arms
 //!
-//! The same encoder, the same ids, the same sweep entry point (`Store.forget`)
-//! as production; only the corpus is synthetic. Retrieval is measured too:
-//! for contradiction pairs, is the top-1 hit the *current* value; for
-//! duplicate groups, how many of the top-5 are copies of each other.
+//! The functional arm's guarantees are asserted, not just reported: the
+//! process exits non-zero if a multi-valued or unknown-predicate cell is
+//! superseded or forgotten, if a conflict_old is not superseded, or if a
+//! unique cell is forgotten. (The same properties are also unit/e2e tests.)
 //!
 //! ## scale: does the sweep stay sub-quadratic
 //!
@@ -69,11 +76,13 @@ const Kind = enum {
     dup_near2,
     conflict_old,
     conflict_new,
+    unknown_old,
+    unknown_new,
     multi,
     templ,
     stale,
 };
-const N_KINDS = 10; // == number of `Kind` tags; `@intFromEnum` indexes the arrays below
+const N_KINDS = 12; // == number of `Kind` tags; `@intFromEnum` indexes the arrays below
 
 const Rec = struct { id: u64, kind: Kind, group: u32 };
 
@@ -81,6 +90,7 @@ pub const Shape = struct {
     unique: usize = 400,
     dup_groups: usize = 60,
     conflicts: usize = 60,
+    unknown_conflicts: usize = 60,
     multi_subjects: usize = 60,
     templ_pairs: usize = 60,
     stale: usize = 40,
@@ -166,13 +176,29 @@ fn buildCorpus(store: *Store, alloc: Allocator, seed: u64, shape: Shape, recs: *
         _ = try addCell(store, recs, alloc, .conflict_new, @intCast(c), ep.items, fc.items, relevance(rand));
     }
 
-    // multi-valued: three "likes" per subject, none of which contradicts another.
+    // unknown predicate: a real contradiction the default list cannot see.
+    for (0..shape.unknown_conflicts) |c| {
+        ep.clearRetainingCapacity();
+        fc.clearRetainingCapacity();
+        try words(alloc, &ep, rand, 8);
+        try fc.appendSlice(alloc, try std.fmt.bufPrint(&tmp, "cu{d}|shoe_size|alpha", .{c}));
+        _ = try addCell(store, recs, alloc, .unknown_old, @intCast(c), ep.items, fc.items, relevance(rand));
+        ep.clearRetainingCapacity();
+        fc.clearRetainingCapacity();
+        try words(alloc, &ep, rand, 8);
+        try fc.appendSlice(alloc, try std.fmt.bufPrint(&tmp, "cu{d}|shoe_size|beta", .{c}));
+        _ = try addCell(store, recs, alloc, .unknown_new, @intCast(c), ep.items, fc.items, relevance(rand));
+    }
+
+    // multi-valued: three values per subject, none of which contradicts
+    // another. The predicate rotates so the result is not about one word.
+    const multi_preds = [_][]const u8{ "likes", "knows", "uses", "prefers", "speaks", "visited" };
     for (0..shape.multi_subjects) |s| {
         for (0..3) |v| {
             ep.clearRetainingCapacity();
             fc.clearRetainingCapacity();
             try words(alloc, &ep, rand, 8);
-            try fc.appendSlice(alloc, try std.fmt.bufPrint(&tmp, "ms{d}|likes|item{d}", .{ s, v }));
+            try fc.appendSlice(alloc, try std.fmt.bufPrint(&tmp, "ms{d}|{s}|item{d}", .{ s, multi_preds[s % multi_preds.len], v }));
             _ = try addCell(store, recs, alloc, .multi, @intCast(s), ep.items, fc.items, relevance(rand));
         }
     }
@@ -201,6 +227,8 @@ fn buildCorpus(store: *Store, alloc: Allocator, seed: u64, shape: Shape, recs: *
     }
 }
 
+const Arm = enum { decay_only, all, functional };
+
 const Side = struct {
     forgotten: [N_KINDS]usize = @splat(0),
     total: [N_KINDS]usize = @splat(0),
@@ -210,9 +238,11 @@ const Side = struct {
     res_redundant: usize = 0,
     res_conflicted: usize = 0,
     res_superseded: usize = 0,
-    // retrieval
+    // retrieval: is the top-1 hit of a contradiction pair the CURRENT value?
     conflict_top1_current: usize = 0,
     conflict_queries: usize = 0,
+    unknown_top1_current: usize = 0,
+    unknown_queries: usize = 0,
     dup_members_in_top5: usize = 0,
     dup_queries: usize = 0,
     dup_group_found: usize = 0,
@@ -222,14 +252,62 @@ const Side = struct {
     sweep_ms: f64 = 0,
 };
 
-fn evaluate(alloc: Allocator, seed: u64, shape: Shape, legacy: bool) !Side {
+/// For each contradiction pair, query by the pair's shared key and ask whether
+/// the first of the pair to appear is the new (current) cell. Only queries where
+/// at least one of the two is reachable count.
+fn pairRetrieval(
+    store: *Store,
+    alloc: Allocator,
+    recs: []const Rec,
+    old_kind: Kind,
+    new_kind: Kind,
+    comptime key_fmt: []const u8,
+    n: usize,
+    queries: *usize,
+    top1_current: *usize,
+) !void {
+    var c_old = std.AutoHashMap(u32, u64).init(alloc);
+    defer c_old.deinit();
+    var c_new = std.AutoHashMap(u32, u64).init(alloc);
+    defer c_new.deinit();
+    for (recs) |r| {
+        if (r.kind == old_kind) try c_old.put(r.group, r.id);
+        if (r.kind == new_kind) try c_new.put(r.group, r.id);
+    }
+    var qbuf: [64]u8 = undefined;
+    for (0..n) |c| {
+        const new_id = c_new.get(@intCast(c)).?;
+        const old_id = c_old.get(@intCast(c)).?;
+        const text = try std.fmt.bufPrint(&qbuf, key_fmt, .{c});
+        const hits = try store.query(alloc, text, .{ .topk = 5 });
+        defer alloc.free(hits);
+        var found_any = false;
+        for (hits) |h| if (h.cell.id == new_id or h.cell.id == old_id) {
+            found_any = true;
+        };
+        if (!found_any) continue;
+        queries.* += 1;
+        for (hits) |h| {
+            if (h.cell.id == new_id or h.cell.id == old_id) {
+                if (h.cell.id == new_id) top1_current.* += 1;
+                break;
+            }
+        }
+    }
+}
+
+fn evaluate(alloc: Allocator, seed: u64, shape: Shape, arm: Arm) !Side {
     const store = try Store.init(alloc, .{ .data_dir = null, .seed_default_goals = true });
     defer store.deinit();
-    if (legacy) {
-        // The forgetter before this change: decay only.
-        store.lc.cfg.supersede_on_conflict = false;
-        store.lc.forgetter.cfg.supersede_on_conflict = false;
-        store.lc.forgetter.cfg.redundancy_threshold = 2.0;
+    switch (arm) {
+        // The forgetter before net_existence: decay only.
+        .decay_only => {
+            store.setSupersedeMode(.off);
+            store.lc.forgetter.cfg.redundancy_threshold = 2.0;
+        },
+        // The first cut: every subject+predicate is single-valued.
+        .all => store.setSupersedeMode(.all),
+        .functional => {},
     }
 
     var recs: std.ArrayList(Rec) = .empty;
@@ -253,8 +331,7 @@ fn evaluate(alloc: Allocator, seed: u64, shape: Shape, legacy: bool) !Side {
         if (!e.found_existing or imp > e.value_ptr.imp) e.value_ptr.* = .{ .id = r.id, .imp = imp };
     }
 
-    // ---- retrieval BEFORE the sweep is not what we compare; both sides are
-    // measured AFTER their own sweep, which is what a user would see.
+    // Every arm is measured AFTER its own sweep, which is what a user sees.
     const t0 = nowNs();
     const sw = try store.forget(false);
     side.sweep_ms = @as(f64, @floatFromInt(nowNs() - t0)) / 1e6;
@@ -276,41 +353,8 @@ fn evaluate(alloc: Allocator, seed: u64, shape: Shape, legacy: bool) !Side {
         if (store.getCell(e.value_ptr.id) != null) side.dup_rep_kept += 1;
     }
 
-    // ---- retrieval: contradiction pairs. Query = the pair's shared key.
-    // Default recall (legacy store never marks anything, so it is the
-    // pre-change behaviour: old and new compete on score).
-    var qbuf: [64]u8 = undefined;
-    var c_old = std.AutoHashMap(u32, u64).init(alloc);
-    defer c_old.deinit();
-    var c_new = std.AutoHashMap(u32, u64).init(alloc);
-    defer c_new.deinit();
-    for (recs.items) |r| switch (r.kind) {
-        .conflict_old => try c_old.put(r.group, r.id),
-        .conflict_new => try c_new.put(r.group, r.id),
-        else => {},
-    };
-    for (0..shape.conflicts) |c| {
-        const new_id = c_new.get(@intCast(c)).?;
-        const old_id = c_old.get(@intCast(c)).?;
-        // The episode of the new cell is the query: "which memory states the
-        // current value of this key". Query by the shared fact key words.
-        const text = try std.fmt.bufPrint(&qbuf, "cs{d} status", .{c});
-        const hits = try store.query(alloc, text, .{ .topk = 5 });
-        defer alloc.free(hits);
-        // Only count queries where at least one of the pair is reachable.
-        var found_any = false;
-        for (hits) |h| if (h.cell.id == new_id or h.cell.id == old_id) {
-            found_any = true;
-        };
-        if (!found_any) continue;
-        side.conflict_queries += 1;
-        for (hits) |h| {
-            if (h.cell.id == new_id or h.cell.id == old_id) {
-                if (h.cell.id == new_id) side.conflict_top1_current += 1;
-                break;
-            }
-        }
-    }
+    try pairRetrieval(store, alloc, recs.items, .conflict_old, .conflict_new, "cs{d} status", shape.conflicts, &side.conflict_queries, &side.conflict_top1_current);
+    try pairRetrieval(store, alloc, recs.items, .unknown_old, .unknown_new, "cu{d} shoe_size", shape.unknown_conflicts, &side.unknown_queries, &side.unknown_top1_current);
 
     // ---- retrieval: duplicate groups. Query = the original's own text.
     var group_text = std.AutoHashMap(u32, []const u8).init(alloc);
@@ -362,93 +406,126 @@ fn pct(n: usize, d: usize) f64 {
     return 100.0 * @as(f64, @floatFromInt(n)) / @as(f64, @floatFromInt(d));
 }
 
-fn row(name: []const u8, b: Side, a: Side, k: Kind) void {
+fn row(name: []const u8, sides: [3]Side, k: Kind) void {
     const i = @intFromEnum(k);
-    pr("  {s:<14} n={d:<4} forgotten before={d:<4} after={d:<4}  superseded before={d:<3} after={d:<3}\n", .{
-        name, a.total[i], b.forgotten[i], a.forgotten[i], b.superseded[i], a.superseded[i],
+    pr("  {s:<13} n={d:<4} forgotten {d:>3} | {d:>3} | {d:>3}     superseded {d:>3} | {d:>3} | {d:>3}\n", .{
+        name,
+        sides[2].total[i],
+        sides[0].forgotten[i],
+        sides[1].forgotten[i],
+        sides[2].forgotten[i],
+        sides[0].superseded[i],
+        sides[1].superseded[i],
+        sides[2].superseded[i],
     });
 }
 
+fn meanTop5(s: Side) f64 {
+    return if (s.dup_queries == 0) 0.0 else @as(f64, @floatFromInt(s.dup_members_in_top5)) / @as(f64, @floatFromInt(s.dup_queries));
+}
+
+/// Returns false if a guarantee of the default (functional) arm is broken.
 pub fn runNetex(alloc: Allocator, seed: u64, shape: Shape) !void {
-    const before = try evaluate(alloc, seed, shape, true);
-    const after = try evaluate(alloc, seed, shape, false);
+    const sides = [3]Side{
+        try evaluate(alloc, seed, shape, .decay_only),
+        try evaluate(alloc, seed, shape, .all),
+        try evaluate(alloc, seed, shape, .functional),
+    };
+    const d = sides[0];
+    const all = sides[1];
+    const fun = sides[2];
 
     var n_cells: usize = 0;
-    for (after.total) |t| n_cells += t;
-    pr("\n=== net_existence evaluation: seed={d}, {d} cells ===\n\n", .{ seed, n_cells });
+    for (fun.total) |t| n_cells += t;
+    pr("\n=== net_existence evaluation: seed={d}, {d} cells ===\n", .{ seed, n_cells });
+    pr("Arms, left to right: decay_only (before net_existence) | all (first cut: every predicate single-valued) | functional (default)\n\n", .{});
     pr("Per kind (forgotten = moved to the fuzzy store; superseded = marked superseded_at):\n", .{});
-    row("unique", before, after, .unique);
-    row("dup_orig", before, after, .dup_orig);
-    row("dup_exact", before, after, .dup_exact);
-    row("dup_near1", before, after, .dup_near1);
-    row("dup_near2", before, after, .dup_near2);
-    row("conflict_old", before, after, .conflict_old);
-    row("conflict_new", before, after, .conflict_new);
-    row("multi", before, after, .multi);
-    row("templ", before, after, .templ);
-    row("stale", before, after, .stale);
+    row("unique", sides, .unique);
+    row("dup_orig", sides, .dup_orig);
+    row("dup_exact", sides, .dup_exact);
+    row("dup_near1", sides, .dup_near1);
+    row("dup_near2", sides, .dup_near2);
+    row("conflict_old", sides, .conflict_old);
+    row("conflict_new", sides, .conflict_new);
+    row("unknown_old", sides, .unknown_old);
+    row("unknown_new", sides, .unknown_new);
+    row("multi", sides, .multi);
+    row("templ", sides, .templ);
+    row("stale", sides, .stale);
 
-    pr("\nSweep reasons (before | after):\n", .{});
-    pr("  decayed    {d:>5} | {d:<5}\n", .{ before.res_decayed, after.res_decayed });
-    pr("  redundant  {d:>5} | {d:<5}\n", .{ before.res_redundant, after.res_redundant });
-    pr("  conflicted {d:>5} | {d:<5}\n", .{ before.res_conflicted, after.res_conflicted });
-    pr("  superseded {d:>5} | {d:<5}   (newly marked by the sweep; write-time marks are counted per kind above)\n", .{ before.res_superseded, after.res_superseded });
+    pr("\nSweep reasons (decay_only | all | functional):\n", .{});
+    pr("  decayed    {d:>5} | {d:>5} | {d:<5}\n", .{ d.res_decayed, all.res_decayed, fun.res_decayed });
+    pr("  redundant  {d:>5} | {d:>5} | {d:<5}\n", .{ d.res_redundant, all.res_redundant, fun.res_redundant });
+    pr("  conflicted {d:>5} | {d:>5} | {d:<5}\n", .{ d.res_conflicted, all.res_conflicted, fun.res_conflicted });
+    pr("  superseded {d:>5} | {d:>5} | {d:<5}   (newly marked by the sweep; write-time marks are counted per kind above)\n", .{ d.res_superseded, all.res_superseded, fun.res_superseded });
 
-    // ---- derived: duplicates
+    const co = @intFromEnum(Kind.conflict_old);
+    const uo = @intFromEnum(Kind.unknown_old);
+    const mu = @intFromEnum(Kind.multi);
+    const un = @intFromEnum(Kind.unique);
+    const cn = @intFromEnum(Kind.conflict_new);
+    const un_new = @intFromEnum(Kind.unknown_new);
+
+    // ---- derived: duplicates (the same in every arm that has the term)
     const d_orig = @intFromEnum(Kind.dup_orig);
     const d_exact = @intFromEnum(Kind.dup_exact);
-    const d_n1 = @intFromEnum(Kind.dup_near1);
-    const d_n2 = @intFromEnum(Kind.dup_near2);
-    const exact_removed_a = after.forgotten[d_orig] + after.forgotten[d_exact];
-    const exact_removed_b = before.forgotten[d_orig] + before.forgotten[d_exact];
-    var fp_after: usize = 0;
-    var fp_before: usize = 0;
-    for ([_]Kind{ .unique, .conflict_new, .multi, .templ }) |k| {
-        fp_after += after.forgotten[@intFromEnum(k)];
-        fp_before += before.forgotten[@intFromEnum(k)];
-    }
-    pr("\nDuplicates ({d} groups: original + exact copy + 1-token edit + 2-token edit, one fact each):\n", .{after.dup_groups});
-    pr("  exact-copy pairs reduced to one cell   before {d}/{d}   after {d}/{d}\n", .{ exact_removed_b, after.dup_groups, exact_removed_a, after.dup_groups });
-    pr("  most-important member of the group kept   before {d}/{d}   after {d}/{d}\n", .{ before.dup_rep_kept, before.dup_groups, after.dup_rep_kept, after.dup_groups });
-    pr("  near-duplicates forgotten: 1-token edit (J~0.86) {d}/{d}, 2-token edit (J~0.67, below tau) {d}/{d}\n", .{
-        after.forgotten[d_n1], after.total[d_n1], after.forgotten[d_n2], after.total[d_n2],
+    pr("\nDuplicates ({d} groups: original + exact copy + 1-token edit + 2-token edit, one fact each):\n", .{fun.dup_groups});
+    pr("  exact-copy pairs reduced to one cell   decay_only {d}/{d}   functional {d}/{d}\n", .{
+        d.forgotten[d_orig] + d.forgotten[d_exact], fun.dup_groups, fun.forgotten[d_orig] + fun.forgotten[d_exact], fun.dup_groups,
     });
-    pr("  (a near-duplicate is forgotten only when s > importance/(importance+theta); at typical importance that needs J ~ 0.96+, so these stay, with a lowered net_existence.)\n", .{});
+    pr("  most-important member of the group kept   decay_only {d}/{d}   functional {d}/{d}\n", .{ d.dup_rep_kept, d.dup_groups, fun.dup_rep_kept, fun.dup_groups });
+    pr("  duplicate copies in top-5 (mean)   decay_only {d:.2}   functional {d:.2}\n", .{ meanTop5(d), meanTop5(fun) });
 
-    // ---- derived: supersession
-    const co = @intFromEnum(Kind.conflict_old);
-    const cn = @intFromEnum(Kind.conflict_new);
-    const mu = @intFromEnum(Kind.multi);
-    const sup_tp = after.superseded[co];
-    const sup_fp_new = after.superseded[cn];
-    const sup_fp_multi = after.superseded[mu];
-    const sup_fp = sup_fp_new + sup_fp_multi + after.superseded[@intFromEnum(Kind.unique)];
-    const sup_total = sup_tp + sup_fp;
-    // The last of three multi-values is never superseded by definition; the
-    // first two are what the heuristic key wrongly marks.
-    pr("\nSupersession (ground truth: conflict_old superseded; nothing else):\n", .{});
-    pr("  recall    {d}/{d} ({d:.1}%)\n", .{ sup_tp, after.total[co], pct(sup_tp, after.total[co]) });
-    pr("  precision {d}/{d} ({d:.1}%)   false marks: multi-valued={d} (of {d} cells), conflict_new={d}\n", .{
-        sup_tp, sup_total, pct(sup_tp, sup_total), sup_fp_multi, after.total[mu], sup_fp_new,
+    // ---- the three supersession scenarios, per arm
+    pr("\nSupersession, by scenario (recall = contradicted cells superseded; false = cells superseded that no fact contradicts):\n", .{});
+    pr("  (a) single-valued `status`   n={d}:  recall  all {d}/{d}   functional {d}/{d}\n", .{ fun.total[co], all.superseded[co], all.total[co], fun.superseded[co], fun.total[co] });
+    pr("  (b) multi-valued (rotating)  n={d}:  false marks  all {d}   functional {d}      forgotten  all {d}   functional {d}\n", .{
+        fun.total[mu], all.superseded[mu], fun.superseded[mu], all.forgotten[mu], fun.forgotten[mu],
+    });
+    pr("  (c) unknown `shoe_size`      n={d}:  recall  all {d}/{d}   functional {d}/{d}   <- the abandoned recall: real contradictions the default leaves visible\n", .{
+        fun.total[uo], all.superseded[uo], all.total[uo], fun.superseded[uo], fun.total[uo],
     });
 
     // ---- derived: collateral
-    pr("\nCollateral (must be 0 for unique / conflict_new; templ and multi are known weak spots):\n", .{});
-    pr("  forgotten non-duplicate cells   before {d}   after {d}\n", .{ fp_before, fp_after });
-    pr("  unique forgotten                before {d}   after {d}   (of {d})\n", .{ before.forgotten[@intFromEnum(Kind.unique)], after.forgotten[@intFromEnum(Kind.unique)], after.total[@intFromEnum(Kind.unique)] });
-    pr("  templ forgotten                 before {d}   after {d}   (of {d}; distinct tickets whose text differs by one token)\n", .{ before.forgotten[@intFromEnum(Kind.templ)], after.forgotten[@intFromEnum(Kind.templ)], after.total[@intFromEnum(Kind.templ)] });
+    pr("\nCollateral (must be 0 for unique / conflict_new / unknown_new):\n", .{});
+    pr("  unique forgotten        decay_only {d}   all {d}   functional {d}   (of {d})\n", .{ d.forgotten[un], all.forgotten[un], fun.forgotten[un], fun.total[un] });
+    pr("  conflict_new forgotten  decay_only {d}   all {d}   functional {d}\n", .{ d.forgotten[cn], all.forgotten[cn], fun.forgotten[cn] });
+    pr("  templ forgotten         decay_only {d}   all {d}   functional {d}   (of {d}; distinct tickets whose text differs by one token)\n", .{
+        d.forgotten[@intFromEnum(Kind.templ)], all.forgotten[@intFromEnum(Kind.templ)], fun.forgotten[@intFromEnum(Kind.templ)], fun.total[@intFromEnum(Kind.templ)],
+    });
 
     // ---- derived: retrieval
-    pr("\nRetrieval after the sweep:\n", .{});
-    pr("  contradiction pairs, top-1 hit is the CURRENT value   before {d}/{d} ({d:.1}%)   after {d}/{d} ({d:.1}%)\n", .{
-        before.conflict_top1_current, before.conflict_queries, pct(before.conflict_top1_current, before.conflict_queries),
-        after.conflict_top1_current,  after.conflict_queries,  pct(after.conflict_top1_current, after.conflict_queries),
+    pr("\nRetrieval after the sweep (top-1 hit of a contradiction pair is the CURRENT value):\n", .{});
+    pr("  (a) status      decay_only {d}/{d} ({d:.1}%)   all {d}/{d} ({d:.1}%)   functional {d}/{d} ({d:.1}%)\n", .{
+        d.conflict_top1_current,   d.conflict_queries,   pct(d.conflict_top1_current, d.conflict_queries),
+        all.conflict_top1_current, all.conflict_queries, pct(all.conflict_top1_current, all.conflict_queries),
+        fun.conflict_top1_current, fun.conflict_queries, pct(fun.conflict_top1_current, fun.conflict_queries),
     });
-    const bd = if (before.dup_queries == 0) 0.0 else @as(f64, @floatFromInt(before.dup_members_in_top5)) / @as(f64, @floatFromInt(before.dup_queries));
-    const ad = if (after.dup_queries == 0) 0.0 else @as(f64, @floatFromInt(after.dup_members_in_top5)) / @as(f64, @floatFromInt(after.dup_queries));
-    pr("  duplicate groups, copies of one memory in top-5 (mean)  before {d:.2}   after {d:.2}\n", .{ bd, ad });
-    pr("  duplicate groups still reachable (>=1 member in top-5)   before {d}/{d}   after {d}/{d}\n", .{ before.dup_group_found, before.dup_queries, after.dup_group_found, after.dup_queries });
-    pr("\nSweep wall time (whole corpus, includes the move to the fuzzy store): before {d:.1} ms, after {d:.1} ms\n\n", .{ before.sweep_ms, after.sweep_ms });
+    pr("  (c) shoe_size   decay_only {d}/{d} ({d:.1}%)   all {d}/{d} ({d:.1}%)   functional {d}/{d} ({d:.1}%)   (functional shows both values, so the old one can rank first)\n", .{
+        d.unknown_top1_current,   d.unknown_queries,   pct(d.unknown_top1_current, d.unknown_queries),
+        all.unknown_top1_current, all.unknown_queries, pct(all.unknown_top1_current, all.unknown_queries),
+        fun.unknown_top1_current, fun.unknown_queries, pct(fun.unknown_top1_current, fun.unknown_queries),
+    });
+    pr("\nSweep wall time (whole corpus, includes the move to the fuzzy store): decay_only {d:.1} ms, all {d:.1} ms, functional {d:.1} ms\n", .{ d.sweep_ms, all.sweep_ms, fun.sweep_ms });
+
+    // ---- guarantees of the shipped default
+    var broken: usize = 0;
+    const checks = [_]struct { name: []const u8, ok: bool }{
+        .{ .name = "(a) every contradicted `status` cell superseded", .ok = fun.superseded[co] == fun.total[co] },
+        .{ .name = "(a) no `status` current cell superseded", .ok = fun.superseded[cn] == 0 },
+        .{ .name = "(b) 0 multi-valued cells superseded", .ok = fun.superseded[mu] == 0 },
+        .{ .name = "(b) 0 multi-valued cells forgotten", .ok = fun.forgotten[mu] == 0 },
+        .{ .name = "(c) 0 unknown-predicate cells superseded", .ok = fun.superseded[uo] == 0 and fun.superseded[un_new] == 0 },
+        .{ .name = "(c) 0 unknown-predicate cells forgotten", .ok = fun.forgotten[uo] == 0 and fun.forgotten[un_new] == 0 },
+        .{ .name = "0 unique cells forgotten", .ok = fun.forgotten[un] == 0 },
+    };
+    pr("\nAssertions on the default (functional) arm:\n", .{});
+    for (checks) |c| {
+        pr("  {s}  {s}\n", .{ if (c.ok) "PASS" else "FAIL", c.name });
+        if (!c.ok) broken += 1;
+    }
+    pr("\n", .{});
+    if (broken != 0) return error.GuaranteeBroken;
 }
 
 // ============================================================================

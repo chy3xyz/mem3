@@ -24,10 +24,18 @@
 //!   MemCells with conflicting atomic_facts": hiding a cell from recall is
 //!   the costly mistake, showing a stale fact beside its correction is not.
 //!   A cell with no keyed facts is never superseded.
-//! * Predicates are not classified as single- or multi-valued. `user|knows|a`
-//!   then `user|knows|b` is a conflict here, exactly as `user|lives_in|x` then
-//!   `user|lives_in|y` is. That is the spec's rule taken literally and it is
-//!   the largest false-positive risk in this file; see the ADR.
+//! * **Only single-valued predicates can supersede.** `Policy` decides which.
+//!   By default (`functional`) that is a small explicit list (`lives_in`,
+//!   `works_at`, `status`, `current_*`, ...; `default_functional`); every other
+//!   predicate is multi-valued, never supersedes, and never counts toward a
+//!   conflict. `user|likes|tea` then `user|likes|coffee` therefore leaves
+//!   both cells current. `all` restores the first heuristic (every
+//!   subject+predicate is single-valued) as an explicit opt-in; `off`
+//!   disables supersession. A cell is only hidden when *every* fact it
+//!   asserts is functional and contradicted, so a cell that also says
+//!   something multi-valued is never hidden by a functional change.
+//! * A cell an operator restored with `mem3 unsupersede`
+//!   (`metadata.supersede_pinned`) is never superseded again.
 //!
 //! ## The index
 //!
@@ -49,6 +57,107 @@ const Allocator = std.mem.Allocator;
 const core = @import("../core/mod.zig");
 const MemCell = core.MemCell;
 const Fact = core.Fact;
+
+pub const Mode = core.SupersedeMode;
+
+/// Predicates treated as single-valued when no list is configured. Small on
+/// purpose: a predicate belongs here only if a person has (at any one time)
+/// one value for it, so that a newer, different value really does replace the
+/// older one. Anything uncertain is left off, because the cost of a missing
+/// entry is a stale fact shown next to its correction, and the cost of a wrong
+/// one is a true fact silently hidden. Matching is on the normalised
+/// predicate (trimmed, lower-case, space/hyphen -> `_`); a trailing `*` is a
+/// prefix match. Deliberately NOT here: `is`, `has`, `owns`, `likes`,
+/// `prefers`, `uses`, `knows`, `role` (all multi-valued). ADR 0005 gives the
+/// reasoning entry by entry.
+pub const default_functional = [_][]const u8{
+    "lives_in",
+    "resides_in",
+    "located_in",
+    "works_at",
+    "employed_by",
+    "has_status",
+    "status",
+    "version",
+    "name",
+    "email",
+    "owner",
+    "born_in",
+    "birthday",
+    "current_*",
+};
+
+/// Normalise a predicate for list matching into `buf`; null when it is empty
+/// or too long to be any list entry.
+fn normPredicate(buf: []u8, s: []const u8) ?[]const u8 {
+    const t = std.mem.trim(u8, s, " \t\r\n");
+    if (t.len == 0 or t.len > buf.len) return null;
+    for (t, buf[0..t.len]) |c, *o| o.* = switch (c) {
+        ' ', '-' => '_',
+        else => std.ascii.toLower(c),
+    };
+    return buf[0..t.len];
+}
+
+fn entryMatches(entry: []const u8, pred: []const u8) bool {
+    if (entry.len > 1 and entry[entry.len - 1] == '*') {
+        const prefix = entry[0 .. entry.len - 1];
+        return pred.len > prefix.len and std.mem.startsWith(u8, pred, prefix);
+    }
+    return std.mem.eql(u8, entry, pred);
+}
+
+/// Which predicates may supersede. Cheap to copy; the `predicates` text is
+/// borrowed.
+pub const Policy = struct {
+    mode: Mode = .functional,
+    /// Comma-separated list. `null` = `default_functional`. A plain list
+    /// replaces the default; a leading `+` extends it.
+    predicates: ?[]const u8 = null,
+
+    pub fn fromConfig(cfg: core.Config) Policy {
+        return .{ .mode = cfg.supersede_mode, .predicates = cfg.functional_predicates };
+    }
+
+    /// May a fact with this predicate supersede / be superseded?
+    pub fn isFunctional(self: Policy, predicate: []const u8) bool {
+        switch (self.mode) {
+            .off => return false,
+            .all => return std.mem.trim(u8, predicate, " \t\r\n").len > 0,
+            .functional => {},
+        }
+        var pbuf: [96]u8 = undefined;
+        const pred = normPredicate(&pbuf, predicate) orelse return false;
+        var use_default = true;
+        if (self.predicates) |list| {
+            var rest = std.mem.trim(u8, list, " \t\r\n");
+            if (rest.len > 0 and rest[0] == '+') {
+                rest = rest[1..];
+            } else {
+                use_default = false;
+            }
+            var it = std.mem.splitScalar(u8, rest, ',');
+            while (it.next()) |raw| {
+                var ebuf: [96]u8 = undefined;
+                const entry = normPredicate(&ebuf, raw) orelse continue;
+                if (entryMatches(entry, pred)) return true;
+            }
+        }
+        if (use_default) {
+            for (default_functional) |entry| {
+                if (entryMatches(entry, pred)) return true;
+            }
+        }
+        return false;
+    }
+};
+
+/// A cell superseded by a newer one, and the fact of the newer cell that
+/// contradicted it (its strings are borrowed from the newer cell).
+pub const Hit = struct {
+    old: *MemCell,
+    via: Fact,
+};
 
 fn trimmed(s: []const u8) []const u8 {
     return std.mem.trim(u8, s, " \t\r\n");
@@ -128,9 +237,17 @@ const KeyEntry = struct {
 pub const ConflictIndex = struct {
     alloc: Allocator,
     keys: std.AutoHashMapUnmanaged(u64, KeyEntry) = .empty,
+    /// Which contradictions count. The index itself holds every asserted fact
+    /// whatever the policy, so this can change at any time (the CLI sets it
+    /// after a snapshot load) without re-indexing.
+    policy: Policy = .{},
 
     pub fn init(alloc: Allocator) ConflictIndex {
         return .{ .alloc = alloc };
+    }
+
+    pub fn initWithPolicy(alloc: Allocator, policy: Policy) ConflictIndex {
+        return .{ .alloc = alloc, .policy = policy };
     }
 
     pub fn deinit(self: *ConflictIndex) void {
@@ -201,15 +318,28 @@ pub const ConflictIndex = struct {
     }
 
     /// The indexed cells that `newer` supersedes: older (smaller id), not
-    /// already superseded, and with every keyed fact contradicted. Appended to
-    /// `out` in ascending id order. `newer` may or may not be indexed itself.
-    /// Nothing is mutated.
+    /// already superseded, not pinned, with every fact functional and
+    /// contradicted. Appended to `out` in ascending id order. `newer` may or
+    /// may not be indexed itself. Nothing is mutated.
     pub fn detect(self: *ConflictIndex, alloc: Allocator, newer: *const MemCell, out: *std.ArrayList(*MemCell)) !void {
-        var touched: std.AutoHashMapUnmanaged(u64, *MemCell) = .empty;
+        var hits: std.ArrayList(Hit) = .empty;
+        defer hits.deinit(alloc);
+        try self.detectHits(alloc, newer, &hits);
+        for (hits.items) |h| try out.append(alloc, h.old);
+    }
+
+    /// `detect`, naming for each superseded cell the contradicting fact of
+    /// `newer` (the audit trail `memory_add` reports).
+    pub fn detectHits(self: *ConflictIndex, alloc: Allocator, newer: *const MemCell, out: *std.ArrayList(Hit)) !void {
+        if (self.policy.mode == .off) return;
+        const Touched = struct { cell: *MemCell, via: usize };
+        var touched: std.AutoHashMapUnmanaged(u64, Touched) = .empty;
         defer touched.deinit(alloc);
 
-        for (newer.atomic_facts) |nf| {
+        for (newer.atomic_facts, 0..) |nf, fi| {
             const k = keyOf(nf) orelse continue;
+            // Multi-valued: a second value is an addition, not a correction.
+            if (!self.policy.isFunctional(nf.predicate)) continue;
             const e = self.keys.getPtr(k.kh) orelse continue;
             for (e.groups.items) |*g| {
                 if (g.oh == k.oh) continue;
@@ -217,8 +347,11 @@ pub const ConflictIndex = struct {
                 while (it.next()) |c| {
                     const old = c.value_ptr.*;
                     if (old.id >= newer.id or old.metadata.superseded_at != null) continue;
+                    // An operator already said this one is still true.
+                    if (old.metadata.supersede_pinned) continue;
                     if (!hasConflictingFact(old, nf)) continue;
-                    try touched.put(alloc, old.id, old);
+                    const slot = try touched.getOrPut(alloc, old.id);
+                    if (!slot.found_existing) slot.value_ptr.* = .{ .cell = old, .via = fi };
                 }
             }
         }
@@ -226,18 +359,22 @@ pub const ConflictIndex = struct {
         const start = out.items.len;
         var it = touched.iterator();
         while (it.next()) |t| {
-            if (self.fullyContradicted(t.value_ptr.*, newer)) try out.append(alloc, t.value_ptr.*);
+            if (self.fullyContradicted(t.value_ptr.cell, newer)) {
+                try out.append(alloc, .{ .old = t.value_ptr.cell, .via = newer.atomic_facts[t.value_ptr.via] });
+            }
         }
-        std.mem.sort(*MemCell, out.items[start..], {}, idLess);
+        std.mem.sort(Hit, out.items[start..], {}, hitLess);
     }
 
-    /// Every keyed fact of `old` is contradicted by `newer` or by another
-    /// indexed cell that arrived after `old`.
+    /// Every fact `old` asserts is functional and contradicted by `newer` or
+    /// by another indexed cell that arrived after `old`. One multi-valued
+    /// fact is enough to keep the cell: it still says something true.
     fn fullyContradicted(self: *ConflictIndex, old: *const MemCell, newer: *const MemCell) bool {
         var keyed: usize = 0;
         for (old.atomic_facts) |of| {
             const k = keyOf(of) orelse continue;
             keyed += 1;
+            if (!self.policy.isFunctional(of.predicate)) return false;
             if (hasConflictingFact(newer, of)) continue;
             const e = self.keys.getPtr(k.kh) orelse return false;
             var found = false;
@@ -259,8 +396,8 @@ pub const ConflictIndex = struct {
     }
 };
 
-fn idLess(_: void, a: *MemCell, b: *MemCell) bool {
-    return a.id < b.id;
+fn hitLess(_: void, a: Hit, b: Hit) bool {
+    return a.old.id < b.old.id;
 }
 
 /// Is fact `i` of `cell` a repeat of an earlier fact of the same cell (same

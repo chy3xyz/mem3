@@ -63,6 +63,7 @@ pub fn run(alloc: std.mem.Allocator, parsed: cli.Parsed) !void {
     } else {
         try buf.appendSlice(alloc, ",\"superseded_by\":null");
     }
+    try cli_common.appendFmt(&buf, alloc, ",\"supersede_pinned\":{}", .{cell.metadata.supersede_pinned});
     // The cells this one replaced, found by scanning both stores: one
     // inspect call, not a hot path, so no reverse index is kept for it.
     try buf.appendSlice(alloc, ",\"supersedes\":[");

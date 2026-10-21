@@ -316,7 +316,7 @@ fn cellWith(id: u64, facts: []const Fact) MemCell {
 
 test "conflict: the same subject and predicate with a different object supersedes the older cell" {
     const alloc = testing.allocator;
-    var idx = ConflictIndex.init(alloc);
+    var idx = ConflictIndex.initWithPolicy(alloc, .{ .mode = .all });
     defer idx.deinit();
     var old = cellWith(1, &.{fact("user", "prefers", "zig")});
     var newer = cellWith(2, &.{fact("user", "prefers", "rust")});
@@ -332,7 +332,7 @@ test "conflict: the same subject and predicate with a different object supersede
 
 test "conflict: key and object comparison ignore case and surrounding whitespace" {
     const alloc = testing.allocator;
-    var idx = ConflictIndex.init(alloc);
+    var idx = ConflictIndex.initWithPolicy(alloc, .{ .mode = .all });
     defer idx.deinit();
     var old = cellWith(1, &.{fact("User", " Prefers", "Zig")});
     var restated = cellWith(2, &.{fact("user", "prefers ", "zig")});
@@ -350,7 +350,7 @@ test "conflict: key and object comparison ignore case and surrounding whitespace
 
 test "conflict: a different predicate, an empty object, or no facts is never a conflict" {
     const alloc = testing.allocator;
-    var idx = ConflictIndex.init(alloc);
+    var idx = ConflictIndex.initWithPolicy(alloc, .{ .mode = .all });
     defer idx.deinit();
     var old = cellWith(1, &.{fact("user", "prefers", "zig")});
     try idx.index(&old);
@@ -368,7 +368,7 @@ test "conflict: a different predicate, an empty object, or no facts is never a c
 
 test "conflict: a cell is superseded only when every one of its facts is contradicted" {
     const alloc = testing.allocator;
-    var idx = ConflictIndex.init(alloc);
+    var idx = ConflictIndex.initWithPolicy(alloc, .{ .mode = .all });
     defer idx.deinit();
     var old = cellWith(1, &.{ fact("user", "prefers", "zig"), fact("user", "uses", "vim") });
     try idx.index(&old);
@@ -391,7 +391,7 @@ test "conflict: a cell is superseded only when every one of its facts is contrad
 
 test "conflict: a removed cell no longer conflicts, and a superseded cell is not re-detected" {
     const alloc = testing.allocator;
-    var idx = ConflictIndex.init(alloc);
+    var idx = ConflictIndex.initWithPolicy(alloc, .{ .mode = .all });
     defer idx.deinit();
     var old = cellWith(1, &.{fact("a", "b", "1")});
     var mid = cellWith(2, &.{fact("a", "b", "2")});
@@ -455,7 +455,7 @@ test "netex: conflict_score is the superseder's importance, so a weaker old fact
 }
 
 test "netex: supersession is off when the config says so" {
-    var w = try World.init(testing.allocator, .{ .forgetting_threshold = 0.1, .supersede_on_conflict = false });
+    var w = try World.init(testing.allocator, .{ .forgetting_threshold = 0.1, .supersede_mode = .off });
     defer w.deinit();
     try w.add(.{ .id = 1, .episode = "owner alice", .facts = &.{fact("plan", "owner", "alice")} });
     try w.add(.{ .id = 2, .episode = "owner bob", .facts = &.{fact("plan", "owner", "bob")} });

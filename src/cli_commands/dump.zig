@@ -69,6 +69,8 @@ fn writeCellJson(alloc: std.mem.Allocator, buf: *std.ArrayList(u8), cell: *const
     // Supersession: null while current, else when and by which cell.
     try appendOptInt(buf, alloc, "superseded_at", cell.metadata.superseded_at);
     try appendOptInt(buf, alloc, "superseded_by", cell.metadata.superseded_by);
+    // `true` after `mem3 unsupersede`: never superseded again.
+    try cli_common.appendFmt(buf, alloc, ",\"supersede_pinned\":{}", .{cell.metadata.supersede_pinned});
     try buf.appendSlice(alloc, ",\"atomic_facts\":[");
     for (cell.atomic_facts, 0..) |f, i| {
         if (i > 0) try buf.append(alloc, ',');
@@ -128,4 +130,32 @@ test "dump: a foresight-only cell lists its foresight entries" {
     const parsed = try std.json.parseFromSlice(std.json.Value, alloc, buf.items, .{});
     defer parsed.deinit();
     try std.testing.expectEqual(@as(usize, 1), parsed.value.object.get("foresight").?.array.items.len);
+}
+
+test "dump: every line carries superseded_at / superseded_by / supersede_pinned by default" {
+    const alloc = std.testing.allocator;
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(alloc);
+    var cell: MemCell = .{
+        .id = 5,
+        .source = .matter,
+        .episode = "the user lives in Paris",
+        .atomic_facts = &.{},
+        .foresight = &.{},
+        .goal_associations = &.{},
+        .metadata = .{},
+    };
+    try writeCellJson(alloc, &buf, &cell);
+    try std.testing.expect(std.mem.indexOf(u8, buf.items, "\"superseded_at\":null") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buf.items, "\"superseded_by\":null") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buf.items, "\"supersede_pinned\":false") != null);
+
+    buf.clearRetainingCapacity();
+    cell.metadata.superseded_at = 1234;
+    cell.metadata.superseded_by = 9;
+    cell.metadata.supersede_pinned = true;
+    try writeCellJson(alloc, &buf, &cell);
+    try std.testing.expect(std.mem.indexOf(u8, buf.items, "\"superseded_at\":1234") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buf.items, "\"superseded_by\":9") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buf.items, "\"supersede_pinned\":true") != null);
 }

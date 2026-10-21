@@ -124,7 +124,7 @@ pub fn run(alloc: std.mem.Allocator, p: cli.Parsed) !void {
         std.process.exit(1);
     };
     defer srv.deinit();
-    if (cli_common.hasSwitch(p, "--no-supersede")) srv.store.setSupersedeOnConflict(false);
+    try cli_common.applySupersedePolicy(srv.store, p);
 
     // SIGINT/SIGTERM become a graceful stop: `serve` returns, having
     // refused new connections, drained in-flight ones and flushed the WAL.

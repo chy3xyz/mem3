@@ -103,6 +103,11 @@ pub const Metadata = struct {
     /// together with `superseded_at`; `null` for a `superseded_at` that was
     /// written by a build that did not record the superseder (snapshot v1/v2).
     superseded_by: ?u64 = null,
+    /// Set by `mem3 unsupersede`: an operator said this cell is still true
+    /// although a newer cell contradicts it. Conflict detection (write-time
+    /// and sweep) never supersedes a pinned cell again. Persisted: snapshot
+    /// v3 flag bit, and a WAL `memcell_update` record.
+    supersede_pinned: bool = false,
     /// When this cell was moved to the fuzzy store.
     fuzzed_at: ?i64 = null,
 

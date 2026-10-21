@@ -1248,8 +1248,8 @@ pub const Server = struct {
         };
         defer mem3_store.freeForesight(self.alloc, foresight);
 
-        var superseded: std.ArrayList(u64) = .empty;
-        defer superseded.deinit(self.alloc);
+        var superseded: std.ArrayList(mem3_store.Supersession) = .empty;
+        defer mem3_store.freeSupersessions(self.alloc, &superseded);
         const id = self.store.addRawReporting(source, episode, facts, goal_id, relevance, foresight, &superseded) catch |err| {
             // `jsonResponse` copies its body, so the formatted message is
             // ours to free. It was not, and every refused insert leaked it.
@@ -1264,12 +1264,8 @@ pub const Server = struct {
         try resp.print(self.alloc, "{{\"id\":{d}", .{id});
         // Additive: only present when this insert replaced an older fact.
         if (superseded.items.len > 0) {
-            try resp.appendSlice(self.alloc, ",\"superseded\":[");
-            for (superseded.items, 0..) |sid, i| {
-                if (i > 0) try resp.append(self.alloc, ',');
-                try resp.print(self.alloc, "{d}", .{sid});
-            }
-            try resp.append(self.alloc, ']');
+            try resp.appendSlice(self.alloc, ",\"superseded\":");
+            try mem3_store.appendSupersededJson(self.alloc, &resp, superseded.items);
         }
         try resp.append(self.alloc, '}');
         return self.rawJson(201, try resp.toOwnedSlice(self.alloc));

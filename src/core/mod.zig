@@ -18,3 +18,4 @@ pub const EdgeType = types.EdgeType;
 pub const MemCell = memcell.MemCell;
 pub const IdSources = ids.IdSources;
 pub const Config = config.Config;
+pub const SupersedeMode = config.SupersedeMode;

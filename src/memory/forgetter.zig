@@ -291,8 +291,8 @@ pub const Forgetter = struct {
         }
 
         // ---- 2. conflicts nobody recorded yet ------------------------------
-        if (self.cfg.supersede_on_conflict) {
-            var ci = conflict.ConflictIndex.init(self.alloc);
+        if (self.cfg.supersede_mode != .off) {
+            var ci = conflict.ConflictIndex.initWithPolicy(self.alloc, conflict.Policy.fromConfig(self.cfg));
             defer ci.deinit();
             var olds = std.ArrayList(*MemCell).empty;
             defer olds.deinit(self.alloc);

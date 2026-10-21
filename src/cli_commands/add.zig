@@ -128,7 +128,7 @@ pub fn addMemoryReporting(
     store: *Store,
     alloc: std.mem.Allocator,
     mem: Memory,
-    superseded_out: ?*std.ArrayList(u64),
+    superseded_out: ?*std.ArrayList(store_mod.Supersession),
 ) !u64 {
     if (mem.foresight.len == 0 and mem.goal_associations.len == 0) {
         return core.Error.SpiritDimMissing;
@@ -216,8 +216,8 @@ pub fn run(alloc: std.mem.Allocator, parsed: cli.Parsed) !void {
         }
     }
 
-    var superseded: std.ArrayList(u64) = .empty;
-    defer superseded.deinit(alloc);
+    var superseded: std.ArrayList(store_mod.Supersession) = .empty;
+    defer store_mod.freeSupersessions(alloc, &superseded);
     const id = addMemoryReporting(store, alloc, .{
         .source = source.?,
         .episode = episode.?,
@@ -238,20 +238,16 @@ pub fn run(alloc: std.mem.Allocator, parsed: cli.Parsed) !void {
         try cli_common.appendFmt(&out, alloc, "{{\"id\":{d}", .{id});
         // Additive: only present when this add replaced an older fact.
         if (superseded.items.len > 0) {
-            try out.appendSlice(alloc, ",\"superseded\":[");
-            for (superseded.items, 0..) |sid, i| {
-                if (i > 0) try out.append(alloc, ',');
-                try cli_common.appendFmt(&out, alloc, "{d}", .{sid});
-            }
-            try out.append(alloc, ']');
+            try out.appendSlice(alloc, ",\"superseded\":");
+            try store_mod.appendSupersededJson(alloc, &out, superseded.items);
         }
         try out.append(alloc, '}');
     } else {
         try cli_common.appendFmt(&out, alloc, "added memory id={d}", .{id});
         if (superseded.items.len > 0) {
             try out.appendSlice(alloc, " (superseded:");
-            for (superseded.items) |sid| try cli_common.appendFmt(&out, alloc, " {d}", .{sid});
-            try out.append(alloc, ')');
+            for (superseded.items) |sp| try cli_common.appendFmt(&out, alloc, " {d} [{s}]", .{ sp.id, sp.predicate });
+            try out.appendSlice(alloc, "; undo with `mem3 unsupersede <id>`)");
         }
     }
     cli_common.println(out.items);

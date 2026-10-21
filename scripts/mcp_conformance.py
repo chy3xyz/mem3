@@ -271,7 +271,7 @@ def run(binary):
                 modern_res.get("resultType") == "complete")
         c.check("a modern result echoes serverInfo",
                 isinstance(modern_res.get("_meta", {}).get(META_PREFIX + "serverInfo"), dict))
-        c.check("both eras list the same five tools",
+        c.check("both eras list the same tools",
                 [t["name"] for t in legacy_res.get("tools", [])]
                 == [t["name"] for t in modern_res.get("tools", [])])
 

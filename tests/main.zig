@@ -24,6 +24,8 @@ comptime {
     _ = @import("unit/consolidator_incremental.zig");
     // net_existence = importance - redundancy - conflict_score (FR-010 / FR-015).
     _ = @import("unit/forgetting_netexistence.zig");
+    // Which predicates may supersede: functional list / off / all / custom.
+    _ = @import("unit/supersede_policy.zig");
     _ = @import("unit/hnsw.zig");
     // The CLI argument parser. Zero tests previously, across 223 lines of
     // hand-rolled flag handling; three real parser bugs were found the day
