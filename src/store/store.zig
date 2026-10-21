@@ -382,6 +382,7 @@ pub const Store = struct {
         self.bm25.deinit();
         self.alloc.destroy(self.bm25);
         self.lc.fuzzy.deinit();
+        self.lc.consolidator.deinit();
         self.alloc.destroy(self.lc);
         self.hymem.deinit();
         self.mgr.deinit();

@@ -614,8 +614,8 @@ zig build
 | `coh_mean` at last sample | 0.277 |
 | Consolidation passes | 84 |
 | Total abstracts created | 12,974 (155 per pass, flat from 5k cells on) |
-| Consolidate latency, first pass | 126.9 ms at 518 cells |
-| Consolidate latency, last pass | **20,257.6 ms at 44,909 cells** |
+| Consolidate latency, first pass (all-pairs build) | 126.9 ms at 518 cells |
+| Consolidate latency, last pass (all-pairs build) | **20,257.6 ms at 44,909 cells** |
 | RSS at stop | 151 MB |
 
 The `RSS at stop` row is **not reconciled with
@@ -636,9 +636,15 @@ Two things fall out of this, and both are recorded as misses in
    `--stats-every=N` is set — without it every `imp_*` field is `null` and the
    explanation is silently skipped. The crossover is **40–201 days** depending
    on source; this run was 0.0046 days.
-2. **Consolidation is superlinear.** 89.9× more cells cost 154.6× more time.
-   The pass is all-pairs, so this is O(n²) in the corpus, and the exponent is
-   already 1.12 over the range this run covered.
+2. **Consolidation was superlinear.** 89.9× more cells cost 154.6× more time.
+   The pass was all-pairs, so this was O(n²) in the corpus, and the exponent was
+   already 1.12 over the range this run covered. *This run predates incremental
+   consolidation; the table's two consolidate-latency rows describe the old
+   all-pairs build.* The A/B against the incremental build is in
+   [`docs/roadmap.md`](docs/roadmap.md) under "Consolidation is incremental":
+   at 45k cells a steady-state pass is ~35× less CPU (1.76 s vs 61.6 s on a
+   loaded host) and ~40× fewer pair comparisons, while the first pass in a
+   process is still O(n²).
 
 If you reproduce this, `--stats-every=25` is worth adding: it turns the
 `fuzzied: 0` line from a mystery into a checkable prediction, and it is the
@@ -719,8 +725,8 @@ Because `zig build test` re-runs are served from the build cache and report gree
 without re-executing, drive the roots directly when you need a real count:
 
 ```bash
-zig test --dep mem3 -Mroot=src/main.zig  -Mmem3=src/lib.zig   # -> All 407 tests passed.
-zig test --dep mem3 -Mroot=tests/main.zig -Mmem3=src/lib.zig   # -> All 100 tests passed.
+zig test --dep mem3 -Mroot=src/main.zig  -Mmem3=src/lib.zig   # -> All 421 tests passed.
+zig test --dep mem3 -Mroot=tests/main.zig -Mmem3=src/lib.zig   # -> All 120 tests passed.
 zig test --dep mem3 -Mroot=tests/constitution/main.zig -Mmem3=src/lib.zig  # -> All 12 tests passed.
 ```
 
@@ -811,15 +817,18 @@ Known and measured, not discovered after the fact:
   will actually sit through, including the 24 h baseline in the README.
   Demonstrating convergence needs either a compressed clock or a fixture of
   pre-aged cells; it does not need a longer run.
-- **Consolidation is all-pairs, so it is superlinear in corpus size.** The same
-  run found something worse than the convergence question.
-  `Consolidator.consolidate` scores every cell pair (single-linkage over packed
-  token bitsets). Corpus growth of **89.9×** produced **154.6×** consolidation
-  latency — exponent **1.12** over the whole range, but the tail is far worse
-  than that number suggests: **8.5 s per pass at 40k cells, 20.3 s at 45k**. At
-  45k cells that is ~1.01 billion pair comparisons per pass; at the
-  constitutional 100k scale it is ~5.0 billion. The pair loop was already made
-  75× faster and bit-identical; the algorithm underneath is still O(n²).
+- **Consolidation is incremental now, but the first pass in a process is still
+  O(n²).** The long run above recorded an all-pairs pass: **8.5 s per pass at
+  40k cells, 20.3 s at 45k**, ~1.01 billion pair comparisons at 45k and ~5.0
+  billion at 100k. `Consolidator` now keeps its union-find and per-cell token
+  signatures across passes and compares only new cells, with an identical
+  partition. Measured A/B on a loaded host (CPU time, 45k cells): steady-state
+  pass **61.6 s → 1.76 s**, 1.05e9 → 2.59e7 pairs, growth exponent 2.00 →
+  1.00 — but only while arrivals per pass are fixed (here 555), and the cache
+  costs ~109 B/cell. The cold first pass (every `mem3 consolidate` CLI call) is
+  unchanged at 1.01e9 pairs / ~59 s CPU. Details, the removal rule and what was
+  not measured (100k, forgetting at volume): `docs/roadmap.md`, "Consolidation
+  is incremental".
   Note also that `abstracts` per pass sits flat at 155 from 5k cells onward —
   that is a property of the harness's 5-topic synthetic corpus saturating, not
   evidence of convergence.

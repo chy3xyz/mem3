@@ -21,7 +21,8 @@ fn buildStore(alloc: std.mem.Allocator) !struct {
     ids: *std.atomic.Value(u64),
 
     fn deinit(self: *@This()) void {
-        // CoherenceCalculator has no heap state, so no deinit.
+        // CoherenceCalculator has no heap state; the cluster index does.
+        self.cons.deinit();
         self.cons.fuzzy.deinit();
         self.cons.mgr.deinit();
         self.alloc.destroy(self.cons.fuzzy);

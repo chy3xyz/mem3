@@ -21,6 +21,7 @@ comptime {
     // Unit tests — per-module focused coverage of core algorithms.
     _ = @import("unit/coherence.zig");
     _ = @import("unit/consolidator.zig");
+    _ = @import("unit/consolidator_incremental.zig");
     _ = @import("unit/hnsw.zig");
     // The CLI argument parser. Zero tests previously, across 223 lines of
     // hand-rolled flag handling; three real parser bugs were found the day
@@ -31,6 +32,7 @@ comptime {
     // HTTP server. Slow but high signal.
     _ = @import("integration/store_persistence_e2e.zig");
     _ = @import("integration/http_server_e2e.zig");
+    _ = @import("integration/consolidate_incremental_e2e.zig");
     _ = @import("integration/daemon_lifecycle_e2e.zig");
 
     // Property-based tests — randomized round-trip coverage of the
