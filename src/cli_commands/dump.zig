@@ -67,3 +67,27 @@ fn writeCellJson(alloc: std.mem.Allocator, buf: *std.ArrayList(u8), cell: *const
     }
     try buf.appendSlice(alloc, "]}");
 }
+test "dump: a foresight-only cell lists its foresight entries" {
+    // `dump` printed `"foresight":[]` for every cell because the store
+    // never kept any. The JSON must carry the entry and stay valid.
+    const alloc = std.testing.allocator;
+    var store = try Store.init(alloc, .{ .data_dir = null, .seed_default_goals = false });
+    defer store.deinit();
+    const id = try store.addRawWithForesight(.spirit, "dump me", "", 0, 0.5, &.{
+        .{ .description = "quote \" inside", .valid_from = 100, .valid_until = 200, .confidence = 0.5 },
+    });
+
+    var buf = std.ArrayList(u8).empty;
+    defer buf.deinit(alloc);
+    try writeCellJson(alloc, &buf, store.getCell(id).?);
+
+    try std.testing.expect(std.mem.indexOf(u8, buf.items, "\"foresight\":[]") == null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        buf.items,
+        "\"foresight\":[{\"desc\":\"quote \\\" inside\",\"from\":100,\"until\":200,\"conf\":0.5000}]",
+    ) != null);
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, buf.items, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 1), parsed.value.object.get("foresight").?.array.items.len);
+}

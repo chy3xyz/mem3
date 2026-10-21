@@ -392,6 +392,34 @@ pub const Store = struct {
         goal_id: u64,
         relevance: f32,
     ) !u64 {
+        return self.addRawWithForesight(source, episode, facts, goal_id, relevance, &.{});
+    }
+
+    /// `addRaw` plus the cell's foresight (the predictive half of the
+    /// spirit dimension, Constitution I).
+    ///
+    /// Foresight rides in the `memcell_insert` record as an optional
+    /// trailing `"foresight":[...]` field, written only when there is any,
+    /// so a cell without foresight journals the exact bytes it always did
+    /// and a WAL written before this field existed replays unchanged. The
+    /// slices are borrowed for the duration of the call; the manager
+    /// copies them on commit.
+    ///
+    /// Validated before anything is reserved or journaled: an entry with an
+    /// empty description or a confidence that is not a finite number in
+    /// [0,1] returns `error.InvalidForesight` and commits nothing. A NaN
+    /// cannot be spelled in the JSON record at all, so accepting one would
+    /// make the live cell and its replay disagree.
+    pub fn addRawWithForesight(
+        self: *Store,
+        source: MemorySource,
+        episode: []const u8,
+        facts: []const u8,
+        goal_id: u64,
+        relevance: f32,
+        foresight: []const Foresight,
+    ) !u64 {
+        try validateForesight(foresight);
         const id = self.ids.fetchAdd(1, .monotonic);
         // No errdefer returning the id. `self.ids` is one monotonic counter
         // shared with the goal poset, the hypergraph and the tri-source
@@ -412,11 +440,11 @@ pub const Store = struct {
         // Leaking an id costs nothing. `addHyperedge` already takes this
         // path deliberately and says why: ids must be unique, not dense.
 
-        const built = try self.buildCellFromInput(id, source, episode, facts, goal_id, relevance);
+        const built = try self.buildCellFromInput(id, source, episode, facts, goal_id, relevance, foresight);
         errdefer built.deinit(self.alloc);
 
         if (self.wal) |wal| {
-            const payload = try self.encodeWALPayload(
+            const payload = try self.encodeWALPayloadWithForesight(
                 id,
                 source,
                 episode,
@@ -424,6 +452,7 @@ pub const Store = struct {
                 goal_id,
                 relevance,
                 built.cell.metadata,
+                foresight,
             );
             defer self.alloc.free(payload);
             try wal.append(.{
@@ -609,7 +638,7 @@ pub const Store = struct {
         // so a WAL failure here means it will not survive a restart
         // that does not also take a snapshot.
         if (self.wal) |wal| {
-            const payload = self.encodeWALPayload(
+            const payload = self.encodeWALPayloadWithForesight(
                 id,
                 cell.source,
                 cell.episode,
@@ -617,6 +646,7 @@ pub const Store = struct {
                 0,
                 0.0,
                 cell.metadata,
+                cell.foresight,
             ) catch |err| {
                 log.warn("consolidate: WAL encode failed for abstract {d}: {}", .{ id, err });
                 return;
@@ -1029,6 +1059,7 @@ pub const Store = struct {
         facts: []const u8,
         goal_id: u64,
         relevance: f32,
+        foresight: []const Foresight,
     ) !BuiltCell {
         const fact_list = try self.alloc.create(std.ArrayList(Fact));
         errdefer self.alloc.destroy(fact_list);
@@ -1069,7 +1100,7 @@ pub const Store = struct {
             .source = source,
             .episode = episode,
             .atomic_facts = fact_list.items,
-            .foresight = &[_]Foresight{},
+            .foresight = foresight,
             .goal_associations = goal_list.items,
         });
         cell_ptr.id = id;
@@ -1089,6 +1120,7 @@ pub const Store = struct {
         goal_id: u64,
         relevance: f32,
         meta: core.Metadata,
+        foresight: []const Foresight,
     ) !BuiltCell {
         const fact_list = try self.alloc.create(std.ArrayList(Fact));
         errdefer self.alloc.destroy(fact_list);
@@ -1130,7 +1162,7 @@ pub const Store = struct {
             .source = source,
             .episode = episode,
             .atomic_facts = fact_list.items,
-            .foresight = &[_]Foresight{},
+            .foresight = foresight,
             .goal_associations = goal_list.items,
             .metadata = meta,
         };
@@ -1396,6 +1428,30 @@ pub const Store = struct {
         relevance: f32,
         meta: core.Metadata,
     ) ![]u8 {
+        return self.encodeWALPayloadWithForesight(id, source, episode, facts, goal_id, relevance, meta, &.{});
+    }
+
+    /// `encodeWALPayload` plus the optional trailing `"foresight"` field:
+    ///
+    ///   ...,"access_count":N,"foresight":[{"description":"..",
+    ///    "valid_from":N,"valid_until":N,"confidence":F},...]}
+    ///
+    /// Emitted only when `foresight` is non-empty. It is last on purpose:
+    /// the replay parser finds each key by its first `"key":` occurrence,
+    /// and every earlier string is JSON-escaped (no bare `"`), so nothing
+    /// a user wrote in an episode or fact can be mistaken for this field,
+    /// and a reader that predates it simply stops at `access_count`.
+    pub fn encodeWALPayloadWithForesight(
+        self: *Store,
+        id: u64,
+        source: MemorySource,
+        episode: []const u8,
+        facts: []const u8,
+        goal_id: u64,
+        relevance: f32,
+        meta: core.Metadata,
+        foresight: []const Foresight,
+    ) ![]u8 {
         var out = std.ArrayList(u8).empty;
         defer out.deinit(self.alloc);
         try out.append(self.alloc, '{');
@@ -1428,6 +1484,7 @@ pub const Store = struct {
         try jsonFieldFloatRaw(self.alloc, &out, "emotional_valence", meta.emotional_valence);
         try out.append(self.alloc, ',');
         try jsonFieldUintRaw(self.alloc, &out, "access_count", meta.access_count);
+        if (foresight.len > 0) try appendForesightField(self.alloc, &out, foresight);
         try out.append(self.alloc, '}');
         return out.toOwnedSlice(self.alloc);
     }
@@ -1999,6 +2056,7 @@ pub fn encodeGoalWALPayloadRaw(
                     parsed.goal_id,
                     parsed.relevance,
                     parsed.metadata,
+                    parsed.foresight,
                 ) catch |err| {
                     std.log.warn("replay: buildCell failed: {}", .{err});
                     return;
@@ -2410,12 +2468,16 @@ const ParsedInsert = struct {
     goal_id: u64,
     relevance: f32,
     metadata: core.Metadata,
+    /// Owned: the slice and every `description`. Empty for a record
+    /// written before the field existed.
+    foresight: []Foresight = &.{},
 
     pub fn deinit(self: *const ParsedInsert, alloc: Allocator) void {
         // `source` is a MemorySource enum (by value, no heap), so no
         // free needed — the 6-byte leak is from somewhere else.
         alloc.free(self.episode);
         alloc.free(self.facts);
+        freeForesight(alloc, self.foresight);
     }
 };
 
@@ -2475,6 +2537,18 @@ fn parseInsertPayload(alloc: Allocator, payload: []const u8, synthetic_id_fallba
         .superseded_at = null,
     };
 
+    // A record whose foresight field cannot be read keeps the cell and
+    // loses only the foresight: the record already passed its checksum, so
+    // this is a writer bug, and dropping a whole memory over it would be
+    // the worse failure.
+    const foresight = parseForesightField(alloc, payload) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.ParseFailed => blk: {
+            log.warn("WAL: insert id={d} has an unreadable foresight field; replayed without it", .{id});
+            break :blk @as([]Foresight, &.{});
+        },
+    };
+
     return .{
         .id = id,
         .source = source,
@@ -2483,7 +2557,103 @@ fn parseInsertPayload(alloc: Allocator, payload: []const u8, synthetic_id_fallba
         .goal_id = goal_id,
         .relevance = relevance_f,
         .metadata = metadata,
+        .foresight = foresight,
     };
+}
+
+/// Reject what the record format cannot carry faithfully: an empty
+/// description (the parser treats that as absent) and a confidence that is
+/// not a finite number in [0,1] (the documented range; NaN and inf have no
+/// JSON spelling).
+pub fn validateForesight(items: []const Foresight) error{InvalidForesight}!void {
+    for (items) |f| {
+        if (f.description.len == 0) return error.InvalidForesight;
+        if (!std.math.isFinite(f.confidence)) return error.InvalidForesight;
+        if (f.confidence < 0.0 or f.confidence > 1.0) return error.InvalidForesight;
+    }
+}
+
+/// Release a slice produced by `parseForesightField`.
+pub fn freeForesight(alloc: Allocator, items: []Foresight) void {
+    for (items) |f| alloc.free(@constCast(f.description));
+    alloc.free(items);
+}
+
+/// Append `,"foresight":[...]` to a record body that is missing only its
+/// closing brace.
+fn appendForesightField(alloc: Allocator, out: *std.ArrayList(u8), items: []const Foresight) !void {
+    try out.appendSlice(alloc, ",\"foresight\":[");
+    for (items, 0..) |f, i| {
+        if (i > 0) try out.append(alloc, ',');
+        try out.append(alloc, '{');
+        try jsonFieldStringRaw(alloc, out, "description", f.description);
+        // Not `jsonFieldIntRaw`: its 32-byte buffer cannot hold
+        // `"valid_until":9223372036854775807` (33 bytes), and `i64.max` is
+        // the documented spelling of "always".
+        var tmp: [160]u8 = undefined;
+        const tail = try std.fmt.bufPrint(
+            &tmp,
+            ",\"valid_from\":{d},\"valid_until\":{d},\"confidence\":{d:.6}}}",
+            .{ f.valid_from, f.valid_until, f.confidence },
+        );
+        try out.appendSlice(alloc, tail);
+    }
+    try out.append(alloc, ']');
+}
+
+/// Read the optional `"foresight":[{...},...]` field of a `memcell_insert`
+/// body (WAL replay and the HTTP `POST /api/memcells` body share it).
+/// Absent field → empty slice. Absent per-entry numbers default like the
+/// CLI's `--foresight` does (0 / 0 / 0.5). Does not validate ranges; call
+/// `validateForesight` for caller-supplied input. Caller frees with
+/// `freeForesight`.
+pub fn parseForesightField(alloc: Allocator, body: []const u8) ParseError![]Foresight {
+    const key = "\"foresight\":";
+    var list: std.ArrayList(Foresight) = .empty;
+    errdefer {
+        for (list.items) |f| alloc.free(@constCast(f.description));
+        list.deinit(alloc);
+    }
+
+    if (std.mem.findPos(u8, body, 0, key)) |idx| {
+        var pos = idx + key.len;
+        while (pos < body.len and (body[pos] == ' ' or body[pos] == '\t')) : (pos += 1) {}
+        if (pos >= body.len or body[pos] != '[') return error.ParseFailed;
+        pos += 1;
+        while (true) {
+            while (pos < body.len and (body[pos] == ' ' or body[pos] == ',' or body[pos] == '\t' or body[pos] == '\n' or body[pos] == '\r')) : (pos += 1) {}
+            if (pos >= body.len) return error.ParseFailed;
+            if (body[pos] == ']') break;
+            if (body[pos] != '{') return error.ParseFailed;
+            const start = pos;
+            // Find the object's closing brace, stepping over strings so a
+            // `}` inside a description does not end it early.
+            var in_str = false;
+            while (pos < body.len) : (pos += 1) {
+                const ch = body[pos];
+                if (in_str) {
+                    if (ch == '\\') pos += 1 else if (ch == '"') in_str = false;
+                } else if (ch == '"') {
+                    in_str = true;
+                } else if (ch == '}') break;
+            }
+            if (pos >= body.len) return error.ParseFailed;
+            const obj = body[start .. pos + 1];
+            pos += 1;
+
+            const desc = (extractJsonString(alloc, obj, "description") catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+            }) orelse return error.ParseFailed;
+            errdefer alloc.free(desc);
+            try list.append(alloc, .{
+                .description = desc,
+                .valid_from = extractJsonInt(obj, "valid_from") orelse 0,
+                .valid_until = extractJsonInt(obj, "valid_until") orelse 0,
+                .confidence = extractJsonFloat(obj, "confidence") orelse 0.5,
+            });
+        }
+    }
+    return list.toOwnedSlice(alloc);
 }
 
 /// Replay-side parse of a `goal_create` payload. Mirrors
@@ -4226,4 +4396,141 @@ test "Store: forgetting a cell takes its postings out of the lexical index" {
             try std.testing.expectEqual(@as(usize, 0), hits.len);
         }
     }
+}
+
+// =============================================================================
+// Foresight durability (spirit dimension, Constitution I)
+//
+// `--foresight` used to be parsed by the CLI and then discarded: neither
+// `addRaw` nor the `memcell_insert` record carried it, so a foresight-bearing
+// cell came back from a restart with `foresight = []`. These pin the three
+// observable halves of the fix — WAL replay, snapshot restore, and the
+// no-foresight record staying byte-identical.
+// =============================================================================
+
+const test_foresight = [_]Foresight{
+    .{ .description = "release ships friday", .valid_from = 1_700_000_000_000, .valid_until = 1_800_000_000_000, .confidence = 0.75 },
+    // Hostile on purpose: quotes, a backslash, a newline, and text that
+    // looks like another JSON key. `extractJson*` finds the first
+    // `"key":` needle, so an unescaped copy of this inside a description
+    // could be mistaken for a real field.
+    .{ .description = "say \"id\":9 and \\ then\nnewline", .valid_from = -5, .valid_until = 0, .confidence = 0.25 },
+};
+
+fn expectTestForesight(cell: *const MemCell) !void {
+    try std.testing.expectEqual(@as(usize, 2), cell.foresight.len);
+    try std.testing.expectEqualStrings(test_foresight[0].description, cell.foresight[0].description);
+    try std.testing.expectEqual(test_foresight[0].valid_from, cell.foresight[0].valid_from);
+    try std.testing.expectEqual(test_foresight[0].valid_until, cell.foresight[0].valid_until);
+    try std.testing.expectApproxEqAbs(test_foresight[0].confidence, cell.foresight[0].confidence, 1e-6);
+    try std.testing.expectEqualStrings(test_foresight[1].description, cell.foresight[1].description);
+    try std.testing.expectEqual(test_foresight[1].valid_from, cell.foresight[1].valid_from);
+    try std.testing.expectEqual(test_foresight[1].valid_until, cell.foresight[1].valid_until);
+    try std.testing.expectApproxEqAbs(test_foresight[1].confidence, cell.foresight[1].confidence, 1e-6);
+}
+
+test "Store: foresight is on the committed cell and survives WAL replay" {
+    const alloc = std.testing.allocator;
+    var dir_buf: [128]u8 = undefined;
+    const data_dir = testDataDir(&dir_buf, "foresight_wal");
+    wipeStoreDir(data_dir);
+    defer wipeStoreDir(data_dir);
+
+    const id = blk: {
+        var store = try Store.init(alloc, .{ .data_dir = data_dir, .seed_default_goals = false });
+        defer store.deinit();
+        const id = try store.addRawWithForesight(.spirit, "a foresight-only cell", "", 0, 0.5, &test_foresight);
+        // The live cell already carries it...
+        try expectTestForesight(store.getCell(id).?);
+        // ...and no sync: the next process has only the WAL to go on.
+        break :blk id;
+    };
+
+    var store = try Store.init(alloc, .{ .data_dir = data_dir, .seed_default_goals = false });
+    defer store.deinit();
+    const cell = store.getCell(id) orelse return error.TestExpectedCellMissing;
+    try expectTestForesight(cell);
+}
+
+test "Store: foresight survives snapshot + restore with an empty WAL" {
+    const alloc = std.testing.allocator;
+    var dir_buf: [128]u8 = undefined;
+    const data_dir = testDataDir(&dir_buf, "foresight_snap");
+    wipeStoreDir(data_dir);
+    defer wipeStoreDir(data_dir);
+
+    const id = blk: {
+        var store = try Store.init(alloc, .{ .data_dir = data_dir, .seed_default_goals = false });
+        defer store.deinit();
+        const id = try store.addRawWithForesight(.spirit, "snapshot foresight", "", 0, 0.5, &test_foresight);
+        // `sync` is snapshot-and-truncate: afterwards there is nothing to
+        // replay, so the restore below is the snapshot reader alone.
+        try store.sync();
+        break :blk id;
+    };
+
+    var store = try Store.init(alloc, .{ .data_dir = data_dir, .seed_default_goals = false });
+    defer store.deinit();
+    const cell = store.getCell(id) orelse return error.TestExpectedCellMissing;
+    try expectTestForesight(cell);
+}
+
+test "Store: a cell with no foresight still journals the exact pre-foresight bytes" {
+    // Old readers and the literal in "encodeWALPayload: round-trips ..."
+    // depend on this: the foresight field is emitted only when there is
+    // some, so records without it do not move a byte.
+    const alloc = std.testing.allocator;
+    var store = try Store.init(alloc, .{ .data_dir = null, .seed_default_goals = false });
+    defer store.deinit();
+    const meta: core.Metadata = .{
+        .created_at = 1, .updated_at = 2, .last_accessed_at = 3,
+        .importance_score = 0.5, .coherence_score = 0.0, .decay_rate = 0.01,
+        .source_confidence = 1.0, .emotional_valence = 0.0, .access_count = 0,
+    };
+    const plain = try store.encodeWALPayload(1, .matter, "e", "", 0, 0.5, meta);
+    defer alloc.free(plain);
+    const none = try store.encodeWALPayloadWithForesight(1, .matter, "e", "", 0, 0.5, meta, &.{});
+    defer alloc.free(none);
+    try std.testing.expectEqualStrings(plain, none);
+    try std.testing.expect(std.mem.indexOf(u8, plain, "foresight") == null);
+
+    const with = try store.encodeWALPayloadWithForesight(1, .matter, "e", "", 0, 0.5, meta, test_foresight[0..1]);
+    defer alloc.free(with);
+    // Strictly an extension: the old bytes are a prefix (minus the closing
+    // brace), so a parser that stops at `access_count` reads it unchanged.
+    try std.testing.expect(std.mem.startsWith(u8, with, plain[0 .. plain.len - 1]));
+    try std.testing.expectEqualStrings(
+        \\,"foresight":[{"description":"release ships friday","valid_from":1700000000000,"valid_until":1800000000000,"confidence":0.750000}]}
+    , with[plain.len - 1 ..]);
+}
+
+test "Store: a pre-foresight WAL record (no foresight field) replays with empty foresight" {
+    const alloc = std.testing.allocator;
+    const old_payload =
+        \\{"id":7,"source":"matter","episode":"old record","facts":"","goal_id":0,"relevance":0.500000,"created_at":1,"updated_at":2,"last_accessed_at":3,"importance_score":0.500000,"coherence_score":0.000000,"decay_rate":0.010000,"source_confidence":1.000000,"emotional_valence":0.000000,"access_count":0}
+    ;
+    const parsed = try parseInsertPayload(alloc, old_payload, 99);
+    defer parsed.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), parsed.foresight.len);
+    try std.testing.expectEqualStrings("old record", parsed.episode);
+}
+
+test "Store: addRawWithForesight rejects a malformed entry and commits nothing" {
+    const alloc = std.testing.allocator;
+    var store = try Store.init(alloc, .{ .data_dir = null, .seed_default_goals = false });
+    defer store.deinit();
+    const nan = std.math.nan(f32);
+    try std.testing.expectError(error.InvalidForesight, store.addRawWithForesight(
+        .spirit, "x", "", 0, 0.5,
+        &.{.{ .description = "d", .valid_from = 0, .valid_until = 0, .confidence = nan }},
+    ));
+    try std.testing.expectError(error.InvalidForesight, store.addRawWithForesight(
+        .spirit, "x", "", 0, 0.5,
+        &.{.{ .description = "d", .valid_from = 0, .valid_until = 0, .confidence = 1.5 }},
+    ));
+    try std.testing.expectError(error.InvalidForesight, store.addRawWithForesight(
+        .spirit, "x", "", 0, 0.5,
+        &.{.{ .description = "", .valid_from = 0, .valid_until = 0, .confidence = 0.5 }},
+    ));
+    try std.testing.expectEqual(@as(usize, 0), store.cellCount());
 }

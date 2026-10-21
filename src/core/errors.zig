@@ -18,6 +18,9 @@ pub const Error = error{
     SpiritDimMissing,
     /// Episode was empty.
     EmptyEpisode,
+    /// A foresight entry had an empty description, or a confidence that is
+    /// not a finite number in [0, 1].
+    InvalidForesight,
 
     // Storage / I/O
     OutOfMemory,

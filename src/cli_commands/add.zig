@@ -22,13 +22,19 @@
 //!   path correct: the suite was green while the most-used command in
 //!   the product violated Principle II.
 //!
-//! **What `Store.addRaw` cannot carry** (it takes one goal and no
-//! foresight, and so does the `memcell_insert` WAL record — see
-//! `Store.encodeWALPayload`): a multi-goal cell is committed as its
-//! highest-relevance goal, and `--foresight` is reported as dropped
-//! rather than silently discarded. Both are pre-existing limits of the
-//! durable format, not new ones — but the in-memory cell used to differ
-//! from what the next process would replay, and now it does not.
+//! **What the durable record cannot carry**: it holds one goal, so a
+//! multi-goal cell is committed as its highest-relevance goal. That is a
+//! pre-existing limit of the format, not a new one — but the in-memory
+//! cell used to differ from what the next process would replay, and now
+//! it does not.
+//!
+//! **Foresight is durable.** `--foresight "desc|valid_from|valid_until|confidence"`
+//! (entries separated by `;`) goes through `Store.addRawWithForesight`
+//! into the `memcell_insert` record and the snapshot row. It used to be
+//! parsed and discarded, with a warning, so a foresight-only cell came
+//! back from a restart without its spirit dimension. A cell that names no
+//! goal still carries the synthetic goal id 0 (see `addMemory`), so
+//! `dump` shows `"goals":[{"id":0,...}]` next to the real foresight.
 //!
 //! **Failure behaviour**: none of the failure points (WAL encode, WAL
 //! append, HNSW insert, GHW traversal) is swallowed. Each aborts the
@@ -133,7 +139,7 @@ pub fn addMemory(store: *Store, alloc: std.mem.Allocator, mem: Memory) !u64 {
         // `Store.encodeAcrossLayers` spells "nothing to traverse".
         GoalAssociation{ .goal_id = 0, .relevance = 0.5, .priority = 5 };
 
-    return store.addRaw(mem.source, mem.episode, facts_str, primary.goal_id, primary.relevance);
+    return store.addRawWithForesight(mem.source, mem.episode, facts_str, primary.goal_id, primary.relevance, mem.foresight);
 }
 
 pub fn run(alloc: std.mem.Allocator, parsed: cli.Parsed) !void {
@@ -199,14 +205,6 @@ pub fn run(alloc: std.mem.Allocator, parsed: cli.Parsed) !void {
         }
     }
 
-    // `--foresight` has no home in the durable format: neither
-    // `Store.addRaw` nor the `memcell_insert` WAL record carries one, so
-    // replay never restored it either. Say so rather than reporting
-    // success on an insert that dropped what the user typed.
-    if (foresights.items.len > 0) {
-        cli_common.eprintln("warning: --foresight is not yet stored; it is absent from the WAL record and from the committed cell. The cell was added without it.");
-    }
-
     const id = addMemory(store, alloc, .{
         .source = source.?,
         .episode = episode.?,
@@ -259,21 +257,29 @@ fn parseFactsConst(alloc: std.mem.Allocator, s: []const u8, out: *std.ArrayList(
     }
 }
 
+/// One `desc|valid_from|valid_until|confidence` entry. Absent or
+/// unparseable trailing fields fall back to 0 / 0 / 0.5. The result
+/// borrows `part`. Shared by the CLI and the MCP `memory_add` tool so the
+/// two surfaces cannot disagree about the spelling.
+pub fn parseForesightEntry(part: []const u8) Foresight {
+    var pit = std.mem.splitScalar(u8, part, '|');
+    const desc = pit.next() orelse "";
+    const from = std.fmt.parseInt(i64, pit.next() orelse "0", 10) catch 0;
+    const until = std.fmt.parseInt(i64, pit.next() orelse "0", 10) catch 0;
+    const conf = std.fmt.parseFloat(f32, pit.next() orelse "0.5") catch 0.5;
+    return .{
+        .description = desc,
+        .valid_from = from,
+        .valid_until = until,
+        .confidence = conf,
+    };
+}
+
 fn parseForesightConst(alloc: std.mem.Allocator, s: []const u8, out: *std.ArrayList(Foresight)) !void {
     var it = std.mem.splitScalar(u8, s, ';');
     while (it.next()) |part| {
         if (part.len == 0) continue;
-        var pit = std.mem.splitScalar(u8, part, '|');
-        const desc = pit.next() orelse "";
-        const from = std.fmt.parseInt(i64, pit.next() orelse "0", 10) catch 0;
-        const until = std.fmt.parseInt(i64, pit.next() orelse "0", 10) catch 0;
-        const conf = std.fmt.parseFloat(f32, pit.next() orelse "0.5") catch 0.5;
-        try out.append(alloc, .{
-            .description = desc,
-            .valid_from = from,
-            .valid_until = until,
-            .confidence = conf,
-        });
+        try out.append(alloc, parseForesightEntry(part));
     }
 }
 
@@ -475,4 +481,38 @@ test "mem3 add scores a tombstoned goal at zero relevance" {
     // about the score, not about erasing the record.
     try std.testing.expect(dead_store.harnessForGoal(dead) != null);
     try std.testing.expectEqual(@as(usize, 2), dead_store.crossLayerLog().count());
+}
+
+test "mem3 add commits a foresight-only cell with its foresight" {
+    // `--foresight` was parsed and then dropped on the way to `Store`, so
+    // the cell that `dump` listed had `foresight = []`.
+    const alloc = std.testing.allocator;
+    var store = try freshStore(alloc);
+    defer store.deinit();
+
+    const id = try addMemory(store, alloc, .{
+        .source = .spirit,
+        .episode = "it will rain on friday",
+        .foresight = &.{.{ .description = "rain", .valid_from = 10, .valid_until = 20, .confidence = 0.9 }},
+    });
+
+    const cell = store.getCell(id).?;
+    try std.testing.expectEqual(@as(usize, 1), cell.foresight.len);
+    try std.testing.expectEqualStrings("rain", cell.foresight[0].description);
+    try std.testing.expectEqual(@as(i64, 10), cell.foresight[0].valid_from);
+    try std.testing.expectEqual(@as(i64, 20), cell.foresight[0].valid_until);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.9), cell.foresight[0].confidence, 1e-6);
+}
+
+test "mem3 add parses a --foresight entry as desc|valid_from|valid_until|confidence" {
+    const f = parseForesightEntry("rain|10|20|0.9");
+    try std.testing.expectEqualStrings("rain", f.description);
+    try std.testing.expectEqual(@as(i64, 10), f.valid_from);
+    try std.testing.expectEqual(@as(i64, 20), f.valid_until);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.9), f.confidence, 1e-6);
+    // Absent trailing fields keep the documented defaults.
+    const g = parseForesightEntry("just a description");
+    try std.testing.expectEqual(@as(i64, 0), g.valid_from);
+    try std.testing.expectEqual(@as(i64, 0), g.valid_until);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), g.confidence, 1e-6);
 }

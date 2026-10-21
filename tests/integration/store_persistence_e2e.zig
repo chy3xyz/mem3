@@ -503,3 +503,44 @@ test "E2E: a dry-run sweep changes nothing, including the index" {
     try testing.expect(store.getCell(low_id) != null);
     try testing.expect(store.getCell(keep_id) != null);
 }
+
+test "E2E: foresight-only cell keeps its spirit dimension across WAL replay and snapshot" {
+    // `mem3 add --foresight` used to be parsed and then dropped: the cell
+    // that came back from a restart had `foresight = []`. Exercised through
+    // the public API only, in the two recovery modes the daemon actually
+    // hits — WAL-only (crash / plain exit) and snapshot-only (after sync).
+    const alloc = testing.allocator;
+    const data_dir = try makeDataDir(alloc, "foresight");
+    defer alloc.free(data_dir);
+
+    const fs = [_]mem3.Foresight{
+        .{ .description = "the migration finishes", .valid_from = 1_700_000_000_000, .valid_until = 1_900_000_000_000, .confidence = 0.8 },
+    };
+
+    var id: u64 = 0;
+    {
+        wipeDataDir(data_dir);
+        var store = try mem3.Store.init(alloc, .{ .data_dir = data_dir });
+        defer store.deinit();
+        id = try store.addRawWithForesight(.spirit, "foresight only", "", 0, 0.5, &fs);
+    }
+    // Run 2: WAL replay only. Then sync, so run 3 is snapshot only.
+    {
+        var store = try mem3.Store.init(alloc, .{ .data_dir = data_dir });
+        defer store.deinit();
+        const cell = store.getCell(id) orelse return error.TestExpectedCellMissing;
+        try testing.expectEqual(@as(usize, 1), cell.foresight.len);
+        try testing.expectEqualStrings("the migration finishes", cell.foresight[0].description);
+        try testing.expectEqual(@as(i64, 1_900_000_000_000), cell.foresight[0].valid_until);
+        try store.sync();
+    }
+    {
+        var store = try mem3.Store.init(alloc, .{ .data_dir = data_dir });
+        defer store.deinit();
+        const cell = store.getCell(id) orelse return error.TestExpectedCellMissing;
+        try testing.expectEqual(@as(usize, 1), cell.foresight.len);
+        try testing.expectEqualStrings("the migration finishes", cell.foresight[0].description);
+        try testing.expectApproxEqAbs(@as(f32, 0.8), cell.foresight[0].confidence, 1e-6);
+        wipeDataDir(data_dir);
+    }
+}
