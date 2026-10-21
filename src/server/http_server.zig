@@ -1008,9 +1008,22 @@ pub const Server = struct {
         const goal_id = @as(u64, @intCast(extractJsonInt(body, "goalId") orelse 1));
         const relevance = extractJsonFloat(body, "relevance") orelse 0.5;
 
-        const id = self.store.addRaw(source, episode, facts, goal_id, relevance) catch |err| {
-            const msg = @errorName(err);
-            return try self.jsonResponse(400, "Bad Request", try std.fmt.allocPrint(self.alloc, "{{\"error\":\"{s}\"}}", .{msg}));
+        // Optional `"foresight":[{"description":..,"valid_from":..,
+        // "valid_until":..,"confidence":..}]`, the same shape the WAL
+        // record carries. A malformed field is a 400, not a cell that
+        // quietly lost its foresight.
+        const foresight = mem3_store.parseForesightField(self.alloc, body) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.ParseFailed => return try self.jsonResponse(400, "Bad Request", "{\"error\":\"invalid foresight\"}"),
+        };
+        defer mem3_store.freeForesight(self.alloc, foresight);
+
+        const id = self.store.addRawWithForesight(source, episode, facts, goal_id, relevance, foresight) catch |err| {
+            // `jsonResponse` copies its body, so the formatted message is
+            // ours to free. It was not, and every refused insert leaked it.
+            const err_body = try std.fmt.allocPrint(self.alloc, "{{\"error\":\"{s}\"}}", .{@errorName(err)});
+            defer self.alloc.free(err_body);
+            return try self.jsonResponse(400, "Bad Request", err_body);
         };
         _ = self.metrics.inserts_total.fetchAdd(1, .monotonic);
 
@@ -1515,6 +1528,22 @@ fn jsonAppendCell(alloc: Allocator, out: *std.ArrayList(u8), cell: *const MemCel
         try out.append(alloc, '}');
     }
     try out.appendSlice(alloc, "]");
+    // Additive: a cell without foresight lists `[]`, as `dump` does.
+    try out.appendSlice(alloc, ",\"foresight\":[");
+    for (cell.foresight, 0..) |f, i| {
+        if (i > 0) try out.append(alloc, ',');
+        try out.append(alloc, '{');
+        try jsonFieldString(alloc, out, "description", f.description);
+        try out.append(alloc, ',');
+        var tmp: [160]u8 = undefined;
+        const tail = try std.fmt.bufPrint(
+            &tmp,
+            "\"valid_from\":{d},\"valid_until\":{d},\"confidence\":{d:.4}}}",
+            .{ f.valid_from, f.valid_until, f.confidence },
+        );
+        try out.appendSlice(alloc, tail);
+    }
+    try out.append(alloc, ']');
     try out.append(alloc, '}');
 }
 
@@ -2687,4 +2716,45 @@ test "Server: /api/forget does not re-enter the store lock it is already holding
     try std.testing.expect(std.mem.indexOf(u8, finished.body[0..finished.body_len], "\"fuzzied\":2") != null);
     // The sweep still happened, under the lock the accept loop already held.
     try std.testing.expectEqual(@as(u64, 2), srv.metrics.forgotten_cells_total.load(.monotonic));
+}
+
+test "HTTP: POST /api/memcells carries foresight through to the committed cell" {
+    // Bodies get the same `\r\n\r\n` prefix trick as the metrics test.
+    const alloc = std.testing.allocator;
+    var srv = try Server.init(alloc, "127.0.0.1", 0, null);
+    defer srv.deinit();
+
+    const post =
+        "\r\n\r\n{\"source\":\"spirit\",\"episode\":\"http foresight\",\"facts\":\"\",\"goalId\":1,\"relevance\":0.5," ++
+        "\"foresight\":[{\"description\":\"rain \\\"soon\\\"\",\"valid_from\":10,\"valid_until\":20,\"confidence\":0.9}]}";
+    const inserted = try srv.route("POST", "/api/memcells", post);
+    defer inserted.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 201), inserted.status);
+
+    const id: u64 = @intCast(extractJsonInt(inserted.body, "id").?);
+    const cell = srv.store.getCell(id).?;
+    try std.testing.expectEqual(@as(usize, 1), cell.foresight.len);
+    try std.testing.expectEqualStrings("rain \"soon\"", cell.foresight[0].description);
+    try std.testing.expectEqual(@as(i64, 10), cell.foresight[0].valid_from);
+    try std.testing.expectEqual(@as(i64, 20), cell.foresight[0].valid_until);
+
+    // And the read side shows it.
+    var path_buf: [64]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "/api/memcells/{d}", .{id});
+    const got = try srv.route("GET", path, "");
+    defer got.deinit(alloc);
+    try std.testing.expect(std.mem.indexOf(u8, got.body, "\"foresight\":[{\"description\":\"rain \\\"soon\\\"\",\"valid_from\":10,\"valid_until\":20,\"confidence\":0.9000}]") != null);
+
+    // Malformed foresight is refused rather than dropped.
+    const bad_conf =
+        "\r\n\r\n{\"source\":\"spirit\",\"episode\":\"x\",\"goalId\":1," ++
+        "\"foresight\":[{\"description\":\"d\",\"confidence\":7}]}";
+    const r1 = try srv.route("POST", "/api/memcells", bad_conf);
+    defer r1.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 400), r1.status);
+    const bad_shape = "\r\n\r\n{\"source\":\"spirit\",\"episode\":\"x\",\"goalId\":1,\"foresight\":5}";
+    const r2 = try srv.route("POST", "/api/memcells", bad_shape);
+    defer r2.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 400), r2.status);
+    try std.testing.expectEqual(@as(usize, 1), srv.store.cellCount());
 }

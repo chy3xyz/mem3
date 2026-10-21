@@ -67,12 +67,14 @@ pub const CATALOGUE = [_]Tool{
         \\`episode` is the 物 (matter) trace and is required. `source` must be
         \\matter, form or spirit — a memory cannot be untagged (Constitution I).
         \\`facts` are "subject|predicate|object" triples (象 / form), and
-        \\`goal_ids` binds the cell to goals (性 / spirit). A cell with neither a
-        \\goal binding nor a foresight is rejected.
+        \\`goal_ids` binds the cell to goals (性 / spirit), and `foresight` lists
+        \\predicted claims as "description|valid_from_ms|valid_until_ms|confidence"
+        \\(also 性 / spirit, stored durably). A cell with neither a goal binding
+        \\nor a foresight is rejected.
         \\
         \\Returns the assigned MemCell id.
         ,
-        .schema = "{\"type\":\"object\",\"properties\":{\"episode\":{\"type\":\"string\",\"description\":\"物 — the raw episode text\"},\"source\":{\"type\":\"string\",\"enum\":[\"matter\",\"form\",\"spirit\"],\"description\":\"ontological source tag (required)\"},\"facts\":{\"type\":\"array\",\"items\":{\"type\":\"string\"},\"description\":\"象 — subject|predicate|object triples\"},\"goal_ids\":{\"type\":\"array\",\"items\":{\"type\":\"integer\"},\"description\":\"性 — goal bindings\"},\"relevances\":{\"type\":\"array\",\"items\":{\"type\":\"number\"},\"description\":\"per-goal relevance in [0,1]\"},\"foresight\":{\"type\":\"array\",\"items\":{\"type\":\"string\"},\"description\":\"accepted and reported; not yet persisted\"}},\"required\":[\"episode\",\"source\"]}",
+        .schema = "{\"type\":\"object\",\"properties\":{\"episode\":{\"type\":\"string\",\"description\":\"物 — the raw episode text\"},\"source\":{\"type\":\"string\",\"enum\":[\"matter\",\"form\",\"spirit\"],\"description\":\"ontological source tag (required)\"},\"facts\":{\"type\":\"array\",\"items\":{\"type\":\"string\"},\"description\":\"象 — subject|predicate|object triples\"},\"goal_ids\":{\"type\":\"array\",\"items\":{\"type\":\"integer\"},\"description\":\"性 — goal bindings\"},\"relevances\":{\"type\":\"array\",\"items\":{\"type\":\"number\"},\"description\":\"per-goal relevance in [0,1]\"},\"foresight\":{\"type\":\"array\",\"items\":{\"type\":\"string\"},\"description\":\"spirit — predicted claims as desc|valid_from_ms|valid_until_ms|confidence; durable\"}},\"required\":[\"episode\",\"source\"]}",
     },
     .{
         .name = "memory_query",
@@ -317,12 +319,17 @@ fn toolMemoryAdd(
         try goals.append(alloc, .{ .goal_id = gid, .relevance = rel, .priority = 5 });
     }
 
-    // `foresight` is accepted and reported back as not persisted, which
-    // is what `mem3 add` does. Saying so beats returning an id for a
-    // cell that quietly dropped a dimension.
-    var dropped_foresight: usize = 0;
+    // Same `desc|valid_from|valid_until|confidence` spelling as the CLI's
+    // `--foresight`, parsed by the same function. The entries borrow from
+    // `arguments`, which outlives the call.
+    var foresight: std.ArrayList(core.Foresight) = .empty;
+    defer foresight.deinit(alloc);
     if (member(argObject(arguments), "foresight")) |v| {
-        dropped_foresight = (v.asArray() orelse return error.InvalidParams).len;
+        const items = v.asArray() orelse return error.InvalidParams;
+        for (items) |item| {
+            const raw = item.asString() orelse return error.InvalidParams;
+            try foresight.append(alloc, cli_add.parseForesightEntry(raw));
+        }
     }
 
     const episode = (try argString(arguments, "episode")) orelse return error.ToolFailed;
@@ -333,6 +340,7 @@ fn toolMemoryAdd(
         .source = source,
         .episode = episode,
         .facts = facts.items,
+        .foresight = foresight.items,
         .goal_associations = goals.items,
     }) catch |err| return switch (err) {
         // Constitution I rejects an untagged or spiritless cell here.
@@ -347,12 +355,6 @@ fn toolMemoryAdd(
     try out.string(body, alloc, source.label());
     try body.appendSlice(alloc, ",\"cells\":");
     try out.uint(body, alloc, store.cellCount());
-    if (dropped_foresight > 0) {
-        try body.appendSlice(alloc, ",\"warning\":");
-        try out.string(body, alloc, "foresight is not yet persisted by this store; the cell was added without it");
-        try body.appendSlice(alloc, ",\"foresight_dropped\":");
-        try out.uint(body, alloc, dropped_foresight);
-    }
     try body.append(alloc, '}');
 }
 
@@ -681,20 +683,48 @@ test "tools: memory_add refuses a cell with no spirit dimension" {
     try testing.expectEqual(@as(usize, 0), store.harnessCount());
 }
 
-test "tools: memory_add reports dropped foresight instead of silently losing it" {
+test "tools: memory_add stores foresight on the committed cell" {
     const alloc = testing.allocator;
     var store = try testStore(alloc);
     defer store.deinit();
 
+    // Foresight-only: no goal_ids. Constitution I is satisfied by the
+    // foresight itself, and the cell must actually carry it.
     var r = try callWith(alloc, store, "memory_add",
-        \\{"episode":"x","source":"matter","foresight":["it will rain|t|t"],"goal_ids":[1]}
+        \\{"episode":"x","source":"spirit","foresight":["it will rain|10|20|0.9"]}
     );
     defer r.deinit();
 
     var d = try json.parse(alloc, r.text);
     defer d.deinit();
-    try testing.expectEqual(@as(f64, 1), json.get(d.root, "foresight_dropped").?.asNumber().?);
-    try testing.expect(json.get(d.root, "warning").?.asString().?.len > 0);
+    // The old "not persisted" warning must be gone: it is no longer true.
+    try testing.expect(json.get(d.root, "foresight_dropped") == null);
+    try testing.expect(json.get(d.root, "warning") == null);
+    const id: u64 = @intFromFloat(json.get(d.root, "id").?.asNumber().?);
+    const cell = store.getCell(id).?;
+    try testing.expectEqual(@as(usize, 1), cell.foresight.len);
+    try testing.expectEqualStrings("it will rain", cell.foresight[0].description);
+    try testing.expectEqual(@as(i64, 10), cell.foresight[0].valid_from);
+    try testing.expectEqual(@as(i64, 20), cell.foresight[0].valid_until);
+}
+
+test "tools: memory_add foresight argument errors are protocol or tool errors, never silent" {
+    const alloc = testing.allocator;
+    var store = try testStore(alloc);
+    defer store.deinit();
+
+    // Wrong shape: protocol error.
+    try testing.expectError(error.InvalidParams, callWith(alloc, store, "memory_add",
+        \\{"episode":"x","source":"spirit","foresight":"rain"}
+    ));
+    try testing.expectError(error.InvalidParams, callWith(alloc, store, "memory_add",
+        \\{"episode":"x","source":"spirit","foresight":[7]}
+    ));
+    // Right shape, confidence outside [0,1]: the tool ran and refused.
+    try testing.expectError(error.ToolFailed, callWith(alloc, store, "memory_add",
+        \\{"episode":"x","source":"spirit","foresight":["rain|1|2|1.5"]}
+    ));
+    try testing.expectEqual(@as(usize, 0), store.cellCount());
 }
 
 test "tools: a wrongly typed argument is a protocol error, not a tool error" {

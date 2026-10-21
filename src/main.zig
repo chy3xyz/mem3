@@ -76,6 +76,9 @@ comptime {
     // zero tests; the only other reference is the dispatch switch inside
     // `main`, which never registers a test block. Same trap as `goal.zig`.
     _ = @import("cli_commands/add.zig");
+    // `dump.zig` had no tests until the foresight one; same reachability
+    // trap as `add.zig` (only the dispatch switch referenced it).
+    _ = @import("cli_commands/dump.zig");
     // Same trap, different victim: `lib.zig` re-exports
     // `retrieval.RerankContext`, but a re-export does not pull a
     // module's `test` blocks into the test binary — verified: with
