@@ -15,7 +15,7 @@
 | Theory | 三源合恰论 (物/象/性) + GHW 范式 (Goal/Harness/World) |
 | Spec-kit | Initialized; spec at `specs/001-trisource-everos-mvp/` |
 | Platforms | **macOS and Linux only** — Windows and WASM refused at compile time (see [Platforms](#platforms)) |
-| Status | **v0.1.0-alpha** (CLI + MCP + persistence + 462 tests + 12 constitution invariants, all measured). All 7 constitutional principles active. |
+| Status | **v0.1.0-alpha** (CLI + MCP + persistence + 507 tests + 12 constitution invariants, all measured). All 7 constitutional principles active. |
 
 ## Read Order for New Agents
 
@@ -125,8 +125,9 @@ tests/
 | `mem3 mcp` | ✅ | MCP server over stdio (JSON-RPC 2.0, hand-written, zero deps). 5 tools: `memory_add` / `memory_query` / `goal_list` / `memory_forget` / `memory_stats`. **Dual-era**: modern `2026-07-28` (per-request `_meta`, `resultType`, `server/discover`) and the legacy handshake, decided per request. Accepts JSON-RPC batches. Checked by `scripts/mcp_conformance.py` against the live binary. **Real-client evidence (2026-10-21, legacy `2025-11-25` handshake only)**: MCP Inspector CLI 2.11.0, Claude Code 2.1.289 and the Cursor CLI agent 2026.10.21 each ran `tools/list` + `memory_add` + `memory_query` + `memory_stats` cleanly; opencode 2.0.32 only handshake + `tools/list`. **Not verified**: the modern `2026-07-28` path against any real client, Claude Desktop, Cursor IDE, Codex, Gemini CLI. See `docs/mcp-hosts.md` |
 | Embedding | ✅ | Built-in hashed lexer is the default and is byte-identical to pre-MCP builds. `--embedder-cmd` delegates to a long-lived external program over a line protocol (the "optional tier"); no new link dependency either way. Requests are **hex-encoded**, not raw text — see `scripts/embedder_adapter_example.py` |
 | Lexical arm | ✅ | `src/retrieval/bm25.zig`, Okapi BM25 over unigrams + bigrams, max-normalised inside the existing `λ_dense=0.5 / λ_sparse=0.2 / λ_graph=0.3` sum. Rebuilt from cells on snapshot restore, never serialised. Identifiers that live only in an `atomic_facts` triple went from 1/12 recall to 12/12 |
-| Persistence | ✅ | WAL-first + snapshot. WAL truncated on sync. |
-| Tests | ✅ | 462: 378 (`src/main.zig`-rooted) + 84 (`tests/main.zig`-rooted), plus 12 constitution invariants as a separate gate, 0 leaks |
+| Persistence | ✅ | WAL-first + snapshot. WAL truncated on sync. `--wal-sync=always\|group\|interval:N` (default `always`, byte-identical); `interval` is weaker and documented as such. |
+| Daemon hygiene | ✅ | `serve`/`mcp` exit 0 on SIGINT/SIGTERM (`src/platform/signal.zig`: handler only stores an atomic; loops poll with a timeout). `--log-format`/`--log-every` feed `src/utils/logger.zig`; default is silent and byte-identical. JSONL goes to stderr only. |
+| Tests | ✅ | 507: 407 (`src/main.zig`-rooted) + 100 (`tests/main.zig`-rooted), plus 12 constitution invariants as a separate gate, 0 leaks |
 | Binary | ✅ | 963,704 bytes `ReleaseFast` / 4,569,032 bytes Debug, only links libSystem. The lexical arm added 49 KB ReleaseFast (+5.4%) over the 914,456 B measured before it |
 | Toolchain | ✅ | Pinned via `.zigversion` (Zig 0.17.0) |
 | Platforms | ✅ | macOS + Linux (x86_64 and aarch64). Windows/WASM refused at compile time — see [Platforms](#platforms) |
@@ -206,7 +207,9 @@ real gap, not a rounding error.
 
 The write-throughput miss is **HNSW insert**, not fsync: `hnsw.insert` is
 ~899 µs/op, comparable to the ~1.2 ms WAL fsync and above the whole
-`store.addRaw_durable` pipeline. Group commit would not move it.
+`store.addRaw_durable` pipeline. Group commit did not move it: `--wal-sync=group`
+(opt-in) was A/B-measured over 5 interleaved rounds and is within noise of
+`always` on this host (see `docs/roadmap.md`).
 
 The LongMemEval miss is **`lexical_hash`**, not retrieval:
 `exhaustive_nn_hit_rate` is 0.604 and identical across the core, quarter-padded,
@@ -263,7 +266,7 @@ The current spec-kit artifacts:
 ## Testing
 
 ```bash
-# All tests: 462 (378 src/main.zig-rooted + 84 tests/main.zig-rooted)
+# All tests: 507 (407 src/main.zig-rooted + 100 tests/main.zig-rooted)
 zig build test
 
 # Just the constitution invariants (12, separate root)
@@ -283,8 +286,8 @@ without re-executing**. When you need a count you can trust, drive the roots
 directly:
 
 ```bash
-zig test --dep mem3 -Mroot=src/main.zig  -Mmem3=src/lib.zig   # All 378 tests passed.
-zig test --dep mem3 -Mroot=tests/main.zig -Mmem3=src/lib.zig   # All 84 tests passed.
+zig test --dep mem3 -Mroot=src/main.zig  -Mmem3=src/lib.zig   # All 407 tests passed.
+zig test --dep mem3 -Mroot=tests/main.zig -Mmem3=src/lib.zig   # All 100 tests passed.
 zig test --dep mem3 -Mroot=tests/constitution/main.zig -Mmem3=src/lib.zig  # All 12 tests passed.
 ```
 
