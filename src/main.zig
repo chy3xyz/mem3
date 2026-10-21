@@ -109,6 +109,7 @@ comptime {
     _ = @import("platform/fs.zig");
     _ = @import("platform/stdio.zig");
     _ = @import("platform/env.zig");
+    _ = @import("platform/signal.zig");
     _ = @import("platform/mod.zig");
     // `utils/serializer.zig` was likewise outside the gate entirely, which
     // is how a size-accounting defect that silently dropped every
