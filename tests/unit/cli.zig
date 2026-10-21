@@ -43,7 +43,12 @@ fn parse(argv: []const []const u8) !cli.Parsed {
 test "cli: subcommandFromName maps every enum variant" {
     inline for (@typeInfo(cli.Subcommand).@"enum".field_names) |name| {
         const got = try cli.subcommandFromName(name);
-        try testing.expectEqual(name, @tagName(got));
+        // Compare contents, not addresses: `expectEqual` on two string slices
+        // compares their pointers, which only match if the compiler folds
+        // identical literals. LLVM does; the self-hosted x86_64 backend (the
+        // Debug default on x86_64 targets) does not, so this failed on x86_64
+        // Linux and passed everywhere else.
+        try testing.expectEqualStrings(name, @tagName(got));
     }
 }
 
