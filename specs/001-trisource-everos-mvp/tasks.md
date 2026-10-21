@@ -54,13 +54,13 @@ Not a task in this file, but relevant to "done": real MCP hosts have run against
 **Purpose**: Project scaffolding, build configuration, and CI infrastructure. All other phases depend on this.
 
 - [x] T001 Create directory layout per `plan.md` §Project Structure (src/core, src/ghw, src/memory, src/hypermem, src/retrieval, src/storage, src/server, src/utils, tests/, bench/, examples/, docs/adr/)
-- [x] T002 [P] Write `build.zig` with `addExecutable`, io_uring/GCD detection, test step, bench step (per `dev.md` §三) _(done except io_uring/GCD detection, which does not exist; the HTTP daemon uses raw POSIX sockets, not `std.Io`)_
+- [x] T002 [P] Write `build.zig` with `addExecutable`, io_uring/GCD detection, test step, bench step (per `dev.md` §3) _(done except io_uring/GCD detection, which does not exist; the HTTP daemon uses raw POSIX sockets, not `std.Io`)_
 - [x] T003 [P] Write `build.zig.zon` pinning `zig 0.17.0-dev.XXXX+` with zero dependencies _(zon sets `minimum_zig_version = 0.17.0-dev.3000`; the exact pin is `.zigversion` = 0.17.0; no dependencies)_
 - [x] T004 [P] Write `.gitignore` excluding `zig-out/`, `data/`, `*.log`, `zig-cache/`
 - [x] T005 [P] Write `README.md` with project intro, build command, link to `AGENTS.md`
 - [x] T006 [P] Write `AGENTS.md` (root) — agent onboarding: principles, file map, dev workflow, constitution test gate
 - [x] T007 [P] Write `docs/adr/0001-three-source-ontology.md` resolving the `matter/form/spirit` vs `sensory/cognitive/action` nomenclature conflict (per data-model.md note)
-- [x] T008 [P] Write `docs/adr/0002-ghw-mapping.md` documenting the Goal/Harness/World → 三源 mapping
+- [x] T008 [P] Write `docs/adr/0002-ghw-mapping.md` documenting the Goal/Harness/World → tri-source (matter/form/spirit) mapping
 - [x] T009 [P] Write `docs/adr/0003-hnsw-from-scratch.md` justifying zero-dep HNSW
 - [x] T010 [P] Write `docs/adr/0004-wal-first-persistence.md` justifying WAL + snapshot over RocksDB _(ADR exists but still describes `lsm_store.zig` / `sstable.zig` / `hnsw.idx` / `kv.idx`, which were never built — see T041, T046, T047)_
 - [ ] T011 [P] Set up CI workflow (`.github/workflows/ci.yml`) running `zig build test` + `zig build bench` on Linux + macOS _(written, never run on a runner, so left unchecked: matrix over ubuntu-latest / ubuntu-24.04-arm / macos-latest running build, linked-libs check, test, check-constitution, a `-Doptimize=ReleaseFast` test step (continue-on-error: known `platform.clock.Timer` fold, fails on macOS arm64, passes on Linux aarch64 in a container), bench smoke, clean-tree check and the gate-can-go-red guard. Running the suite in Linux containers (aarch64 native, x86_64 cross-compiled + Rosetta) found: `src/storage/wal.zig` test used `std.c.fstat` and did not compile on Linux (fixed); `tests/unit/cli.zig` compared string pointers and failed on x86_64 Debug (fixed); `ExternalEmbedder … BackendExited` race, ~40–55% failure on Linux (NOT fixed, src/ change). Expect a red Linux `zig build test` until the race is fixed)_
@@ -259,7 +259,7 @@ Not a task in this file, but relevant to "done": real MCP hosts have run against
 - [ ] T105 [P] Add `docs/performance.md` summarizing benchmark results vs Constitution targets _(file does not exist; the figures live in the AGENTS.md "Performance Gates" table and docs/roadmap.md)_
 - [ ] T106 [P] Add a 5-minute demo script `examples/quick_demo.sh` that takes a contributor from zero to a populated store _(does not exist; `scripts/verify.sh` is a verification script, not a demo)_
 - [x] T107 [P] Bump version to `0.1.0-alpha` in `build.zig.zon` and `README.md`
-- [x] T108 [P] Tag the release: `git tag -a v0.1.0-alpha -m "TriSource-EverOS MVP — 三源合恰 + GHW 范式"` _(annotated tag exists locally, pointing at an early commit (ab4bd25), not the current HEAD; the repo has no `origin` remote, so nothing was pushed)_
+- [x] T108 [P] Tag the release: `git tag -a v0.1.0-alpha -m "TriSource-EverOS MVP: Tri-Source Coherence + GHW paradigm"` _(annotated tag exists locally, pointing at an early commit (ab4bd25), not the current HEAD; the repo has no `origin` remote, so nothing was pushed)_
 - [ ] T109 [P] Write release notes `docs/releases/v0.1.0-alpha.md` with: features, known limitations, performance summary, what's next _(partial: file exists with all sections, but its figures are stale and overclaim — "7.2M cells/sec" (Debug), "2.4 MB binary", "11/11 invariants", dated 2026-06-08 — and it does not mention the measured misses or MCP)_
 - [ ] T110 [P] Final constitution compliance review (manual sign-off; all 7 principles verified) _(no sign-off record found; the constitution is v1.2.0 while AGENTS.md still says v1.1.0)_
 
@@ -295,7 +295,7 @@ Not a task in this file, but relevant to "done": real MCP hosts have run against
 
 The longest dependency chain is: T001 → T002 → T012 → T040 → T045 → T048 → T097 → T110.
 
-Estimated duration: with 1 developer serial, ~10-12 weeks (matches dev.md §四 12-week roadmap). With 2-3 developers in parallel after Phase 2, ~5-6 weeks.
+Estimated duration: with 1 developer serial, ~10-12 weeks (matches dev.md §4 12-week roadmap). With 2-3 developers in parallel after Phase 2, ~5-6 weeks.
 
 ---
 
