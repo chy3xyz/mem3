@@ -263,6 +263,9 @@ pub const HNSW = struct {
     /// first so their vectors can be prefetched while the earlier ones are
     /// being scored.
     scratch_pending: std.ArrayList(Pending) = .empty,
+    /// Working buffers of `shrinkConnections`.
+    scratch_cands: std.ArrayList(Cand) = .empty,
+    scratch_kept: std.ArrayList(u64) = .empty,
 
     /// Reusable beam containers. `searchLayer` runs four times per insert
     /// and each call used to allocate and free its frontier, its result
@@ -300,6 +303,8 @@ pub const HNSW = struct {
         self.by_idx.deinit(self.alloc);
         self.norms.deinit(self.alloc);
         self.scratch_pending.deinit(self.alloc);
+        self.scratch_cands.deinit(self.alloc);
+        self.scratch_kept.deinit(self.alloc);
         self.visit_stamp.deinit(self.alloc);
         self.dense.deinit(self.alloc);
         self.scratch_frontier.deinit(self.alloc);
@@ -965,16 +970,30 @@ pub const HNSW = struct {
     /// Ids missing from `self.nodes` are dropped rather than carried: the
     /// adjacency lists must never point at a node the index no longer holds.
     fn shrinkConnections(self: *HNSW, node: *Node, q: Query, level: u8, limit: usize) !void {
-        const level_idx: usize = level;
-        const src = node.neighbors[level_idx].items;
+        const list = &node.neighbors[level];
+        const src = list.items;
 
-        var cands = std.ArrayList(Cand).empty;
-        defer cands.deinit(self.alloc);
-        try cands.ensureTotalCapacity(self.alloc, src.len);
+        // Pass 1: resolve every candidate and ask the cache for its vector,
+        // so the 33 loads overlap instead of queueing behind the arithmetic.
+        // Pass 2 scores them in list order, as before.
+        var pending = &self.scratch_pending;
+        pending.clearRetainingCapacity();
+        try pending.ensureTotalCapacity(self.alloc, src.len);
         for (src) |cid| {
             if (cid == node.id) continue; // never keep a self loop
-            const cn = self.nodeFor(cid) orelse continue; // never keep a dangling id
-            try cands.append(self.alloc, .{ .id = cid, .score = score(q, cn) });
+            const cidx = self.idxFor(cid) orelse continue; // never keep a dangling id
+            self.prefetchVector(cidx);
+            pending.appendAssumeCapacity(.{ .id = cid, .idx = cidx });
+        }
+
+        // Both buffers are the index's own scratch, reused across calls: this
+        // runs ~32 times per insert, and it used to allocate and free three
+        // lists each time.
+        var cands = &self.scratch_cands;
+        cands.clearRetainingCapacity();
+        try cands.ensureTotalCapacity(self.alloc, pending.items.len);
+        for (pending.items) |pn| {
+            cands.appendAssumeCapacity(.{ .id = pn.id, .score = self.scoreIdx(q, pn.idx) });
         }
         // Nearest to the query first; ties broken by id so the resulting
         // graph is byte-for-byte reproducible for a given insertion order.
@@ -985,8 +1004,8 @@ pub const HNSW = struct {
             }
         }.lt);
 
-        var kept = std.ArrayList(u64).empty;
-        errdefer kept.deinit(self.alloc);
+        var kept = &self.scratch_kept;
+        kept.clearRetainingCapacity();
         try kept.ensureTotalCapacity(self.alloc, @min(limit, cands.items.len));
 
         for (cands.items) |c| {
@@ -1007,7 +1026,7 @@ pub const HNSW = struct {
             if (evict) |ki| {
                 kept.items[ki] = c.id;
             } else {
-                try kept.append(self.alloc, c.id);
+                kept.appendAssumeCapacity(c.id);
             }
         }
 
@@ -1027,12 +1046,15 @@ pub const HNSW = struct {
             for (cands.items) |c| {
                 if (kept.items.len >= limit) break;
                 if (containsId(kept.items, c.id)) continue;
-                try kept.append(self.alloc, c.id);
+                kept.appendAssumeCapacity(c.id);
             }
         }
 
-        node.neighbors[level_idx].deinit(self.alloc);
-        node.neighbors[level_idx] = kept;
+        // Written back into the list's own storage. `kept` is never longer
+        // than `limit` and the list has just overflowed `limit`, so the
+        // capacity is already there and nothing below can fail.
+        list.clearRetainingCapacity();
+        list.appendSliceAssumeCapacity(kept.items);
     }
 
     /// Append `nb` to `node`'s list at `level` unless it is already there,
@@ -1051,8 +1073,15 @@ pub const HNSW = struct {
         const list = &node.neighbors[level];
         if (containsId(list.items, nb)) return; // already linked
 
-        try list.append(self.alloc, nb);
         const limit = self.maxDegree(level);
+        // Grow by doubling but never past `limit + 1`: that is the longest
+        // a list gets before `shrinkConnections` cuts it back, so a full
+        // list holds 33 ids (264 B) instead of the 56 (448 B) the default
+        // 1.5x-plus-8 growth leaves behind.
+        if (list.items.len == list.capacity) {
+            try list.ensureTotalCapacityPrecise(self.alloc, @min(@max(list.capacity * 2, 4), limit + 1));
+        }
+        list.appendAssumeCapacity(nb);
         if (list.items.len > limit) {
             try self.shrinkConnections(node, q, level, limit);
         }
