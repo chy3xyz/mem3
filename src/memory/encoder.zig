@@ -1,11 +1,11 @@
 //! Memory encoder — converts raw inputs into TS-MemCells.
 //!
-//! **GHW Layer**: Memory (三源合恰). Implements the Encoding stage of
+//! **GHW Layer**: Memory (tri-source coherence). Implements the Encoding stage of
 //! the four-stage lifecycle (per the paper §4.3.1).
 //!
 //! ## Constitution compliance
-//! - Principle I (三源完整性): source_tag is mandatory.
-//! - Principle III (存在增益驱动): importance_score is computed here using
+//! - Principle I (Tri-Source Integrity): source_tag is mandatory.
+//! - Principle III (existence-gain-driven lifecycle): importance_score is computed here using
 //!   the constitutional formula `α·source_coherence + β·goal_relevance +
 //!   γ·existential_contribution`.
 //!

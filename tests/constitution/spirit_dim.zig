@@ -1,8 +1,8 @@
-//! Constitution Invariant II: every MemCell has a 物/象/性 spirit dimension.
+//! Constitution Invariant II: every MemCell has a matter/form/spirit spirit dimension.
 //!
 //! Per `.specify/memory/constitution.md` Principle I and `spec.md` FR-027:
 //!   - Every MemCell MUST have ≥ 1 foresight OR ≥ 1 goal_association.
-//!   - This guarantees the spirit dimension is present (性 is non-empty).
+//!   - This guarantees the spirit dimension is present (spirit is non-empty).
 //!
 //! A cell with no foresight AND no goal_associations is a "headless" memory:
 //! it has matter (episode) and form (facts) but no meaning. Constitution

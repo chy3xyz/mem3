@@ -4,7 +4,7 @@
 //! storage, multi-hop traversal, and message passing over typed edges.
 //!
 //! ## Constitution compliance
-//! - Principle II (GHW 三层耦合): HyMem is the storage backbone.
+//! - Principle II (GHW three-layer coupling): HyMem is the storage backbone.
 //! - Principle III: edges carry three-source weight vectors.
 
 const std = @import("std");

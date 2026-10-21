@@ -1,6 +1,6 @@
 //! HyperEdge — a typed relation connecting 2+ MemCells.
 //!
-//! **GHW Layer**: HyMem (跨层). Carries a three-source weight vector
+//! **GHW Layer**: HyMem (cross-layer). Carries a three-source weight vector
 //! `(w_M, w_F, w_S)` summing to 1.
 
 const std = @import("std");
