@@ -25,6 +25,7 @@ Implement a WAL + snapshot architecture in-tree:
 - **Positive**: Full control over the format; we can add tri-source-specific optimizations (e.g., column-grouped storage by source_tag).
 - **Positive**: Cross-compiles cleanly. No `librocksdb-sys` build chain.
 - **Negative**: ~650 LOC of storage code we own. Compaction logic, block cache, bloom filters, etc. must be implemented and tested.
+- **Note (2026-10-21)**: durability is now selectable (`--wal-sync=always|group|interval:N`). `always`, the default, is the behaviour described here. `group` acknowledges only after an fsync covering the record; `interval:N` deliberately does not and can lose ~N ms to an OS crash. Record bytes and replay are identical in every mode.
 - **Negative**: No battle-tested "this won't lose your data" guarantee. We rely on the OS filesystem durability (fsync of the WAL record before acknowledging a write).
 - **Mitigation**: Property tests for WAL replay correctness, snapshot roundtrip, partial-corruption recovery. The dev.md lessons-learned also note: "WAL is append-only. Crash recovery is best-effort within a single session; long-term durability relies on filesystem durability."
 

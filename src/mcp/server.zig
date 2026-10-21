@@ -28,6 +28,7 @@ const framing = @import("framing.zig");
 const json = @import("json.zig");
 const out = @import("json_out.zig");
 const platform_stdio = @import("../platform/stdio.zig");
+const signal = @import("../platform/signal.zig");
 const protocol = @import("protocol.zig");
 const tools = @import("tools.zig");
 const version_mod = @import("../version.zig");
@@ -53,6 +54,10 @@ pub const Server = struct {
     /// snapshot on a clean exit instead of losing the session to the
     /// WAL-replay path next time. `Store.sync` is a no-op in memory.
     dirty: bool = false,
+    /// Stop on SIGINT/SIGTERM and wake every 100 ms while idle. Off by
+    /// default so a test or an embedding host is not driven by the
+    /// process-global signal flag; `mem3 mcp` turns it on.
+    watch_signals: bool = false,
     /// Non-null while a JSON-RPC batch is being dispatched. `emit`
     /// appends here instead of writing, and `handleBatch` turns the
     /// result into one array. See `emit`.
@@ -80,6 +85,17 @@ pub const Server = struct {
     pub fn serveStdio(self: *Server, in_fd: std.posix.fd_t) !void {
         var buf: [READ_BUF]u8 = undefined;
         while (true) {
+            if (self.watch_signals) {
+                if (signal.terminationRequested()) break;
+                // Bounded wait, not a blocking read: a signal that lands
+                // between the check above and the read would otherwise sit
+                // until the client next speaks. The same wake-up is the
+                // idle tick for `--wal-sync=interval:N`.
+                if (!signal.waitReadable(in_fd, 100)) {
+                    if (self.store.wal) |w| w.syncIfDue() catch {};
+                    continue;
+                }
+            }
             // `platform_fs.read` translates the raw syscall into a
             // typed error, so this loop only has to distinguish "bytes"
             // from "end of stream". An interrupted read surfaces as a
@@ -1627,4 +1643,56 @@ test "server: a message too broken to have an id is answered with id null" {
 
     try testing.expect(std.mem.indexOf(u8, got, "\"id\":null") != null);
     try testing.expect(std.mem.indexOf(u8, got, "-32700") != null);
+}
+
+// =============================================================================
+// Termination signals. `mem3 mcp` is a blocking stdio loop; SIGINT/SIGTERM
+// must end it cleanly even while the client keeps the pipe open and idle.
+// =============================================================================
+
+test "server: serveStdio returns on SIGTERM while the client holds the pipe open" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc, true);
+    defer h.deinit(alloc);
+
+    var fds: [2]c_int = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.pipe(&fds));
+    defer _ = std.c.close(fds[0]);
+    defer _ = std.c.close(fds[1]);
+
+    signal.reset();
+    try signal.installTermHandlers();
+    defer {
+        signal.restoreDefaultHandlers();
+        signal.reset();
+    }
+    h.server.watch_signals = true;
+
+    var done: std.atomic.Value(bool) = .init(false);
+    const Runner = struct {
+        fn run(s: *Server, fd: c_int, d: *std.atomic.Value(bool)) void {
+            s.serveStdio(fd) catch {};
+            d.store(true, .release);
+        }
+    };
+    const t = try std.Thread.spawn(.{}, Runner.run, .{ h.server, fds[0], &done });
+
+    // A request goes through, then the line goes quiet. The loop is now
+    // parked waiting for input that is never coming.
+    const req = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}\n";
+    try std.testing.expectEqual(@as(isize, @intCast(req.len)), std.c.write(fds[1], req.ptr, req.len));
+    const clock = @import("../platform/clock.zig");
+    var spins: usize = 0;
+    while (spins < 500) : (spins += 1) {
+        const got = try h.output(alloc);
+        defer alloc.free(got);
+        if (got.len > 0) break;
+        clock.sleepMs(10);
+    }
+    clock.sleepMs(150);
+    try std.testing.expect(!done.load(.acquire));
+
+    try std.testing.expectEqual(@as(c_int, 0), std.c.raise(.TERM));
+    t.join();
+    try std.testing.expect(done.load(.acquire));
 }

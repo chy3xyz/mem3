@@ -29,6 +29,7 @@
 const std = @import("std");
 const testing = std.testing;
 const cli = @import("mem3").cli;
+const core_config = @import("mem3").core.config;
 
 /// Parse and return. Callers own `Parsed.args` and must `deinit`.
 fn parse(argv: []const []const u8) !cli.Parsed {
@@ -444,4 +445,92 @@ test "cli: help text states that a bad value is an error" {
 test "cli: help text documents the alias" {
     try testing.expect(std.mem.indexOf(u8, cli.HELP_TEXT, "-h") != null);
     try testing.expect(std.mem.indexOf(u8, cli.HELP_TEXT, "-V") != null);
+}
+
+// =============================================================================
+// Durability mode and explicit logging flags
+// =============================================================================
+
+test "cli: --wal-sync defaults to always" {
+    var p = try parse(&.{"serve"});
+    defer p.deinit(testing.allocator);
+    try testing.expectEqual(core_config.Config.WalSync.always, p.wal_sync);
+}
+
+test "cli: --wal-sync parses in both the = form and the space form" {
+    const W = core_config.Config.WalSync;
+    {
+        var p = try parse(&.{ "serve", "--wal-sync=group" });
+        defer p.deinit(testing.allocator);
+        try testing.expectEqual(W.group, p.wal_sync);
+    }
+    {
+        var p = try parse(&.{ "serve", "--wal-sync", "interval:25" });
+        defer p.deinit(testing.allocator);
+        try testing.expectEqual(W{ .interval_ms = 25 }, p.wal_sync);
+    }
+    {
+        // Global flag before the subcommand, and last-wins between forms.
+        var p = try parse(&.{ "--wal-sync=group", "add", "--wal-sync", "always" });
+        defer p.deinit(testing.allocator);
+        try testing.expectEqual(cli.Subcommand.add, p.cmd);
+        try testing.expectEqual(W.always, p.wal_sync);
+    }
+}
+
+test "cli: an unknown --wal-sync is an error, not a silent fall back to always" {
+    try testing.expectError(error.InvalidFlagValue, parse(&.{ "serve", "--wal-sync=sometimes" }));
+    try testing.expectError(error.InvalidFlagValue, parse(&.{ "serve", "--wal-sync=interval:0" }));
+    try testing.expectError(error.InvalidFlagValue, parse(&.{ "serve", "--wal-sync", "interval:x" }));
+    try testing.expectError(error.InvalidFlagValue, parse(&.{ "serve", "--wal-sync=" }));
+}
+
+test "cli: --wal-sync is a documented global flag" {
+    var found = false;
+    for (cli.GLOBAL_FLAGS) |f| {
+        if (std.mem.eql(u8, f, "--wal-sync")) found = true;
+    }
+    try testing.expect(found);
+    try testing.expect(std.mem.indexOf(u8, cli.HELP_TEXT, "interval:") != null);
+}
+
+test "cli: --log-every is only 'explicit' when the user typed it" {
+    {
+        var p = try parse(&.{"serve"});
+        defer p.deinit(testing.allocator);
+        // The 60 s default must not turn the periodic summary on: the
+        // daemon is silent unless asked (Constitution VII).
+        try testing.expect(!p.log_every_explicit);
+    }
+    {
+        var p = try parse(&.{ "serve", "--log-every=30" });
+        defer p.deinit(testing.allocator);
+        try testing.expect(p.log_every_explicit);
+        try testing.expectEqual(@as(u64, 30), p.log_every_seconds);
+    }
+    {
+        var p = try parse(&.{ "serve", "--log-every", "15" });
+        defer p.deinit(testing.allocator);
+        try testing.expect(p.log_every_explicit);
+        try testing.expectEqual(@as(u64, 15), p.log_every_seconds);
+    }
+}
+
+test "cli: --log-format is only 'explicit' when the user typed it" {
+    {
+        var p = try parse(&.{"serve"});
+        defer p.deinit(testing.allocator);
+        try testing.expect(!p.log_format_explicit);
+    }
+    {
+        var p = try parse(&.{ "serve", "--log-format=human" });
+        defer p.deinit(testing.allocator);
+        try testing.expect(p.log_format_explicit);
+        try testing.expectEqual(cli.LogFormat.human, p.log_format);
+    }
+    {
+        var p = try parse(&.{ "serve", "--log-format", "jsonl" });
+        defer p.deinit(testing.allocator);
+        try testing.expect(p.log_format_explicit);
+    }
 }

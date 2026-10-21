@@ -33,6 +33,7 @@ comptime {
     _ = @import("integration/store_persistence_e2e.zig");
     _ = @import("integration/http_server_e2e.zig");
     _ = @import("integration/consolidate_incremental_e2e.zig");
+    _ = @import("integration/daemon_lifecycle_e2e.zig");
 
     // Property-based tests — randomized round-trip coverage of the
     // comptime serializer.

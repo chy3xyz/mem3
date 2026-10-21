@@ -23,6 +23,8 @@ const std = @import("std");
 const cli = @import("../cli.zig");
 const cli_common = @import("cli_common.zig");
 const mcp = @import("../mcp/mod.zig");
+const signal = @import("../platform/signal.zig");
+const Logger = @import("../utils/logger.zig").Logger;
 
 /// True when `--in-memory` was passed. It is a subcommand flag, not a
 /// global one, so it arrives through `Parsed.args` like `--source` does
@@ -46,6 +48,27 @@ pub fn run(alloc: std.mem.Allocator, p: cli.Parsed) !void {
 
     var server = mcp.Server.init(alloc, store, 1);
     defer server.deinit();
+
+    // SIGINT/SIGTERM end the loop; the existing exit path then snapshots a
+    // dirty store, so a host that terminates us loses nothing it was told
+    // was saved. The handlers only set a flag; see `platform/signal.zig`.
+    try signal.installTermHandlers();
+    server.watch_signals = true;
+
+    // Silent by default: stdout is the protocol, and stderr is for humans.
+    // Events appear only when `--log-format` was given explicitly, and only
+    // on stderr. (`--log-every` has no meaning here: there is no daemon tick
+    // to report on.)
+    const logger: Logger = if (p.log_format_explicit) switch (p.log_format) {
+        .silent => .{},
+        .human => .{ .mode = .human },
+        .jsonl => .{ .mode = .jsonl },
+    } else .{};
+    logger.event(.info, "startup", "mcp server on stdio data_dir={s} wal_sync={s}", .{
+        if (local.data_dir.len == 0) "(memory)" else local.data_dir,
+        @tagName(p.wal_sync),
+    });
+    defer logger.event(.info, "shutdown", "stdio loop ended; dirty store snapshotted", .{});
 
     // fd 0 in, fd 1 out. Never stderr: stderr is for humans and the
     // client does not read it.

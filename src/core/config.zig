@@ -84,6 +84,11 @@ pub const Config = struct {
     log_every_seconds: u64 = 60,
     log_format: LogFormat = .human,
 
+    // Durability
+    /// When the WAL is `fsync`ed relative to acknowledging a write.
+    /// `.always` is the historical behaviour and the default.
+    wal_sync: WalSync = .always,
+
     pub const EmbedderKind = enum {
         /// Deterministic hash-based stub (v0.1.0 default; ~zero deps).
         /// Semantically blind — kept for reproducibility, not relevance.
@@ -100,6 +105,44 @@ pub const Config = struct {
         human,
         jsonl,
         silent,
+    };
+
+    /// WAL durability mode: *when* the `fsync` that makes a record survive
+    /// power loss happens relative to the moment the write is acknowledged.
+    ///
+    ///  - `always` — every record is `write`n and `fsync`ed before `append`
+    ///    returns. The pre-existing behaviour, byte-for-byte.
+    ///  - `group`  — records still are not acknowledged until an `fsync`
+    ///    that covers them has completed, but concurrent writers share that
+    ///    `fsync` (leader/follower group commit). The durability promise is
+    ///    the same as `always`; only the cost per record changes, and only
+    ///    when more than one writer is in flight.
+    ///  - `interval_ms = N` — **weaker, on purpose.** `append` returns once
+    ///    the record is in the OS page cache and `fsync` runs at most every
+    ///    N ms. A process crash (`kill -9`) loses nothing, because the bytes
+    ///    are already in the kernel; an OS crash or power cut can lose every
+    ///    record written since the last `fsync`, i.e. up to ~N ms of writes
+    ///    (plus the daemon's 100 ms maintenance tick when the stream goes
+    ///    idle).
+    pub const WalSync = union(enum) {
+        always,
+        group,
+        interval_ms: u32,
+
+        pub const ParseError = error{InvalidWalSync};
+
+        /// `always` | `group` | `interval:N` (N a positive number of ms).
+        pub fn parse(s: []const u8) ParseError!WalSync {
+            if (std.mem.eql(u8, s, "always")) return .always;
+            if (std.mem.eql(u8, s, "group")) return .group;
+            const prefix = "interval:";
+            if (std.mem.startsWith(u8, s, prefix)) {
+                const n = std.fmt.parseInt(u32, s[prefix.len..], 10) catch return error.InvalidWalSync;
+                if (n == 0) return error.InvalidWalSync;
+                return .{ .interval_ms = n };
+            }
+            return error.InvalidWalSync;
+        }
     };
 
     /// Decay rate for a given source. Per Constitution Principle III:
@@ -153,4 +196,28 @@ test "Config: the documented three-way fusion weights are unchanged" {
     try std.testing.expectEqual(@as(f32, 0.5), c.recall_lambda_dense);
     try std.testing.expectEqual(@as(f32, 0.2), c.recall_lambda_sparse);
     try std.testing.expectEqual(@as(f32, 0.3), c.recall_lambda_graph);
+}
+
+test "WalSync.parse: the three durability modes and nothing else" {
+    const W = Config.WalSync;
+    try std.testing.expectEqual(W.always, try W.parse("always"));
+    try std.testing.expectEqual(W.group, try W.parse("group"));
+    try std.testing.expectEqual(W{ .interval_ms = 50 }, try W.parse("interval:50"));
+    try std.testing.expectEqual(W{ .interval_ms = 1 }, try W.parse("interval:1"));
+    // A zero interval is `always` in disguise; refusing it keeps the
+    // flag's meaning legible instead of picking a silent winner.
+    try std.testing.expectError(error.InvalidWalSync, W.parse("interval:0"));
+    try std.testing.expectError(error.InvalidWalSync, W.parse("interval:"));
+    try std.testing.expectError(error.InvalidWalSync, W.parse("interval"));
+    try std.testing.expectError(error.InvalidWalSync, W.parse("interval:abc"));
+    try std.testing.expectError(error.InvalidWalSync, W.parse("interval:-5"));
+    try std.testing.expectError(error.InvalidWalSync, W.parse("interval:99999999999"));
+    try std.testing.expectError(error.InvalidWalSync, W.parse(""));
+    try std.testing.expectError(error.InvalidWalSync, W.parse("Group"));
+    try std.testing.expectError(error.InvalidWalSync, W.parse("never"));
+}
+
+test "Config: the default durability mode is `always`" {
+    const c: Config = .{};
+    try std.testing.expectEqual(Config.WalSync.always, c.wal_sync);
 }

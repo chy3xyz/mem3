@@ -38,6 +38,9 @@ pub const retrieval = @import("retrieval/mod.zig");
 pub const storage = @import("storage/mod.zig");
 pub const server = @import("server/mod.zig");
 pub const store = @import("store/mod.zig");
+/// Evaluation protocols (official LongMemEval retrieval harness). Library-side
+/// so the metric math is reachable from the `src/main.zig` test root.
+pub const eval = @import("eval/mod.zig");
 /// The CLI argument parser. Exposed so `tests/unit/cli.zig` can reach
 /// it through this module: giving `src/cli.zig` its own module root would
 /// put `src/core/types.zig` in two modules at once, which Zig refuses.

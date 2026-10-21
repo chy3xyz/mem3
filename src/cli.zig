@@ -4,6 +4,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const core_types = @import("core/types.zig");
+const core_config = @import("core/config.zig");
 
 const ArgIterator = std.process.Args.Iterator;
 
@@ -38,6 +39,17 @@ pub const Parsed = struct {
     json: bool = false,
     log_format: LogFormat = .human,
     log_every_seconds: u64 = 60,
+    /// True only when the user typed `--log-format`. The default (`human`)
+    /// is the silent daemon of Constitution VII; naming a format on the
+    /// command line is what opts the daemon into emitting log lines.
+    log_format_explicit: bool = false,
+    /// True only when the user typed `--log-every`. The 60 s default must
+    /// not switch the periodic summary on by itself: a daemon that has
+    /// not been asked to talk stays silent.
+    log_every_explicit: bool = false,
+    /// WAL durability mode (`--wal-sync`). `always` is the historical
+    /// per-record fsync and the default.
+    wal_sync: core_config.Config.WalSync = .always,
     data_dir: []const u8 = "data",
     bind: []const u8 = "127.0.0.1",
     port: u16 = 7777,
@@ -154,10 +166,16 @@ pub fn parseSlice(alloc: Allocator, raw_args: []const []const u8) ParseError!Par
         }
         if (std.mem.startsWith(u8, arg, "--log-format=")) {
             p.log_format = try logFormatFromName(arg["--log-format=".len..]);
+            p.log_format_explicit = true;
             continue;
         }
         if (std.mem.startsWith(u8, arg, "--log-every=")) {
             p.log_every_seconds = try parseIntStrict(u64, arg["--log-every=".len..]);
+            p.log_every_explicit = true;
+            continue;
+        }
+        if (std.mem.startsWith(u8, arg, "--wal-sync=")) {
+            p.wal_sync = try walSyncFromName(arg["--wal-sync=".len..]);
             continue;
         }
         if (std.mem.startsWith(u8, arg, "--data-dir=")) {
@@ -199,6 +217,10 @@ pub fn parseSlice(alloc: Allocator, raw_args: []const []const u8) ParseError!Par
         }
         if (std.mem.startsWith(u8, arg, "--forget-interval=")) {
             p.forget_interval_sec = try parseIntStrict(u32, arg["--forget-interval=".len..]);
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--wal-sync")) {
+            try p.args.append(alloc, .{ .key = "--wal-sync", .value = null });
             continue;
         }
         if (std.mem.eql(u8, arg, "--port")) {
@@ -275,8 +297,12 @@ fn liftSpaceForm(alloc: Allocator, p: *Parsed, key: []const u8, v: []const u8) P
         try p.embedder_args.append(alloc, v);
     } else if (std.mem.eql(u8, key, "--log-every")) {
         p.log_every_seconds = try parseIntStrict(u64, v);
+        p.log_every_explicit = true;
     } else if (std.mem.eql(u8, key, "--log-format")) {
         p.log_format = try logFormatFromName(v);
+        p.log_format_explicit = true;
+    } else if (std.mem.eql(u8, key, "--wal-sync")) {
+        p.wal_sync = try walSyncFromName(v);
     } else if (std.mem.eql(u8, key, "--maint-interval")) {
         p.maint_interval_sec = try parseIntStrict(u32, v);
     } else if (std.mem.eql(u8, key, "--forget-interval")) {
@@ -297,6 +323,10 @@ fn logFormatFromName(v: []const u8) ParseError!LogFormat {
     if (std.mem.eql(u8, v, "jsonl")) return .jsonl;
     if (std.mem.eql(u8, v, "silent")) return .silent;
     return error.InvalidFlagValue;
+}
+
+fn walSyncFromName(v: []const u8) ParseError!core_config.Config.WalSync {
+    return core_config.Config.WalSync.parse(v) catch error.InvalidFlagValue;
 }
 
 fn parseArg(_: Allocator, raw: []const u8) Arg {
@@ -338,6 +368,7 @@ pub const GLOBAL_FLAGS = [_][]const u8{
     "--port",
     "--log-format",
     "--log-every",
+    "--wal-sync",
     "--maint-interval",
     "--forget-interval",
     "--dry-run",
@@ -375,7 +406,15 @@ pub const HELP_TEXT =
     \\  --bind=<addr>          Daemon bind address (default: 127.0.0.1)
     \\  --port=<port>          Daemon port (default: 7777)
     \\  --log-format=<fmt>     human | jsonl | silent
-    \\  --log-every=<seconds>  Periodic summary interval (default: 60)
+    \\  --log-every=<seconds>  Periodic summary interval; emitted only when this
+    \\                          flag is given (`serve`, to stderr; default 60)
+    \\  --wal-sync=<mode>      WAL durability: always | group | interval:<ms>
+    \\                          always (default) fsyncs every record before it is
+    \\                          acknowledged. group batches concurrent writers
+    \\                          into one fsync and still acknowledges only after
+    \\                          it. interval:N is WEAKER: acknowledged once in the
+    \\                          OS cache, fsync at most every N ms, so a power cut
+    \\                          can lose ~N ms of writes (a process crash cannot).
     \\  --maint-interval=<sec> Daemon maintenance pass interval, 0 = off
     \\  --forget-interval=<sec> Daemon forgetting sweep interval, 0 = off
     \\                          (default: 3600, so the daemon forgets on its
