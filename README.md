@@ -132,6 +132,7 @@ macOS or Linux:
 
 ```bash
 brew tap chy3xyz/tap
+brew trust chy3xyz/tap
 brew install mem3
 ```
 
