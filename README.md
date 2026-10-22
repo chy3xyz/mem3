@@ -126,9 +126,18 @@ several known gaps listed under [Status and limitations](#status-and-limitations
 The reason it is published at all is that the constraints it was built under are
 reproducible today, and the parts that do work are covered by tests.
 
+## Install
+
+macOS or Linux:
+
+```bash
+brew tap chy3xyz/tap
+brew install mem3
+```
+
 ## Build
 
-Requires **Zig 0.17.0**, pinned in [`.zigversion`](.zigversion).
+From source. Requires **Zig 0.17.0**, pinned in [`.zigversion`](.zigversion).
 
 ```bash
 zig build            # binaries land in zig-out/bin/
