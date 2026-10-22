@@ -1,17 +1,13 @@
 # Security
 
-mem3 keeps a memory log on local disk and serves it over HTTP and stdio. It is a single-user tool on a machine you control.
+mem3 is a local store. One person, one machine.
 
-## What the daemon does not do
+`mem3 serve` binds `127.0.0.1:7777` unless you pass `--bind` and `--port`. There is no authentication and no TLS. Anyone who can open the socket can read and write the store.
 
-- **No authentication and no TLS.** `mem3 serve` binds `127.0.0.1:7777` unless you pass `--bind` and `--port`. Anything that can open that socket can read and write the store.
-- **The files are plaintext.** `mem3.wal` and `snapshot.bin` hold episode text, facts, and foresight. Disk encryption is the operating system's job.
-- **MCP has no extra sandbox.** A host that can spawn `mem3 mcp` can call every tool, including forget and unsupersede.
+`mem3.wal` and `snapshot.bin` are plaintext. They hold the text you stored.
 
-Binding a non-loopback address, or putting the data directory on a shared disk, is an operator decision. The program will not refuse it.
+`mem3 mcp` has the same tools as the CLI, including forget.
 
-## Reporting
+Report a crash, a log replay that drops or invents a record, or a way to read another user's files through a [private advisory](https://github.com/chy3xyz/mem3/security/advisories/new). Include `mem3 version`, the commit, and the platform. Leave private text out of the transcript.
 
-Use a [private security advisory](https://github.com/chy3xyz/mem3/security/advisories/new) on `chy3xyz/mem3`. Include the version (`mem3 version`), the commit, the platform, and a transcript that does not contain data you care about.
-
-A missing auth check on the loopback default is the design above, not a vulnerability report. A crash, a WAL replay that drops or invents a record, or a way to read another user's files without their credentials, is.
+A missing login on the loopback default is the design above.

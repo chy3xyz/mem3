@@ -2,77 +2,66 @@
 order: 2
 ---
 
-# CLI, HTTP, and MCP
+# Interface
 
-All three call the same store. `--data-dir` selects the directory that holds `mem3.wal` and `snapshot.bin`. The default data directory is the process working directory, so a bare `mem3 add` writes those files where you ran it. Point it at `/tmp` or a directory you meant to create.
+The CLI, the HTTP daemon, and MCP all use one store. Pass the same `--data-dir` to each.
 
 ## CLI
 
-| Command | What it does |
+| Command | |
 |---|---|
-| `add` | Encode a cell and append it to the WAL |
-| `query` | Ranked recall. `--topk` defaults to 10. `--json` prints ids |
+| `add` | Append a cell. Needs `--episode`, and a foresight or a goal. |
+| `query` | Search. `--topk` defaults to 10. |
 | `goal` | `add`, `list`, `status` |
 | `hyperedge` | `add`, `list`, `multi-hop` |
-| `dump` | JSONL of the store |
-| `inspect` | One cell and its neighborhood |
-| `consolidate` | Clustering pass |
-| `forget` | Existence-gain sweep. `--dry-run` reports without writing |
+| `dump` | Print the store as JSONL |
+| `inspect` | One cell and its links |
+| `consolidate` | Cluster cells |
+| `forget` | Run the sweep. `--dry-run` makes no change. |
 | `unsupersede` | Clear a superseded mark |
 | `serve` | HTTP daemon |
-| `mcp` | MCP over stdio |
-| `bench` | In-process smoke bench. The release harness is `zig build bench` |
-| `help`, `version` | |
+| `mcp` | MCP on stdin and stdout |
+| `bench` | Short in-process bench |
 
-`add` needs `--episode` and a spirit dimension: `--foresight`, or `--goal-ids` with `--relevances`. `--source` defaults are documented by `mem3 add --help`. A foresight confidence outside `[0, 1]`, or an empty description, is `InvalidForesight` and nothing is written.
+`mem3 add --help` lists the flags. A bad foresight is refused and nothing is written.
 
-`query --source-filter` is a filter on the dense path. It is not the hybrid ranker. `--include-superseded` puts marked cells back into the candidate set. The default hides them.
-
-`serve` defaults to `--bind 127.0.0.1 --port 7777`. `--wal-sync` is `always` (the default), `group`, or `interval:N`.
+`query` hides superseded cells unless you pass `--include-superseded`.
 
 ## HTTP
 
-`mem3 serve` speaks HTTP/1.1. No authentication. Do not publish the port.
+`mem3 serve` speaks HTTP/1.1.
 
-| Method | Path | Result |
+| Method | Path | |
 |---|---|---|
-| `GET` | `/` | Embedded web UI |
+| `GET` | `/` | Small web UI |
 | `GET` | `/healthz` | `{"status":"ok","version":"0.1.0-alpha"}` |
-| `GET` | `/metrics` | Prometheus-style text |
-| `POST` | `/api/memcells` | Create a cell. `201` and `{"id":N}` |
+| `GET` | `/metrics` | Text metrics |
+| `POST` | `/api/memcells` | Create a cell. `201`, body `{"id":N}` |
 | `GET` | `/api/memcells` | List cells |
-| `GET` | `/api/memcells/:id` | One cell, or `404` |
-| `GET` | `/api/goals` | Goals, without the structural bottom and top anchors |
-| `POST` | `/api/query` | Body field is `text` |
-| `POST` | `/api/sync` | Flush the WAL and write a snapshot |
-| `POST` | `/api/forget` | Preview unless the body sets `dry_run` to false |
+| `GET` | `/api/memcells/:id` | One cell, or 404 |
+| `GET` | `/api/goals` | Goals |
+| `POST` | `/api/query` | JSON body field `text` |
+| `POST` | `/api/sync` | Flush the log and write a snapshot |
+| `POST` | `/api/forget` | Preview. Send `{"dry_run":false}` to apply. |
+
+A create body needs `episode`. If you omit `goalId` and `relevance`, the server uses goal 1 at relevance 0.5. Foresight is an array of `{description, valid_from, valid_until, confidence}`. A bad foresight returns 400.
 
 ```bash
 curl -s http://127.0.0.1:7777/healthz
 curl -X POST http://127.0.0.1:7777/api/memcells \
   -d '{"source":"matter","episode":"curl added this cell"}'
-curl -X POST http://127.0.0.1:7777/api/query -d '{"text":"curl","topk":3}'
+curl -X POST http://127.0.0.1:7777/api/query \
+  -d '{"text":"curl","topk":3}'
 ```
-
-If the body omits `goalId` and `relevance`, the handler uses goal `1` at relevance `0.5`, which is enough of a spirit dimension to accept the cell. Optional foresight is a JSON array of `{description, valid_from, valid_until, confidence}`. A malformed foresight is a 400 and nothing is written.
 
 ## MCP
 
-`mem3 mcp` reads JSON-RPC 2.0 on stdin and writes responses on stdout. Logging stays off stdout.
+`mem3 mcp` reads JSON-RPC on stdin and writes responses on stdout.
 
-Tools:
-
-| Tool | What it does |
-|---|---|
-| `memory_add` | Encode a cell |
-| `memory_query` | Recall |
-| `goal_list` | List goals |
-| `memory_forget` | Forgetting sweep |
-| `memory_stats` | Counts |
-| `memory_unsupersede` | Clear a superseded mark |
-
-The server accepts the modern `2026-07-28` handshake and the legacy `2025-11-25` handshake, decided per request, and it accepts batches. Real clients that have completed a session — MCP Inspector 2.11.0, Claude Code 2.1.289, and the Cursor CLI agent — all used the legacy handshake. The modern path has no real-client session yet. The record is [MCP hosts](../library/mcp-hosts.md).
+Tools: `memory_add`, `memory_query`, `goal_list`, `memory_forget`, `memory_stats`, `memory_unsupersede`.
 
 ```bash
 python3 scripts/mcp_conformance.py --mem3 ./zig-out/bin/mem3
 ```
+
+That script checks the wire protocol. It is not a session with a real MCP client. Clients that have been run are listed in `docs/mcp-hosts.md` in the repository.

@@ -1,6 +1,6 @@
 # Contributing
 
-Development is on macOS or Linux, with Zig 0.17.0 from [`.zigversion`](.zigversion).
+macOS or Linux. Zig 0.17.0, pinned in `.zigversion`.
 
 ```bash
 git clone https://github.com/chy3xyz/mem3.git
@@ -11,7 +11,7 @@ zig build check-constitution
 python3 scripts/mcp_conformance.py --mem3 ./zig-out/bin/mem3
 ```
 
-`zig build test` prints the pass count. A cached re-run can print a pass without executing. Drive the three roots when the count matters:
+`zig build test` can reprint a cached pass. To force a run:
 
 ```bash
 zig test --dep mem3 -Mroot=src/main.zig -Mmem3=src/lib.zig
@@ -19,34 +19,17 @@ zig test --dep mem3 -Mroot=tests/main.zig -Mmem3=src/lib.zig
 zig test --dep mem3 -Mroot=tests/constitution/main.zig -Mmem3=src/lib.zig
 ```
 
-The third command is the constitution gate: twelve invariants. `zig build check-constitution` runs the same root.
+The last command is the constitution gate in `.specify/memory/constitution.md`. Twelve checks.
 
-The same guide is on the documentation site at <https://chy3xyz.github.io/mem3/project/contributing/>.
+- Tests write under `/tmp`, in a directory named with the process id.
+- Library code does not write to stderr.
+- A test that cannot run returns `error.Skip ZigTest`.
+- Import a new test file from `src/main.zig` or `tests/main.zig`.
+- Pass an allocator in. Return an error for failure.
+- Do not add a database, FAISS, or another runtime dependency.
 
-## Rules
+`AGENTS.md` has the file map and the measured numbers.
 
-The [constitution](.specify/memory/constitution.md) is the constraint. A change that needs to break a principle stops for an amendment. Do not add FAISS, Neo4j, Redis, SQLite, or another runtime dependency to get around it.
+Use a branch. Subjects look like `fix(store): ...`. Open a pull request against `main`.
 
-- Pass an allocator in. Do not hide one in a global.
-- Fallible operations return an error union. `null` means the value is absent.
-- Library code does not write to stderr. The test runner uses those pipes.
-- A test that cannot run returns `error.SkipZigTest`.
-- Tests write under `/tmp`, in a pid-scoped directory. They do not write into the checkout.
-- A new test file is imported from `src/main.zig` or `tests/main.zig`. Otherwise its tests never register.
-- A cell has a matter, form, or spirit tag, and a spirit dimension (foresight or a goal association).
-
-[`AGENTS.md`](AGENTS.md) is the longer engineering guide: file map, pitfalls, and the measured performance table.
-
-## Changes
-
-Use a feature branch. Commit subjects look like `feat(hypermem): ...`, `fix(serializer): ...`, `test(constitution): ...`, `docs(site): ...`.
-
-Open a pull request against `main`. The CI workflow builds, runs the tests, runs the constitution gate, checks that the worktree is clean afterwards, checks that a deliberately failing test makes the gate go red, and checks linked libraries. `zig build bench` in that workflow is a smoke step. It is allowed to fail. The workflow file had not been executed by a GitHub-hosted runner when it was added. Treat a green badge as evidence only after you can see a run.
-
-Docs for the site live in [`site/docs/`](site/docs/). The build copies `docs/`, the MVP spec, `dev.md`, and the GHW paper into the tree and runs [zdoc](https://github.com/chy3xyz/zdoc):
-
-```bash
-bash scripts/build_docs.sh
-```
-
-Output is `site/public/`. The default URL prefix is `/mem3/`, which is the project-site path on GitHub Pages. Pass `/` as the second argument when you are serving the folder at a domain root.
+The public manual is `site/docs/`. Build it with `bash scripts/build_docs.sh`. The same pages are at <https://chy3xyz.github.io/mem3/>.

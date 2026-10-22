@@ -208,7 +208,7 @@ added memory id=6
 {"id":7}
 ```
 
-`--source` accepts `matter`/`m`/`物`, `form`/`f`/`象`, `spirit`/`s`/`性`.
+`--source` accepts `matter` or `m`, `form` or `f`, `spirit` or `s`.
 `--foresight` is `description|valid_from|valid_until|confidence` (entries
 `;`-separated); it is durable — journaled in the WAL record and carried in the
 snapshot, so a foresight-only cell keeps its spirit dimension across a restart.
