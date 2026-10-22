@@ -10,10 +10,12 @@ inside an embedded device — on macOS or Linux; see
 [Supported platforms](#supported-platforms).
 
 ```
-git clone <this repo> && cd mem3
+git clone https://github.com/chy3xyz/mem3.git && cd mem3
 zig build
 ./zig-out/bin/mem3 --help
 ```
+
+Documentation: <https://chy3xyz.github.io/mem3/> (Markdown in `site/docs/`, built with [zdoc](https://github.com/chy3xyz/zdoc)).
 
 ---
 
@@ -1248,7 +1250,10 @@ MIT — see [`LICENSE`](LICENSE).
 |---|---|
 | [`AGENTS.md`](AGENTS.md) | Project status, conventions, file map, roadmap |
 | [`docs/roadmap.md`](docs/roadmap.md) | What is deferred, why, and what it would cost |
-| [`docs/adr/`](docs/adr/) | Four decision records: ontology, GHW mapping, HNSW, WAL |
+| [`docs/adr/`](docs/adr/) | Five decision records: ontology, GHW mapping, HNSW, WAL, forgetting |
+| [`CONTRIBUTING.md`](CONTRIBUTING.md) | How to build, test, and send a change |
+| [`SECURITY.md`](SECURITY.md) | Loopback daemon, plaintext store, how to report a bug |
+| [`CHANGELOG.md`](CHANGELOG.md) | What `main` contains past the alpha notes |
 | [`docs/constitution-amendments/2026-10-14-platform-scope.md`](docs/constitution-amendments/2026-10-14-platform-scope.md) | Why Windows and WASM are refused at compile time |
 | [`docs/releases/v0.1.0-alpha.md`](docs/releases/v0.1.0-alpha.md) | Original release notes — **their performance claims are unmeasured and contradicted by `zig build bench`; ignore the numbers there** |
 | [`bench/main.zig`](bench/main.zig) | The benchmark harness and its honesty rules |

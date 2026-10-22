@@ -2,7 +2,7 @@
 
 **Purpose**: Validate specification completeness and quality before proceeding to implementation.
 **Created**: 2026-06-07
-**Feature**: [spec.md](./spec.md) | [plan.md](./plan.md) | [data-model.md](./data-model.md) | [quickstart.md](./quickstart.md) | [tasks.md](./tasks.md)
+**Feature**: [spec.md](../spec.md) | [plan.md](../plan.md) | [data-model.md](../data-model.md) | [quickstart.md](../quickstart.md) | [tasks.md](../tasks.md)
 
 **Source basis**: `dev.md` (engineering blueprint), `ghw_memory_system.agent.final.md` (formal paper), the Tri-Source Coherence Theory manuscript (foundational ontology), `.specify/memory/constitution.md` (project principles).
 
